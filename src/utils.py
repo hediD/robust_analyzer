@@ -317,7 +317,7 @@ def analyze_logits_detailed(logits: torch.Tensor, target_class: str = None, top_
         target_idx (int, optional): Index of the target class to highlight.
     
     Returns:
-        pandas.DataFrame: DataFrame with columns ["Class", "Count", "Mean Probability"]
+        pandas.DataFrame: DataFrame with columns ["Class", "Count", "Avg Probability"]
     """
     if not isinstance(logits, torch.Tensor):
         logits = torch.tensor(logits)
@@ -336,7 +336,7 @@ def analyze_logits_detailed(logits: torch.Tensor, target_class: str = None, top_
     sorted_stats = sorted(stats, key=lambda x: x[1], reverse=True)[:top_n]
 
     # Convert to DataFrame for better display
-    df = pd.DataFrame(sorted_stats, columns=["Class", "Count", "Mean Probability"])
+    df = pd.DataFrame(sorted_stats, columns=["Class", "Count", "Avg Probability"])
     
     # Highlight the target class if specified
     if target_class is not None:
@@ -424,15 +424,15 @@ def visualize_positions_with_distributions(positions: np.ndarray, labels_correct
                 'azimuth_std': np.std(azimuth_true),
                 'elevation_mean': np.mean(elevation_true),
                 'elevation_std': np.std(elevation_true),
-            'norm_mean': np.mean(norm_true),
-            'norm_std': np.std(norm_true)
-        },
-        'wrong_stats': {
-            'azimuth_mean': np.mean(azimuth_wrong),
-            'azimuth_std': np.std(azimuth_wrong),
-            'elevation_mean': np.mean(elevation_wrong),
-            'elevation_std': np.std(elevation_wrong),
-            'norm_mean': np.mean(norm_wrong),
+                'norm_mean': np.mean(norm_true),
+                'norm_std': np.std(norm_true)
+            },
+            'wrong_stats': {
+                'azimuth_mean': np.mean(azimuth_wrong),
+                'azimuth_std': np.std(azimuth_wrong),
+                'elevation_mean': np.mean(elevation_wrong),
+                'elevation_std': np.std(elevation_wrong),
+                'norm_mean': np.mean(norm_wrong),
                 'norm_std': np.std(norm_wrong)
             }
         }
@@ -483,8 +483,8 @@ def visualize_positions_polar(positions: np.ndarray, labels_correct: np.ndarray,
     
     # Add colorbar
     cbar = plt.colorbar(pcm, ax=ax, pad=0.1)
-    cbar.set_label('Point Density\n(Red: Misclassified, Blue: Well Classified)')
     
+    cbar.set_label('Point Density\n(Red: Misclassified, Blue: Well Classified)')
     # Add radial (elevation) ticks
     elevation_ticks = np.linspace(0, 1, 5) 
     elevation_labels = np.linspace(elevation.min(), elevation.max(), len(elevation_ticks))
