@@ -39,7 +39,7 @@ def imshow(tensor: torch.Tensor, ax: plt.Axes = None):
         plt.imshow(to_numpy(tensor))
     plt.show()
 
-# For camera position projection 
+# For camera position projection
 def project(vector: torch.Tensor, ball_norm: float = 4.5):
     norm_vector = ch.norm(vector)
     if norm_vector >= ball_norm:
@@ -58,14 +58,14 @@ def show_pred(logits: torch.Tensor, topk: int = 3):
         probas = ch.nn.functional.softmax(logits, dim=-1)
         # Sort probabilities in descending order
         top_probas, top_labels = ch.topk(probas, k=topk, dim=-1)
-    
+
     # Convert to lists for processing
     top_labels = top_labels[0].tolist()
     top_probas = top_probas[0].tolist()
-    
+
     # Create formatted string of predictions with truncation
     str_ = "\n".join([
-        f"{(id_to_class[top_labels[i]][:27] + '...') if len(id_to_class[top_labels[i]]) > 30 else id_to_class[top_labels[i]]}:{top_probas[i]:.2f}" 
+        f"{(id_to_class[top_labels[i]][:27] + '...') if len(id_to_class[top_labels[i]]) > 30 else id_to_class[top_labels[i]]}:{top_probas[i]:.2f}"
         for i in range(topk)
     ])
     return str_
@@ -78,8 +78,8 @@ def get_topk_classes(logits: torch.Tensor, topk: int = 3):
     """
     list_classifications = (ch.argmax(logits, dim=1)).flatten().tolist()
     return sorted([(get_target(k), v)  for k, v in Counter(list_classifications).items()], key=lambda x: x[1], reverse=True)[:topk]
-    
-# Shows image after rendering 
+
+# Shows image after rendering
 def show_img(img: np.ndarray):
     ### Img Plot
     plt.figure(figsize=(6, 6))
@@ -120,10 +120,10 @@ def substr_target_indices(substr: str):
 def get_target_label(class_label: str, device: str = "cuda"):
     # Directly index the dictionary to get the class index
     class_idx = get_idx(class_label)
-    
+
     target = ch.zeros((1, 1000), device=device)
     target[0, class_idx] = 1  # Use advanced indexing for clarity
-    return target 
+    return target
 
 # ==========================
 # Attention and Mask Utilities
@@ -144,7 +144,7 @@ def get_attention_mask(mesh: torch.Tensor, cameras: torch.Tensor, image_size: tu
     projected_verts = cameras.transform_points_screen(verts, image_size=image_size).to("cpu")  # Project to screen space
     min_coords = projected_verts.min(dim=0)[0]
     max_coords = projected_verts.max(dim=0)[0]
-    
+
     # Calculate bounding box in image space
     bbox_x_min, bbox_y_min = min_coords[:2]
     bbox_x_max, bbox_y_max = max_coords[:2]
@@ -166,37 +166,37 @@ def get_attention_mask(mesh: torch.Tensor, cameras: torch.Tensor, image_size: tu
 def reconstruct_image_from_mask(image: torch.Tensor, mask: torch.Tensor, patch_size: int, background_value: int = 0):
     """
     Reconstruct the image based on the attention mask.
-    
+
     Args:
         image: Original image tensor of shape (B, C, H, W).
         mask: Attention mask of shape (B, num_tokens).
         patch_size: Size of each patch in the original image.
         background_value: Value to fill for masked-out areas (default: 0).
-    
+
     Returns:
         Reconstructed image tensor of shape (B, C, H, W).
     """
     B, C, H, W = image.shape
     num_patches_x = W // patch_size
     num_patches_y = H // patch_size
-    
+
     # Reshape the mask to match the patch grid
     mask = mask.view(B, num_patches_y, num_patches_x)  # (B, H/patch_size, W/patch_size)
 
     # Divide the image into patches
     patches = image.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size)  # (B, C, num_patches_y, num_patches_x, patch_size, patch_size)
     patches = patches.permute(0, 2, 3, 1, 4, 5)  # (B, num_patches_y, num_patches_x, C, patch_size, patch_size)
-    
+
     # Apply the mask to zero out irrelevant patches
     mask = mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # (B, num_patches_y, num_patches_x, 1, 1, 1)
     patches = patches * mask + background_value * (1 - mask)  # Replace masked patches with background_value
-    
+
     # Reassemble the patches into the full image
     reconstructed = ch.zeros_like(image) + background_value  # Start with background
     for i in range(num_patches_y):
         for j in range(num_patches_x):
             reconstructed[:, :, i * patch_size:(i + 1) * patch_size, j * patch_size:(j + 1) * patch_size] = patches[:, i, j, :, :, :]
-    
+
     return reconstructed
 
 # ==========================
@@ -205,46 +205,46 @@ def reconstruct_image_from_mask(image: torch.Tensor, mask: torch.Tensor, patch_s
 def look_at_rotation(camera_position: torch.Tensor, target_position: torch.Tensor, up_vector: torch.Tensor = None):
     """
     Compute the rotation matrix for a camera to look at a target.
-    
+
     Args:
         camera_position: (B, 3) tensor of camera positions.
         target_position: (B, 3) tensor of target positions.
         up_vector: Optional (3,) tensor specifying the up vector. Defaults to [0, 0, 1].
-        
+
     Returns:
         R: (B, 3, 3) tensor of rotation matrices.
     """
     if up_vector is None:
         up_vector = ch.tensor([0.0, 0.0, 1.0], device=camera_position.device, dtype=camera_position.dtype)
-    
+
     z_axis = F.normalize(camera_position - target_position, dim=-1)  # Camera direction (view axis)
     x_axis = F.normalize(ch.cross(up_vector.expand_as(z_axis), z_axis), dim=-1)  # Right vector
     y_axis = ch.cross(z_axis, x_axis)  # Orthogonal up vector
-    
+
     R = ch.stack([x_axis, y_axis, z_axis], dim=-1)  # Combine to form rotation matrix
     return R
 
 # ==========================
 # Logits Analysis Utilities
 # ==========================
-def analyze_logits(logits: torch.Tensor, target_class: str = None, max_length: int = 15): 
+def analyze_logits(logits: torch.Tensor, target_class: str = None, max_length: int = 15):
     """
     Analyze the logits to find the most common class, its count, percentage,
     and the average probability of that class across all elements.
-    
+
     Args:
         logits (ch.Tensor): A tensor of shape (batch_size, num_classes).
-        
+
     Returns:
         tuple: (most_common_class, count, percentage, average_probability)
     """
 
     # Get the most likely classes for each batch
     predictions = logits.argmax(1)
-    
+
     # Count occurrences of each class
     class_counts = Counter(predictions.tolist())
-    
+
     if target_class is None:
         # Find the most common class and its count
         class_idx, count = class_counts.most_common(1)[0]
@@ -252,18 +252,18 @@ def analyze_logits(logits: torch.Tensor, target_class: str = None, max_length: i
         # Find the target class and its count
         class_idx = get_target_idx(target_class)
         class_count = class_counts[class_idx]
-    
+
     # Calculate the average probability of the most common class
     probs = ch.nn.functional.softmax(logits, dim=1)
     average_probability = probs[:, class_idx].mean().item()
-    
+
     truncate_string = lambda s: s if len(s)<=max_length else s[:max_length] + "." * (min(3, len(s)-max_length))
     return truncate_string(get_target(class_idx)), class_count, average_probability
 
 def render_ims(model: torch.nn.Module, ims: Optional[List[int]] = None, envmaps: Optional[List[int]] = None, initial: bool = False):
     """
     Render images from the model.
-    
+
     Args:
         model: The model to render from.
         ims: The indices of images to render, None for all.
@@ -284,11 +284,11 @@ def render_ims(model: torch.nn.Module, ims: Optional[List[int]] = None, envmaps:
 
     # If no envmaps is provided, only render one environment map at random
     if envmaps is None:
-        envmaps = np.random.randint(0, rendered_images.shape[1])  
-    
+        envmaps = np.random.randint(0, rendered_images.shape[1])
+
     # Generate the rendered images
     rendered_images = to_numpy(render_func())
-    rendered_images = rendered_images[ims, envmaps, :, :, :]  
+    rendered_images = rendered_images[ims, envmaps, :, :, :]
 
     # Plot the images
     _, axes = plt.subplots(num_rows, images_per_row, figsize=(images_per_row * 4, num_rows * 4))
@@ -310,12 +310,12 @@ def render_ims(model: torch.nn.Module, ims: Optional[List[int]] = None, envmaps:
 def analyze_logits_detailed(logits: torch.Tensor, target_class: str = None, top_n: int = 5):
     """
     Analyze logits to provide detailed class statistics.
-    
+
     Args:
         logits (torch.Tensor): Tensor of logits with shape (batch_size, num_classes)
         top_n (int, optional): Number of top classes to return. Defaults to 5.
         target_idx (int, optional): Index of the target class to highlight.
-    
+
     Returns:
         pandas.DataFrame: DataFrame with columns ["Class", "Count", "Avg Probability"]
     """
@@ -328,7 +328,7 @@ def analyze_logits_detailed(logits: torch.Tensor, target_class: str = None, top_
     top_probs = softmax_probs[range(softmax_probs.size(0)), top_indices]
 
     stats = [
-        (id_to_class[idx], count, top_probs[top_indices == idx].mean().item()) 
+        (id_to_class[idx], count, top_probs[top_indices == idx].mean().item())
         for idx, count in zip(class_indices.tolist(), counts.tolist())
     ]
 
@@ -337,20 +337,29 @@ def analyze_logits_detailed(logits: torch.Tensor, target_class: str = None, top_
 
     # Convert to DataFrame for better display
     df = pd.DataFrame(sorted_stats, columns=["Class", "Count", "Avg Probability"])
-    
+
     # Highlight the target class if specified
     if target_class is not None:
         df.loc[df['Class'] == target_class, 'Class'] = df.loc[df['Class'] == target_class, 'Class'].apply(lambda x: f'**{x}**')
-    
+
     return df
 
 # ==========================
 # Visualization Utilities
 # ==========================
+def compute_spherical_coordinates(positions: np.ndarray):
+    """
+    Compute spherical coordinates (azimuth, elevation, norm) from camera positions.
+    """
+    azimuth = np.arctan2(positions[:, 1], positions[:, 0]) * 180 / np.pi
+    norm = np.linalg.norm(positions, axis=1)
+    elevation = np.arcsin(positions[:, 2] / norm) * 180 / np.pi
+    return azimuth, elevation, norm
+
 def visualize_positions_with_distributions(positions: np.ndarray, labels_correct: np.ndarray, title: str = None, fontsize: int = 18, return_stats: bool = False):
     """
     Visualize 3D positions and distributions of azimuth, elevation, and norm.
-    
+
     Parameters:
     positions : numpy array or list of tuples
         Array of (x, y, z) camera positions.
@@ -361,28 +370,25 @@ def visualize_positions_with_distributions(positions: np.ndarray, labels_correct
     fontsize : int, optional
         Font size for plot text. Default is 18.
     """
-    
+
     # Convert to numpy arrays if not already
     positions = np.array(positions)
     labels_correct = np.array(labels_correct)
-    
-    # Compute azimuth, elevation, and norm
-    azimuth = np.arctan2(positions[:, 1], positions[:, 0]) * 180 / np.pi
-    norm = np.linalg.norm(positions, axis=1)
-    elevation = np.arcsin(positions[:, 2] / norm) * 180 / np.pi
-    
+
+    azimuth, elevation, norm = compute_spherical_coordinates(positions)
+
     # Separate data based on labels
     azimuth_true, azimuth_wrong = azimuth[labels_correct == 1], azimuth[labels_correct == 0]
     elevation_true, elevation_wrong = elevation[labels_correct == 1], elevation[labels_correct == 0]
     norm_true, norm_wrong = norm[labels_correct == 1], norm[labels_correct == 0]
     positions_true, positions_wrong = positions[labels_correct == 1], positions[labels_correct == 0]
-    
+
     # Plot 1: 3D Scatter Plot
     fig1 = plt.figure(figsize=(10, 8))
     ax1 = fig1.add_subplot(111, projection='3d')
-    ax1.scatter(positions_true[:, 0], positions_true[:, 1], positions_true[:, 2], 
+    ax1.scatter(positions_true[:, 0], positions_true[:, 1], positions_true[:, 2],
                 c='blue', label='True label', alpha=0.5)
-    ax1.scatter(positions_wrong[:, 0], positions_wrong[:, 1], positions_wrong[:, 2], 
+    ax1.scatter(positions_wrong[:, 0], positions_wrong[:, 1], positions_wrong[:, 2],
                 c='red', label='Wrong label', alpha=0.5)
     ax1.set_title(f'{title or "3D Positions"}', fontsize=fontsize)
     ax1.set_xlabel('X', fontsize=fontsize)
@@ -394,26 +400,26 @@ def visualize_positions_with_distributions(positions: np.ndarray, labels_correct
 
     # Plot 2: Histograms with unified legend
     fig2, axes = plt.subplots(1, 3, figsize=(18, 6))
-    
+
     # Azimuth Histogram
     axes[0].hist(azimuth_true, bins=20, color='blue', alpha=0.5, density=True)
     axes[0].hist(azimuth_wrong, bins=20, color='red', alpha=0.5, density=True)
     axes[0].set_xlabel('Azimuth (degrees)', fontsize=fontsize)
     axes[0].set_ylabel('Likelihood', fontsize=fontsize)
-    
+
     # Elevation Histogram
     axes[1].hist(elevation_true, bins=20, color='blue', alpha=0.5, density=True)
     axes[1].hist(elevation_wrong, bins=20, color='red', alpha=0.5, density=True)
     axes[1].set_xlabel('Elevation (degrees)', fontsize=fontsize)
-    
+
     # Norm/Distance Histogram
     axes[2].hist(norm_true, bins=20, color='blue', alpha=0.5, density=True)
     axes[2].hist(norm_wrong, bins=20, color='red', alpha=0.5, density=True)
     axes[2].set_xlabel('Distance', fontsize=fontsize)
-    
+
     # Add unified legend
     fig2.legend(['True', 'Wrong'], loc='upper center', fontsize=fontsize, ncol=2, bbox_to_anchor=(0.5, 1.05))
-    
+
     plt.tight_layout(rect=[0, 0, 1, 0.95])  # Adjust layout to fit the legend
     plt.show()
 
@@ -440,7 +446,7 @@ def visualize_positions_with_distributions(positions: np.ndarray, labels_correct
 def visualize_positions_polar(positions: np.ndarray, labels_correct: np.ndarray, title: str = None):
     """
     Visualize camera positions with azimuth-elevation heatmaps in a circular (polar) layout.
-    
+
     Parameters:
     positions : numpy array or list of tuples
         Array of (x, y, z) positions
@@ -448,18 +454,18 @@ def visualize_positions_polar(positions: np.ndarray, labels_correct: np.ndarray,
         Array of labels corresponding to each position. 1 for "correct", 0 for "incorrect".
     title : str, optional
         Custom title for the plot
-    """ 
+    """
     # Convert to numpy arrays if not already
     positions = np.array(positions)
     labels_correct = np.array(labels_correct)
-    
+
     # Compute azimuth (theta) and elevation (r)
     azimuth = np.arctan2(positions[:, 1], positions[:, 0])  # Radians
     elevation = np.arcsin(positions[:, 2] / np.linalg.norm(positions, axis=1))  # Radians
-    
+
     # Normalize elevation to [0, 1] for radial plotting
     elevation_normalized = (elevation - elevation.min()) / (elevation.max() - elevation.min())
-    
+
     # Combine data into a weighted histogram
     weights = np.where(labels_correct == 1, 1, -1)  # +1 for correct, -1 for misclassified
     heatmap, theta_edges, r_edges = np.histogram2d(
@@ -468,33 +474,33 @@ def visualize_positions_polar(positions: np.ndarray, labels_correct: np.ndarray,
     counts, _, _ = np.histogram2d(
         azimuth, elevation_normalized, bins=(36, 18), range=[[-np.pi, np.pi], [0, 1]]
     )
-    
+
     # Mask zero density areas
     heatmap_masked = np.ma.masked_where(counts == 0, heatmap)
-    
+
     fig, ax = plt.subplots(subplot_kw={'projection': 'polar'}, figsize=(10, 10))
-    
-    # Heatmap 
+
+    # Heatmap
     theta, r = np.meshgrid(theta_edges, r_edges)
     pcm = ax.pcolormesh(
         theta, r, heatmap_masked.T, cmap='RdBu', shading='auto',
         norm=TwoSlopeNorm(vmin=-heatmap.max(), vcenter=0, vmax=heatmap.max())
     )
-    
+
     # Add colorbar
     cbar = plt.colorbar(pcm, ax=ax, pad=0.1)
-    
+
     cbar.set_label('Point Density\n(Red: Misclassified, Blue: Well Classified)')
     # Add radial (elevation) ticks
-    elevation_ticks = np.linspace(0, 1, 5) 
+    elevation_ticks = np.linspace(0, 1, 5)
     elevation_labels = np.linspace(elevation.min(), elevation.max(), len(elevation_ticks))
     ax.set_yticks(elevation_ticks)
     ax.set_yticklabels([f"{np.degrees(e):.1f}°" for e in elevation_labels])
-    
+
     ax.set_title(title or 'Azimuth-Elevation Heatmap', va='bottom')
     ax.set_theta_zero_location("N")  # Set 0° at the top
     ax.set_theta_direction(-1)  # Clockwise azimuth
     ax.grid(True)
-    
+
     plt.tight_layout()
     plt.show()
