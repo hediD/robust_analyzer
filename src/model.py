@@ -18,11 +18,14 @@ from pytorch3d.renderer import (
     MeshRasterizer,
     SoftPhongShader,
     TexturesUV,
+    TexturesVertex,
     look_at_view_transform
 )
 
 from transformers import ViTForImageClassification, ViTImageProcessor
 import imageio.v3 as iio
+
+from pytorch3d.io import load_objs_as_meshes
 
 
 class Model(nn.Module):
@@ -74,17 +77,17 @@ class Model(nn.Module):
         verts = verts.to(self.device)
         faces_idx = faces.verts_idx.to(self.device)
 
-        # -- Load or create default texture --
+        # -- Handle texture setup --
         if texture_path is None:
             # Default: gray texture of size 1024 x 1024
-            texture_image = torch.ones((1, 1024, 1024, 3), device=self.device) * 0.5
+            texture_image = torch.ones((1, 1024, 1024, 3), device=self.device) * 0.7
         else:
             # Load texture from file
             pil_texture = Image.open(texture_path).convert('RGB')
             texture_arr = np.array(pil_texture).astype(np.float32) / 255.0
             texture_image = torch.from_numpy(texture_arr).unsqueeze(0).to(self.device)
 
-        # Update the default optimize_kwargs to include texture_centroids and lighting parameters
+        # Update the default optimize_kwargs
         self.optimize_kwargs = {
             "texture": False,
             "camera": False,
@@ -95,14 +98,21 @@ class Model(nn.Module):
 
         # -- Manage texture for batch and optimize_texture flag --
         if self.optimize_kwargs["texture"]:
-            # Create separate texture parameters for each item in the batch
             texture_image = nn.Parameter(texture_image.repeat(batch_size, 1, 1, 1), requires_grad=True)
         else:
-            # Expand texture to match batch size but not optimized
             texture_image = texture_image.expand(batch_size, -1, -1, -1).detach()
         self.texture_image = texture_image.detach().clone()
 
-        # -- Apply the texture to the mesh --
+        ## -- Apply the texture to the mesh --
+        #if aux.material_colors is not None:
+        #    # If using material colors, create TexturesVertex
+        #    # Reshape material colors to match vertex count
+        #    from ipdb import set_trace; set_trace()
+        #    material_colors = list(aux.material_colors.values())[0].to(self.device)
+        #    texture = TexturesVertex(verts_features=material_colors.expand(batch_size, verts.shape[0], -1))
+        #else:
+
+        # Otherwise use TexturesUV as before
         faces_uvs = faces.textures_idx.to(self.device)
         verts_uvs = aux.verts_uvs.to(self.device)
         texture = TexturesUV(
@@ -112,11 +122,17 @@ class Model(nn.Module):
         )
 
         # -- Create the mesh structure --
-        self.meshes = Meshes(
-            verts=[verts] * batch_size,
-            faces=[faces_idx] * batch_size,
-            textures=texture
-        ).to(self.device)
+        mesh = load_objs_as_meshes([obj_path], device=device)
+        mesh._verts_list = [v / 5.0 for v in mesh.verts_list()]
+        mesh = mesh.to(device).extend(batch_size)
+        self.meshes = mesh
+
+        # Move mesh to GPU if needed
+        #self.meshes = Meshes(
+        #    verts=[verts] * batch_size,
+        #    faces=[faces_idx] * batch_size,
+        #    textures=texture
+        #).to(self.device)
 
         # -- Compute bounding box properties (center, min, max distances) --
         self._calculate_bbox_properties(min_max_proportion)
@@ -137,14 +153,23 @@ class Model(nn.Module):
         self.init_light_intensity = torch.tensor([1.0] * batch_size, device=self.device)
 
         # -- Rasterization settings --
+        #default_raster_settings = {
+        #    'image_size': 224,
+        #    'blur_radius': 1e-6,
+        #    'faces_per_pixel': 1,
+        #    'max_faces_per_bin': 100_000
+        #}
+
         default_raster_settings = {
-            'image_size': 224,
-            'blur_radius': 1e-6,
-            'faces_per_pixel': 1,
-            'max_faces_per_bin': 100_000
+            'image_size': 512,
+            'blur_radius': 0.0,
+            'faces_per_pixel': 8,
+            'max_faces_per_bin': 10_000,
+            'bin_size': None
         }
-        if raster_settings is not None:
-            default_raster_settings.update(raster_settings)
+
+        #if raster_settings is not None:
+        #    default_raster_settings.update(raster_settings)
         self.raster_settings = RasterizationSettings(**default_raster_settings)
 
         # -- Cluster the texture for color centroid optimization --
@@ -175,6 +200,7 @@ class Model(nn.Module):
             specular_color=self.light_color * self.scene_params['light_intensity'].detach().unsqueeze(-1)
         ).to(self.device)
 
+        
         # -- Renderer --
         camera = FoVPerspectiveCameras(device=self.device)
         self.renderer = MeshRenderer(

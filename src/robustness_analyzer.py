@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-from typing import List, Dict 
+from typing import List, Dict, Optional
 from model import Model
 from collections import defaultdict
 from utils import analyze_logits, get_target_label, to_numpy
+from mtl_parser import prepare_texture_atlas
 
 
 class RobustnessAnalyzer:
@@ -13,6 +14,7 @@ class RobustnessAnalyzer:
 
     Args:
         obj_path (str): Path to the object mesh file
+        mtl_path (str): Path to the material file
         texture_path (str): Path to the texture file
         envmap_paths (List[str]): List of paths to environment maps
         target_class (str): Target class for the attack
@@ -204,7 +206,6 @@ class RobustnessAnalyzer:
                             )
 
                         except RuntimeError as iter_err:
-                            from ipdb import set_trace; set_trace()
                             print(f"Error in iteration {i}: {iter_err}")
                             continue
 
@@ -227,7 +228,7 @@ class RobustnessAnalyzer:
 if __name__ == "__main__":
     robustness_analyzer = RobustnessAnalyzer(
         obj_path="airplane/mesh.obj",
-        texture_path="airplane/texture.png",
+        mtl_path="airplane/mesh.mtl",
         envmap_paths=[
             "environments/klippad_dawn_2_k.exr",
             "environments/goegap_road_2k.exr"
