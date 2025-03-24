@@ -72,15 +72,17 @@ class Model(nn.Module):
         # -- Device setup --
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        use_mtl = texture_path is None
+
         # -- Load geometry --
-        verts, faces, aux = load_obj(obj_path)
+        verts, faces, aux = load_obj(obj_path, load_textures=use_mtl)
         verts = verts.to(self.device)
         faces_idx = faces.verts_idx.to(self.device)
 
         # -- Handle texture setup --
         if texture_path is None:
-            # Default: gray texture of size 1024 x 1024
-            texture_image = torch.ones((1, 1024, 1024, 3), device=self.device) * 0.7
+            # For now take the first texture, but we should handle multiple textures by merging them
+            texture_image = list(aux.texture_images.values())[0].unsqueeze(0).to(self.device)
         else:
             # Load texture from file
             pil_texture = Image.open(texture_path).convert('RGB')
@@ -95,6 +97,11 @@ class Model(nn.Module):
         }
         if optimize_kwargs is not None and isinstance(optimize_kwargs, dict):
             self.optimize_kwargs.update(optimize_kwargs)
+
+        if use_mtl and self.optimize_kwargs["texture"]:
+            print("Warning: can't optimize texture when using MTL files. you need to extract the texture from the material file "
+                  "and feed it to the model via the texture_path argument.")
+            self.optimize_kwargs["texture"] = False
 
         # -- Manage texture for batch and optimize_texture flag --
         if self.optimize_kwargs["texture"]:

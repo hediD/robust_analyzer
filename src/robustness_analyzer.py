@@ -5,7 +5,6 @@ from typing import List, Dict, Optional
 from model import Model
 from collections import defaultdict
 from utils import analyze_logits, get_target_label, to_numpy
-from mtl_parser import prepare_texture_atlas
 
 
 class RobustnessAnalyzer:
@@ -14,8 +13,7 @@ class RobustnessAnalyzer:
 
     Args:
         obj_path (str): Path to the object mesh file
-        mtl_path (str): Path to the material file
-        texture_path (str): Path to the texture file
+        texture_path (str): Path to the texture file (or None to use materials from MTL)
         envmap_paths (List[str]): List of paths to environment maps
         target_class (str): Target class for the attack
         batch_size (int): Batch size for optimization
