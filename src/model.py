@@ -64,7 +64,8 @@ class Model(nn.Module):
         raster_settings=None,
         min_max_proportion=(0.3, 0.8),
         batch_size=1,
-        nb_clusters=4
+        nb_clusters=4,
+        positive_z=True
     ):
         super().__init__()
         self.batch_size = batch_size
@@ -88,6 +89,8 @@ class Model(nn.Module):
             pil_texture = Image.open(texture_path).convert('RGB')
             texture_arr = np.array(pil_texture).astype(np.float32) / 255.0
             texture_image = torch.from_numpy(texture_arr).unsqueeze(0).to(self.device)
+
+        self.positive_z = positive_z
 
         # Update the default optimize_kwargs
         self.optimize_kwargs = {
@@ -159,19 +162,11 @@ class Model(nn.Module):
         self.init_light_location = self._get_random_camera_coords().to(self.device)
         self.init_light_intensity = torch.tensor([1.0] * batch_size, device=self.device)
 
-        # -- Rasterization settings --
-        #default_raster_settings = {
-        #    'image_size': 224,
-        #    'blur_radius': 1e-6,
-        #    'faces_per_pixel': 1,
-        #    'max_faces_per_bin': 100_000
-        #}
-
         default_raster_settings = {
-            'image_size': 512,
+            'image_size': 256,
             'blur_radius': 0.0,
-            'faces_per_pixel': 8,
-            'max_faces_per_bin': 10_000,
+            'faces_per_pixel': 4,
+            'max_faces_per_bin': 5_000,
             'bin_size': None
         }
 
@@ -266,14 +261,17 @@ class Model(nn.Module):
         # Compute radius from bounding box size and FOV
         r = self.bbox_size.cpu() / (2.0 * np.random.uniform(0.5, 0.7)) / torch.tan(fov * (torch.pi / 180.0) / 2)
 
-        # Random spherical angles theta, phi
-        theta = 2 * np.pi * np.random.rand(self.batch_size)
-        phi = np.arccos(2 * np.random.rand(self.batch_size) - 1)
+        # Random spherical angles azimuth, elevation
+        azimuth = 2 * np.pi * np.random.rand(self.batch_size)
+        if self.positive_z:
+            elevation = np.arccos(np.random.rand(self.batch_size))
+        else:
+            elevation = np.arccos(2 * np.random.rand(self.batch_size) - 1)
 
         # Convert spherical to Cartesian
-        x = r * np.sin(phi) * np.cos(theta)
-        y = r * np.sin(phi) * np.sin(theta)
-        z = r * np.cos(phi)
+        x = r * np.sin(elevation) * np.cos(azimuth)
+        y = r * np.sin(elevation) * np.sin(azimuth)
+        z = r * np.cos(elevation)
 
         coords = np.stack([x, y, z], axis=1).astype(np.float32)
         return torch.tensor(coords, device=self.device)
@@ -361,11 +359,14 @@ class Model(nn.Module):
 
         return texture
 
-    def _constrain_position(self, position: torch.Tensor, min_distance: float, max_distance: float) -> torch.Tensor:
+    def _constrain_position(self, position: torch.Tensor, min_distance: float, max_distance: float, positive_z: bool = True) -> torch.Tensor:
         """
         Clamps the position to be within [min_distance, max_distance]
         while preserving the direction from the bounding box center.
         """
+        if positive_z:
+            position[:, 2] = position[:, 2].clamp(min=0)
+
         camera_vectors = position - self.bbox_center
         distances = torch.norm(camera_vectors, dim=-1, keepdim=True)
         normalized_vectors = camera_vectors / (distances + 1e-9)  # avoid /0
@@ -381,7 +382,8 @@ class Model(nn.Module):
         self.scene_params['camera'].data = self._constrain_position(
             self.scene_params['camera'].data,
             self.min_distance,
-            self.max_distance
+            self.max_distance,
+            self.positive_z
         )
 
     def _constrain_texture(self) -> None:
@@ -400,7 +402,8 @@ class Model(nn.Module):
         self.scene_params['light_location'].data = self._constrain_position(
             self.scene_params['light_location'].data,
             self.min_distance,
-            self.max_distance
+            self.max_distance,
+            self.positive_z
         )
 
         # Keep light intensity in [0.5, 5]
