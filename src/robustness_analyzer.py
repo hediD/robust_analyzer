@@ -33,6 +33,7 @@ class RobustnessAnalyzer:
         batch_size: int = 10,
         targeted: bool = True,
         nb_clusters: int = 4,
+        positive_z: bool = True,
         device: str = "cuda"
     ):
         self.obj_path = obj_path
@@ -42,6 +43,7 @@ class RobustnessAnalyzer:
         self.batch_size = batch_size
         self.targeted = targeted
         self.device = device
+        self.positive_z = positive_z
 
         # Default optimization settings if none provided
         self.nb_clusters = nb_clusters
@@ -74,7 +76,8 @@ class RobustnessAnalyzer:
             raster_settings={"image_size": self.image_size},
             device=self.device,
             batch_size=self.batch_size,
-            nb_clusters=self.nb_clusters
+            nb_clusters=self.nb_clusters,
+            positive_z=self.positive_z
         )
         self.model.train()
 
