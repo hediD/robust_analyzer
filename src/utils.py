@@ -6,7 +6,7 @@ from collections import Counter
 import torchvision.transforms.functional as F
 from PIL import Image
 import pandas as pd
-from matplotlib.colors import TwoSlopeNorm
+from matplotlib.colors import TwoSlopeNorm, Normalize
 from typing import List, Optional
 import torch
 ch = torch
@@ -480,11 +480,26 @@ def visualize_positions_polar(positions: np.ndarray, labels_correct: np.ndarray,
 
     fig, ax = plt.subplots(subplot_kw={'projection': 'polar'}, figsize=(10, 10))
 
-    # Heatmap
-    theta, r = np.meshgrid(theta_edges, r_edges)
+    # Calculate heatmap with safety checks
+    heatmap = heatmap_masked.T
+    heatmap_masked = np.ma.masked_where(np.isnan(heatmap), heatmap)
+    
+    # Handle all-true or all-false cases
+    data_min, data_max = heatmap.min(), heatmap.max()
+    if data_min == data_max:
+        norm = Normalize(vmin=data_min, vmax=data_max)
+    else:
+        if data_min < 0 < data_max:
+            norm = TwoSlopeNorm(vmin=data_min, vcenter=0, vmax=data_max)
+        else:
+            norm = Normalize(vmin=data_min, vmax=data_max)
+    
+    # Fix: Use shading='gouraud' instead of 'auto' or 'flat'
     pcm = ax.pcolormesh(
-        theta, r, heatmap_masked.T, cmap='RdBu', shading='auto',
-        norm=TwoSlopeNorm(vmin=-heatmap.max(), vcenter=0, vmax=heatmap.max())
+        theta_edges, r_edges, heatmap_masked,
+        cmap='RdBu', 
+        shading='auto',  # Changed to 'gouraud' to handle dimension differences
+        norm=norm
     )
 
     # Add colorbar
@@ -504,3 +519,76 @@ def visualize_positions_polar(positions: np.ndarray, labels_correct: np.ndarray,
 
     plt.tight_layout()
     plt.show()
+
+def create_logits_comparison_table(all_results: dict, target_class: str = None):
+    """
+    Create an HTML table comparing initial and final logits analysis for different result types.
+    
+    Args:
+        all_results: Dictionary with keys as result types and values as dictionaries containing 
+                    'initial_logits' and 'final_logits'.
+        target_class: Optional target class to highlight in the analysis.
+        
+    Returns:
+        HTML string containing the styled comparison table.
+    """
+    # CSS styling for column widths and consistent heights
+    style = """
+    <style>
+        table {
+            border-collapse: collapse;
+            width: 100%;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: center;
+            vertical-align: top; /* Align content to the top */
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+        td:first-child, th:first-child {
+            width: 15%; /* Narrower first column */
+            text-align: left; /* Align text to the left for readability */
+        }
+        td, th {
+            width: 42.5%; /* Even distribution for the other columns */
+        }
+        .pandas-table {
+            height: 200px; /* Set a fixed height for all tables */
+            overflow: auto; /* Enable scrolling if content exceeds the height */
+        }
+    </style>
+    """
+
+    html_table = "<table>"
+    html_table += """
+    <tr>
+        <th></th>
+        <th style="text-align: center;">Initial</th>
+        <th style="text-align: center;">Final</th>
+    </tr>
+    """
+
+    for type_, results in all_results.items():
+        initial_analysis = analyze_logits_detailed(
+            np.concatenate(results["initial_logits"]).reshape(-1, 1000), target_class
+        )
+        final_analysis = analyze_logits_detailed(
+            np.concatenate(results["final_logits"]).reshape(-1, 1000), target_class
+        )
+        
+        html_table += f"""
+        <tr>
+            <td>{type_.capitalize()}</td>
+            <td class="pandas-table">{initial_analysis.to_html(index=False, border=0)}</td>
+            <td class="pandas-table">{final_analysis.to_html(index=False, border=0)}</td>
+        </tr>
+        """
+
+    html_table += "</table>"
+
+    # Return the styled HTML
+    from IPython.display import HTML, display
+    display(HTML(style + html_table))

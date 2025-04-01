@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from typing import List, Dict, Optional
 from model import Model
 from collections import defaultdict
@@ -65,6 +65,11 @@ class RobustnessAnalyzer:
         self._setup_model()
         self._setup_target()
         self.loss_fn = nn.CrossEntropyLoss()
+
+        # Add state tracking for intermediate results
+        self._current_results = defaultdict(list)
+        self._current_run = 0
+        self._current_iteration = 0
 
     def _setup_model(self) -> None:
         """Initialize the 3D model with given parameters."""
@@ -131,29 +136,23 @@ class RobustnessAnalyzer:
     def run(self, num_runs: int = 1, num_iterations: int = 100, **kwargs) -> Dict[str, List[torch.Tensor]]:
         """
         Run the optimization process with robust error handling.
-
-        Args:
-            num_runs (int): Number of optimization runs
-            num_iterations (int): Number of iterations per run
-
-        Returns:
-            Dict containing optimization results
+        Results are stored in self._current_results and updated continuously.
         """
-        results = defaultdict(list)
-
-        nb_ims = self.batch_size * (len(self.envmap_paths) or 1)
-
+        self._current_results = defaultdict(list)
+        
         for run in range(num_runs):
+            self._current_run = run
             try:
-                self._setup_model()  # Reset model for new run
+                self._setup_model()
                 self._create_optimizer(lr=kwargs.get('lr', 1e-1))
 
                 # Initialize lists to track probabilities and losses for this run
                 run_avg_probabilities = []
                 run_losses = []
 
-                with tqdm(total=num_iterations) as pbar:
+                with tqdm(total=num_iterations, mininterval=0.1) as pbar:
                     for i in range(num_iterations):
+                        self._current_iteration = i
                         try:
                             self._optimizer_zero_grad()
 
@@ -166,9 +165,10 @@ class RobustnessAnalyzer:
                             logits = self.model()
 
                             if i == 0:
-                                results['initial_logits'].append(logits.detach().cpu().clone())
+                                self._current_results['initial_logits'].append(logits.detach().cpu().clone())
 
                             # Reshape logits and target for loss computation
+                            nb_ims = self.batch_size * (len(self.envmap_paths) or 1)
                             logits_flat = logits.reshape(nb_ims, self.num_classes)
                             target_flat = self.target.reshape(nb_ims, self.num_classes)
 
@@ -179,7 +179,10 @@ class RobustnessAnalyzer:
                                 loss *= -1
 
                             loss.backward()
-                            results['grad_norms'].append([torch.norm(param.grad).item() for param in self.model.scene_params.values() if param.grad is not None])  
+                            self._current_results['grad_norms'].append(
+                                [torch.norm(param.grad).item() for param in self.model.scene_params.values() 
+                                 if param.grad is not None]
+                            )
 
                             for param in self.model.scene_params.values():
                                 if param.grad is not None:
@@ -206,24 +209,33 @@ class RobustnessAnalyzer:
                                 f" - LR: {self.param_groups[0]['lr']:.2e}"
                             )
 
+                            # Store intermediate results in class state
+                            self._current_results['loss'].append(loss_)
+                            self._current_results['avg_probability'].append(avg_prob)
+
                         except RuntimeError as iter_err:
                             print(f"Error in iteration {i}: {iter_err}")
                             continue
 
                 # Store run-level results
-                results['loss'].append(run_losses)
-                results['avg_probability'].append(run_avg_probabilities)  # true class probability
-                results['initial_camera_coords'].append(self.model.camera_coords.detach().cpu())  # Camera position before optimization
-                results["initial_scene_params"].append({k: v.detach().cpu().clone() for k, v in self.model.init_scene_params.items()})  # Scene parameters at the end of optimization
-                results["final_scene_params"].append({k: v.detach().cpu().clone() for k, v in self.model.scene_params.items()})  # Scene parameters at the end of optimization
-                results['final_logits'].append(logits.detach().cpu().clone())  # Final logits after optimization
-                results['final_texture'].append(to_numpy(self.model._fill_texture()).copy())  # Final texture after optimization
+                self._current_results['loss'].append(run_losses)
+                self._current_results['avg_probability'].append(run_avg_probabilities)  # true class probability
+                self._current_results['initial_camera_coords'].append(self.model.camera_coords.detach().cpu())  # Camera position before optimization
+                self._current_results["initial_scene_params"].append({k: v.detach().cpu().clone() for k, v in self.model.init_scene_params.items()})  # Scene parameters at the end of optimization
+                self._current_results["final_scene_params"].append({k: v.detach().cpu().clone() for k, v in self.model.scene_params.items()})  # Scene parameters at the end of optimization
+                self._current_results['final_logits'].append(logits.detach().cpu().clone())  # Final logits after optimization
+                self._current_results['final_texture'].append(to_numpy(self.model._fill_texture()).copy())  # Final texture after optimization
 
             except Exception as run_err:
                 print(f"Error in run {run}: {run_err}")
                 continue
 
-        return results
+        return self._current_results
+
+
+    def get_current_results(self) -> Dict[str, List[torch.Tensor]]:
+        """Get the latest results, even if optimization has failed."""
+        return self._current_results
 
 
 if __name__ == "__main__":
