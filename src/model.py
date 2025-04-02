@@ -27,7 +27,7 @@ import imageio.v3 as iio
 class Model(nn.Module):
     """
     A model that renders 3D objects and feeds them into an image classifier.
-    
+
     Key features:
       1. Loads a 3D mesh from an .obj file (with optional texture)
       2. Creates and optionally optimizes a texture (using clustering for color reduction)
@@ -52,7 +52,7 @@ class Model(nn.Module):
     ):
         """
         Initialize the model with mesh, texture, and rendering parameters.
-        
+
         Args:
             obj_path (str): Path to the .obj file of the mesh
             texture_path (str, optional): Path to the texture image file
@@ -81,10 +81,10 @@ class Model(nn.Module):
         }
         if optimize_kwargs is not None and isinstance(optimize_kwargs, dict):
             self.optimize_kwargs.update(optimize_kwargs)
-        
+
         # ------ MESH LOADING ------
         use_mtl = texture_path is None
-        
+
         # Load geometry from obj file
         verts, faces, aux = load_obj(obj_path, load_textures=use_mtl)
         verts = verts.to(self.device)
@@ -112,7 +112,7 @@ class Model(nn.Module):
         else:
             texture_image = texture_image.expand(batch_size, -1, -1, -1).detach()
         self.texture_image = texture_image.detach().clone()
-        
+
         # Create UV texture from loaded data
         faces_uvs = faces.textures_idx.to(self.device)
         verts_uvs = aux.verts_uvs.to(self.device)
@@ -175,7 +175,7 @@ class Model(nn.Module):
                                         ((k == 'light_location' or k == 'light_intensity') and self.optimize_kwargs['lighting'])
 
         self.scene_params = {
-            k: v.clone().detach().requires_grad_(optimize_predicate(k)) 
+            k: v.clone().detach().requires_grad_(optimize_predicate(k))
             for k, v in self.init_scene_params.items()
         }
 
@@ -236,7 +236,7 @@ class Model(nn.Module):
         self.n_envmaps = len(envmap_paths) if envmap_paths else 1
 
     # ------ SCENE PARAMETER METHODS ------
-    
+
     def update_scene_params(self, scene_params: Dict[str, torch.Tensor]) -> None:
         """Update the scene parameters with new values."""
         for param, value in scene_params.items():
@@ -257,14 +257,14 @@ class Model(nn.Module):
         self.max_distance = self.bbox_size / (2.0 * min_max_proportion[0])
 
     # ------ CAMERA POSITION METHODS ------
-    
+
     def _get_random_camera_coords(self, fov: torch.Tensor = torch.tensor(60.0)) -> torch.Tensor:
         """
         Generate random camera coordinates based on a spherical distribution.
-        
+
         Args:
             fov: Field of view in degrees
-            
+
         Returns:
             Tensor of camera coordinates with shape (batch_size, 3)
         """
@@ -289,13 +289,13 @@ class Model(nn.Module):
     def _constrain_position(self, position: torch.Tensor, min_distance: float, max_distance: float, positive_z: bool = True) -> torch.Tensor:
         """
         Clamp position to be within distance bounds while preserving direction.
-        
+
         Args:
             position: Position tensor to constrain
             min_distance: Minimum allowed distance from bounding box center
             max_distance: Maximum allowed distance from bounding box center
             positive_z: If True, constrain z coordinates to be positive
-            
+
         Returns:
             Constrained position tensor
         """
@@ -321,7 +321,7 @@ class Model(nn.Module):
     def distance_penalty(self) -> torch.Tensor:
         """
         Calculate penalty for camera distance outside allowed range.
-        
+
         Returns:
             Tensor representing the distance penalty
         """
@@ -333,14 +333,14 @@ class Model(nn.Module):
         return penalty.mean()
 
     # ------ TEXTURE METHODS ------
-    
+
     def _cluster_texture(self, nb_clusters: int = 3) -> Tuple[Dict[int, torch.Tensor], torch.Tensor]:
         """
         Cluster texture image into color groups for optimization.
-        
+
         Args:
             nb_clusters: Number of color clusters to create
-            
+
         Returns:
             Tuple containing:
             - Dictionary mapping cluster IDs to pixel indices
@@ -379,7 +379,7 @@ class Model(nn.Module):
     def _fill_texture(self) -> torch.Tensor:
         """
         Reconstruct texture from optimized cluster centroids.
-        
+
         Returns:
             Texture tensor with each pixel filled with its centroid color
         """
@@ -404,7 +404,7 @@ class Model(nn.Module):
         )
 
     # ------ LIGHTING METHODS ------
-    
+
     def _constrain_lights(self) -> None:
         """Constrain light position and intensity to reasonable values."""
         # Constrain light position
@@ -421,17 +421,17 @@ class Model(nn.Module):
         )
 
     # ------ ENVIRONMENT MAP METHODS ------
-    
+
     def _load_envmap(self, path: str, gamma: float = 2.2, alpha: float = 0.5, target_size: Tuple[int, int] = (1024, 2048)) -> torch.Tensor:
         """
         Load and process environment map.
-        
+
         Args:
             path: Path to environment map image
             gamma: Gamma correction value
             alpha: Scaling factor
             target_size: Desired (height, width) for resizing
-            
+
         Returns:
             Processed environment map tensor
         """
@@ -453,43 +453,43 @@ class Model(nn.Module):
     def _get_background_rays(self, R: torch.Tensor) -> torch.Tensor:
         """
         Generate world-space ray directions using Z-up convention.
-        
+
         Args:
             R: Rotation matrix for camera
-            
+
         Returns:
             Tensor of ray directions
         """
         H = W = self.raster_settings.image_size
         aspect_ratio = W / H
         fov_rad = torch.tensor(60.0 * np.pi / 180.0)
-        
+
         # Create normalized device coordinates
         y, x = torch.meshgrid(
             torch.linspace(-1, 1, H, device=self.device),
             torch.linspace(-1, 1, W, device=self.device),
             indexing="ij"
         )
-        
+
         # Apply perspective projection
         x = x * aspect_ratio * torch.tan(fov_rad/2)
         y = y * torch.tan(fov_rad/2)
-        
+
         # Camera space directions (forward is -Z in camera space)
         dirs = torch.stack([x, y, -torch.ones_like(x)], dim=-1)
         dirs = F.normalize(dirs, dim=-1)
-        
+
         # Transform to world space using rotation matrix
         return F.normalize(dirs @ R.transpose(1, 2), dim=-1)
 
     def _sample_envmap(self, directions: torch.Tensor, envmap_idx: int = 0) -> torch.Tensor:
         """
         Sample environment map based on ray directions.
-        
+
         Args:
             directions: Ray direction vectors
             envmap_idx: Index of environment map to sample
-            
+
         Returns:
             Sampled colors from environment map
         """
@@ -497,31 +497,31 @@ class Model(nn.Module):
         x = directions[..., 0]  # right
         y = directions[..., 1]  # forward
         z = directions[..., 2]  # up
-        
+
         # Calculate spherical coordinates
         phi = torch.atan2(x, y)  # azimuth around Z-axis
         theta = torch.acos(z.clamp(-1+1e-6, 1-1e-6))  # angle from Z-axis
-        
+
         # Convert to UV coordinates
         u = (phi / (2 * np.pi) + 0.5) % 1.0
         v = 1.0 - (theta / np.pi)  # Invert V coordinate
-        
+
         # Sample environment map
         H, W = self.envmaps.shape[1:3]
         u_idx = (u * (W - 1)).clamp(0, W-1).long()
         v_idx = (v * (H - 1)).clamp(0, H-1).long()
-        
+
         return self.envmaps[envmap_idx, v_idx, u_idx]
 
     def _get_background_mask(self, meshes: torch.Tensor, R: torch.Tensor, T: torch.Tensor) -> torch.Tensor:
         """
         Get mask indicating which pixels are background (not part of the mesh).
-        
+
         Args:
             meshes: PyTorch3D meshes object
             R: Rotation matrices
             T: Translation vectors
-            
+
         Returns:
             Boolean mask where True indicates background pixels
         """
@@ -531,22 +531,22 @@ class Model(nn.Module):
         return background_mask
 
     # ------ RENDERING METHODS ------
-    
+
     def render(self, with_grad: bool = True, image_res: Optional[int] = None) -> torch.Tensor:
         """
         Render the object with current parameters.
-        
+
         Args:
             with_grad: Whether to compute gradients during rendering
             image_res: Override default image resolution
-            
+
         Returns:
             Rendered images tensor with shape (B, N_envmaps, H, W, C)
         """
         # Use context manager if gradients are not needed
         with torch.set_grad_enabled(with_grad):
             meshes = self.meshes.clone()
-            
+
             # Handle custom resolution if specified
             if image_res is not None:
                 raster_settings = RasterizationSettings(
@@ -617,7 +617,7 @@ class Model(nn.Module):
 
             # Render base images with safety checks
             base_images = renderer(meshes_world=meshes, R=R, T=T)[..., :3]
-            
+
             # Check for NaN/Inf values and replace them
             if torch.isnan(base_images).any() or torch.isinf(base_images).any():
                 base_images = torch.where(
@@ -625,7 +625,7 @@ class Model(nn.Module):
                     torch.tensor([0.1, 0.1, 0.1], device=self.device),
                     base_images
                 )
-            
+
             # Apply stricter clamping to the rendered colors
             base_images = base_images.clamp(0.0, 0.95)
 
@@ -658,7 +658,7 @@ class Model(nn.Module):
     def render_initial(self) -> torch.Tensor:
         """
         Render mesh using initial parameters (original texture, initial camera coords).
-        
+
         Returns:
             Rendered images tensor
         """
@@ -731,14 +731,14 @@ class Model(nn.Module):
             return images
 
     # ------ FORWARD PASS ------
-    
+
     def forward(self, return_render: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass: render object and classify with ViT.
-        
+
         Args:
             return_render: If True, also return rendered images
-            
+
         Returns:
             Tuple containing:
             - Classification logits with shape (B, N_envmaps, num_classes)
