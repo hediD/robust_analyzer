@@ -221,11 +221,15 @@ class RobustnessAnalyzer:
 
                         except RuntimeError as iter_err:
                             torch.cuda.empty_cache()
+                            # handle OOM by reducing batch size and reinitializing the model
                             if "out of memory" in str(iter_err).lower():
-                                print(f"GPU OOM error in iteration {i}, reducing batch size and retrying...")
-                                # handle OOM by reducing batch size and reinitializing the model
-                                self.batch_size = max(1, self.batch_size // 2)
+                                # if batch size is 1, we cannot reduce further
+                                if self.batch_size == 1:
+                                    raise Exception("Batch size is 1, cannot reduce further")
+                                print(f"GPU OOM error in iteration {i}, reducing batch size to {self.batch_size} and retrying...")
+                                self.batch_size = self.batch_size // 2
                                 self._setup_model()  # Reinitialize with new batch size
+                                self._setup_target()  # Update the target tensor with new batch size
                             else:
                                 print(f"Error in iteration {i}: {iter_err}")
                             continue
