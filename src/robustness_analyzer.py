@@ -105,9 +105,9 @@ class RobustnessAnalyzer:
                 # Ensure the parameter is a leaf tensor
                 if not param.is_leaf:
                     param = param.detach().requires_grad_(True)
-                
+
                 self.param_groups.append({
-                    'params': [param], 
+                    'params': [param],
                     'lr': lr,
                     'name': name
                 })
@@ -139,7 +139,7 @@ class RobustnessAnalyzer:
         Results are stored in self._current_results and updated continuously.
         """
         self._current_results = defaultdict(list)
-        
+
         for run in range(num_runs):
             self._current_run = run
             try:
@@ -179,8 +179,14 @@ class RobustnessAnalyzer:
                                 loss *= -1
 
                             loss.backward()
+
+                            # Store GPU memory stats in GB
+                            if torch.cuda.is_available():
+                                self._current_results["gpu_memory"].append(torch.cuda.memory_allocated() / (1024 ** 3))
+                                self._current_results["gpu_memory_reserved"].append(torch.cuda.memory_reserved() / (1024 ** 3))
+
                             self._current_results['grad_norms'].append(
-                                [torch.norm(param.grad).item() for param in self.model.scene_params.values() 
+                                [torch.norm(param.grad).item() for param in self.model.scene_params.values()
                                  if param.grad is not None]
                             )
 
@@ -214,7 +220,14 @@ class RobustnessAnalyzer:
                             self._current_results['avg_probability'].append(avg_prob)
 
                         except RuntimeError as iter_err:
-                            print(f"Error in iteration {i}: {iter_err}")
+                            torch.cuda.empty_cache()
+                            if "out of memory" in str(iter_err).lower():
+                                print(f"GPU OOM error in iteration {i}, reducing batch size and retrying...")
+                                # handle OOM by reducing batch size and reinitializing the model
+                                self.batch_size = max(1, self.batch_size // 2)
+                                self._setup_model()  # Reinitialize with new batch size
+                            else:
+                                print(f"Error in iteration {i}: {iter_err}")
                             continue
 
                 # Store run-level results
@@ -229,6 +242,10 @@ class RobustnessAnalyzer:
             except Exception as run_err:
                 print(f"Error in run {run}: {run_err}")
                 continue
+
+            # free gpu memory
+            del logits, loss, logits_flat, target_flat
+            torch.cuda.empty_cache()
 
         return self._current_results
 

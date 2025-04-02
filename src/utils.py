@@ -483,7 +483,7 @@ def visualize_positions_polar(positions: np.ndarray, labels_correct: np.ndarray,
     # Calculate heatmap with safety checks
     heatmap = heatmap_masked.T
     heatmap_masked = np.ma.masked_where(np.isnan(heatmap), heatmap)
-    
+
     # Handle all-true or all-false cases
     data_min, data_max = heatmap.min(), heatmap.max()
     if data_min == data_max:
@@ -493,11 +493,11 @@ def visualize_positions_polar(positions: np.ndarray, labels_correct: np.ndarray,
             norm = TwoSlopeNorm(vmin=data_min, vcenter=0, vmax=data_max)
         else:
             norm = Normalize(vmin=data_min, vmax=data_max)
-    
+
     # Fix: Use shading='gouraud' instead of 'auto' or 'flat'
     pcm = ax.pcolormesh(
         theta_edges, r_edges, heatmap_masked,
-        cmap='RdBu', 
+        cmap='RdBu',
         shading='auto',  # Changed to 'gouraud' to handle dimension differences
         norm=norm
     )
@@ -523,12 +523,12 @@ def visualize_positions_polar(positions: np.ndarray, labels_correct: np.ndarray,
 def create_logits_comparison_table(all_results: dict, target_class: str = None):
     """
     Create an HTML table comparing initial and final logits analysis for different result types.
-    
+
     Args:
-        all_results: Dictionary with keys as result types and values as dictionaries containing 
+        all_results: Dictionary with keys as result types and values as dictionaries containing
                     'initial_logits' and 'final_logits'.
         target_class: Optional target class to highlight in the analysis.
-        
+
     Returns:
         HTML string containing the styled comparison table.
     """
@@ -578,7 +578,7 @@ def create_logits_comparison_table(all_results: dict, target_class: str = None):
         final_analysis = analyze_logits_detailed(
             np.concatenate(results["final_logits"]).reshape(-1, 1000), target_class
         )
-        
+
         html_table += f"""
         <tr>
             <td>{type_.capitalize()}</td>
@@ -592,3 +592,87 @@ def create_logits_comparison_table(all_results: dict, target_class: str = None):
     # Return the styled HTML
     from IPython.display import HTML, display
     display(HTML(style + html_table))
+
+
+def display_rendered_images(robust_analyzer, results, run_index=0, env_index=0, image_indices=None,
+                           image_res=256, max_cols=2, figsize=None):
+    """
+    Display rendered images with camera position information and prediction correctness.
+
+    Args:
+        model: The 3D model to render with
+        results: Dictionary containing results from RobustnessAnalyzer
+        run_index: Index of the run to display results from
+        env_index: Index of the environment map to use
+        image_indices: Indices of images to display (defaults to all)
+        image_res: Resolution for rendering
+        max_cols: Maximum number of columns in the grid
+        figsize: Figure size (width, height) tuple
+    """
+    model = robust_analyzer.model
+
+    # Ensure model has the updated parameters
+    model.update_scene_params(results["final_scene_params"][run_index])
+
+    # Render the images
+    render_ims = model.render(image_res=image_res, with_grad=False)
+
+    # Get predictions for the rendered images
+    with torch.no_grad():
+        logits = model()
+
+    # Define image indices if not provided
+    if image_indices is None:
+        image_indices = range(robust_analyzer.batch_size)
+
+    # Get target class index
+    target_class_idx = get_idx(robust_analyzer.target_class) if hasattr(robust_analyzer, 'target_class') else None
+
+    # Calculate grid dimensions
+    n_images = len(image_indices)
+    n_rows = math.ceil(n_images / max_cols)
+
+    # Create default figsize if not provided
+    if figsize is None:
+        figsize = (max_cols * 7, n_rows * 5)
+
+    # Create the figure and axes
+    fig, axes = plt.subplots(n_rows, max_cols, figsize=figsize)
+    axes = axes.flatten() if n_images > 1 else [axes]
+
+    # Display each image
+    for ax, im_idx in zip(axes, image_indices):
+        # Get camera position metrics
+        camera_pos = results["final_scene_params"][run_index]["camera"][im_idx][None]
+        azimuth, elevation, distance = compute_spherical_coordinates(camera_pos)
+
+        # Check if prediction is correct
+        pred_idx = logits[im_idx, env_index].argmax().item()
+        is_correct = (pred_idx == target_class_idx) if target_class_idx is not None else None
+        pred_class = get_target(pred_idx)
+
+        # Create title with position and prediction info
+        position_info = " ".join([
+            f"{metric}={value.item():.1f}"
+            for value, metric in zip([azimuth, elevation, distance], ["azimuth", "elevation", "distance"])
+        ])
+
+        if is_correct is not None:
+            # Add color codes
+            prediction_info = f"\n{pred_class[:20]}... ({'✓' if is_correct else '✗'})"
+        else:
+            prediction_info = f"\n{pred_class[:20]}..."
+
+        title = position_info + prediction_info
+
+        # Display image with title
+        ax.imshow(to_numpy(render_ims[im_idx][env_index]))
+        ax.axis("off")
+        ax.set_title(title)
+
+    # Hide unused axes
+    for ax in axes[len(image_indices):]:
+        ax.axis("off")
+
+    plt.tight_layout()
+    plt.show()
