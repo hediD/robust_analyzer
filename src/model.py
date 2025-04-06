@@ -439,7 +439,7 @@ class Model(nn.Module):
         im = iio.imread(path)[..., :3]
 
         # Convert to tensor and resize
-        im_tensor = torch.tensor(im, device=self.device, dtype=torch.float32)
+        im_tensor = torch.tensor(im, device=self.device, dtype=torch.float32).squeeze(0)
         im_resized = F.interpolate(
             im_tensor.permute(2, 0, 1).unsqueeze(0),  # Add batch dimension
             size=target_size,
