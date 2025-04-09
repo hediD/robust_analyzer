@@ -7,6 +7,7 @@ from typing import Dict, Tuple, Optional
 from PIL import Image
 from sklearn.cluster import KMeans
 from torchvision import transforms
+import pyexr
 
 from pytorch3d.io import load_obj, load_objs_as_meshes
 from pytorch3d.renderer import (
@@ -436,7 +437,7 @@ class Model(nn.Module):
             Processed environment map tensor
         """
         # Read image
-        im = iio.imread(path)[..., :3]
+        im = pyexr.open(path).get()[..., 3]
 
         # Convert to tensor and resize
         im_tensor = torch.tensor(im, device=self.device, dtype=torch.float32).squeeze(0)
