@@ -1,4 +1,3 @@
-# The idea here is to discard the parts of the image that are not in the background and only tokens that constitute the object
 import math
 import numpy as np
 import matplotlib.pyplot as plt
@@ -638,7 +637,7 @@ def display_rendered_images(robust_analyzer, results, run_index=0, env_index=0, 
 
     # Create the figure and axes
     fig, axes = plt.subplots(n_rows, max_cols, figsize=figsize)
-    axes = axes.flatten() if n_images > 1 else [axes]
+    axes = np.atleast_1d(axes).flatten()
 
     # Display each image
     for ax, im_idx in zip(axes, image_indices):
