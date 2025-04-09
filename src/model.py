@@ -437,7 +437,7 @@ class Model(nn.Module):
             Processed environment map tensor
         """
         # Read image
-        im = pyexr.open(path).get()[..., 3]
+        im = pyexr.open(path).get()[..., :3]
 
         # Convert to tensor and resize
         im_tensor = torch.tensor(im, device=self.device, dtype=torch.float32).squeeze(0)
