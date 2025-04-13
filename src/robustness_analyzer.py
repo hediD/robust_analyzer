@@ -21,6 +21,7 @@ class RobustnessAnalyzer:
         optimize_kwargs (Dict): Optimization flags for camera, texture, and lighting
         num_iterations (int): Number of optimization iterations
         device (str): Device to run optimization on ('cuda' or 'cpu')
+        raster_settings (Dict, optional): Dictionary of rasterization settings. Defaults to {"image_size": 224}.
     """
 
     def __init__(
@@ -34,7 +35,8 @@ class RobustnessAnalyzer:
         targeted: bool = True,
         nb_clusters: int = 4,
         positive_z: bool = True,
-        device: str = "cuda"
+        device: str = "cuda",
+        raster_settings: Optional[Dict] = {}
     ):
         self.obj_path = obj_path
         self.texture_path = texture_path
@@ -59,9 +61,9 @@ class RobustnessAnalyzer:
 
         # Constants
         self.num_classes = 1000  # ImageNet classes
-        self.image_size = 224
 
         # Setup
+        self.raster_settings = raster_settings
         self._setup_model()
         self._setup_target()
         self.loss_fn = nn.CrossEntropyLoss()
@@ -78,7 +80,7 @@ class RobustnessAnalyzer:
             texture_path=self.texture_path,
             envmap_paths=self.envmap_paths,
             optimize_kwargs=self.optimize_kwargs,
-            raster_settings={"image_size": self.image_size},
+            raster_settings=self.raster_settings,
             device=self.device,
             batch_size=self.batch_size,
             nb_clusters=self.nb_clusters,
@@ -262,14 +264,15 @@ class RobustnessAnalyzer:
 if __name__ == "__main__":
     robustness_analyzer = RobustnessAnalyzer(
         obj_path="airplane/mesh.obj",
-        mtl_path="airplane/mesh.mtl",
+        texture_path="airplane/mesh.mtl",
         envmap_paths=[
             "environments/klippad_dawn_2_k.exr",
             "environments/goegap_road_2k.exr"
         ],
         target_class="space shuttle",
         batch_size=10,
-        targeted=True
+        targeted=True,
+        raster_settings={"image_size": 512, "blur_radius": 0.001},
     )
 
     # Run optimization

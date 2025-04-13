@@ -151,12 +151,15 @@ class Model(nn.Module):
         # ------ RENDERING SETTINGS ------
         default_raster_settings = {
             'image_size': 256,
-            'blur_radius': 0.0,
-            'faces_per_pixel': 4,
-            'max_faces_per_bin': 25_000,
+            'blur_radius': 1e-6,
+            'faces_per_pixel': 8,
+            'bin_size': 16,
+            'max_faces_per_bin': 20_000,
         }
 
-        self.raster_settings = RasterizationSettings(**default_raster_settings)
+        raster_settings = {**default_raster_settings, **raster_settings}
+
+        self.raster_settings = RasterizationSettings(**raster_settings)
 
         # ------ TEXTURE CLUSTERING ------
         # Cluster the texture for color centroid optimization
