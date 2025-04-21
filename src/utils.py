@@ -716,7 +716,7 @@ def create_logits_comparison_table(all_results: dict, target_class: str = None):
 
 
 def display_rendered_images(robust_analyzer, results, run_index=0, env_index=0, image_indices=None,
-                           image_res=256, max_cols=2, figsize=None):
+                           max_cols=2, figsize=None, raster_settings={}):
     """
     Display rendered images with camera position information and prediction correctness.
 
@@ -726,9 +726,9 @@ def display_rendered_images(robust_analyzer, results, run_index=0, env_index=0, 
         run_index: Index of the run to display results from
         env_index: Index of the environment map to use
         image_indices: Indices of images to display (defaults to all)
-        image_res: Resolution for rendering
         max_cols: Maximum number of columns in the grid
         figsize: Figure size (width, height) tuple
+        raster_settings: Raster settings for rendering
     """
     model = robust_analyzer.model
 
@@ -736,7 +736,7 @@ def display_rendered_images(robust_analyzer, results, run_index=0, env_index=0, 
     model.update_scene_params(results["final_scene_params"][run_index])
 
     # Render the images
-    render_ims = model.render(image_res=image_res, with_grad=False)
+    render_ims = model.render(with_grad=False, raster_settings=raster_settings)
 
     # Get predictions for the rendered images
     with torch.no_grad():
@@ -797,3 +797,4 @@ def display_rendered_images(robust_analyzer, results, run_index=0, env_index=0, 
 
     plt.tight_layout()
     plt.show()
+
