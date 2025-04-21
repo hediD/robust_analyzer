@@ -9,6 +9,7 @@ def parse_mtl(mtl_path):
     """Parse .mtl file to extract all material properties."""
     materials = OrderedDict()
     current_mtl = None
+    mtl_dir = os.path.dirname(os.path.abspath(mtl_path))
 
     with open(mtl_path, 'r', encoding='utf-8') as f:
         for line in f:
@@ -18,7 +19,7 @@ def parse_mtl(mtl_path):
 
             if line.startswith('newmtl '):
                 current_mtl = line.split(None, 1)[1]
-                materials[current_mtl] = {'map_Kd': None}
+                materials[current_mtl] = {'map_Kd': None, '_mtl_dir': mtl_dir}
 
             elif current_mtl is not None and ' ' in line:
                 key, value = line.split(' ', 1)
@@ -58,7 +59,7 @@ def parse_obj(obj_path):
             elif stripped.startswith('o '):
                 current_object = stripped.split(None, 1)[1]
                 object_groups.append(('o', current_object))
-                
+
             elif stripped.startswith('g '):
                 current_group = stripped.split(None, 1)[1]
                 object_groups.append(('g', current_group))
@@ -98,38 +99,52 @@ def load_textures(materials):
     result = []
     max_width = 1
     max_height = 1
-    
+
     # First pass: load images and find maximum dimensions
     for mat_name, props in materials.items():
         tex_path = props.get('map_Kd')
-        if tex_path and os.path.isfile(tex_path):
-            img = Image.open(tex_path).convert('RGBA')
-            max_width = max(max_width, img.width)
-            max_height = max(max_height, img.height)
-            result.append((mat_name, img, False))
-        else:
-            try:
-                kd = props.get('Kd', '0.5 0.5 0.5').split()
-                color = (
-                    int(float(kd[0]) * 255),
-                    int(float(kd[1]) * 255),
-                    int(float(kd[2]) * 255),
-                    255
-                )
-            except (IndexError, ValueError):
-                color = (128, 128, 128, 255)
-                
-            img = Image.new('RGBA', (16, 16), color)
-            result.append((mat_name, img, True))
-    
+        mtl_dir = props.get('_mtl_dir', '')
+
+        # Try to resolve texture path relative to MTL file directory
+        if tex_path:
+            full_tex_path = os.path.join(mtl_dir, tex_path) if mtl_dir else tex_path
+            if os.path.isfile(full_tex_path):
+                img = Image.open(full_tex_path).convert('RGBA')
+                max_width = max(max_width, img.width)
+                max_height = max(max_height, img.height)
+                result.append((mat_name, img, False))
+                continue
+            # If that fails, try the original path
+            elif os.path.isfile(tex_path):
+                img = Image.open(tex_path).convert('RGBA')
+                max_width = max(max_width, img.width)
+                max_height = max(max_height, img.height)
+                result.append((mat_name, img, False))
+                continue
+
+        # Fallback for textures not found
+        try:
+            kd = props.get('Kd', '0.5 0.5 0.5').split()
+            color = (
+                int(float(kd[0]) * 255),
+                int(float(kd[1]) * 255),
+                int(float(kd[2]) * 255),
+                255
+            )
+        except (IndexError, ValueError):
+            color = (128, 128, 128, 255)
+
+        img = Image.new('RGBA', (16, 16), color)
+        result.append((mat_name, img, True))
+
     # Second pass: resize textures appropriately
     final_result = []
     for i, (mat_name, img, is_fallback) in enumerate(result):
         if not is_fallback and (img.width < max_width or img.height < max_height):
             img = img.resize((max_width, max_height), Image.LANCZOS)
-        
+
         final_result.append((mat_name, img, is_fallback))
-    
+
     return final_result
 
 
@@ -140,29 +155,29 @@ def pack_textures_horizontal(mat_images, padding=5, fallback_size_factor=0.1):
     main_texture = next((img for _, img, is_fallback in mat_images if not is_fallback), None)
     if not main_texture:
         main_texture = mat_images[0][1]
-    
+
     main_width = main_texture.width
     main_height = main_texture.height
-    
+
     fallback_width = max(int(main_width * fallback_size_factor), 32)
-    
+
     total_width = sum(
-        main_width if not is_fallback else fallback_width 
+        main_width if not is_fallback else fallback_width
         for _, _, is_fallback in mat_images
     )
     total_width += padding * (len(mat_images) - 1)
-    
+
     atlas = Image.new('RGBA', (total_width, main_height))
 
     offsets_and_scales = {}
     current_x = 0
-    
+
     for (mat_name, img, is_fallback) in mat_images:
         width = fallback_width if is_fallback else main_width
-        
+
         if is_fallback or img.width != width or img.height != main_height:
             img = img.resize((width, main_height), Image.LANCZOS)
-        
+
         flipped_img = img.transpose(Image.FLIP_TOP_BOTTOM)
         atlas.paste(flipped_img, (current_x, 0))
 
@@ -184,11 +199,11 @@ def write_atlas_mtl(mtl_out_path, materials, atlas_texture_name="atlas.png"):
         if 'map_Kd' not in props or props['map_Kd'] is None:
             base_material = props
             break
-    
+
     with open(mtl_out_path, 'w', encoding='utf-8') as f:
         f.write("newmtl AtlasMaterial\n")
         f.write(f"map_Kd {atlas_texture_name}\n")
-        
+
         if base_material:
             for key, value in base_material.items():
                 if key != 'map_Kd':
@@ -217,18 +232,14 @@ def generate_atlas_obj(obj_in_path, obj_out_path, atlas_offsets, atlas_mtl_filen
     new_faces = []
 
     with open(obj_out_path, 'w', encoding='utf-8') as out_f:
-        # Write basic header
         out_f.write(f"mtllib {atlas_mtl_filename}\n")
-        
-        # Write vertices without comments
+
         for v_line in vertices:
             out_f.write(f"{v_line}\n")
-            
-        # Write normals without comments
+
         for vn_line in normals:
             out_f.write(f"{vn_line}\n")
 
-        # Single material declaration
         out_f.write(f"usemtl {unified_material}\n")
 
         # Process faces

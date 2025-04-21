@@ -26,7 +26,7 @@ from transformers import ViTForImageClassification, ViTImageProcessor
 import imageio.v3 as iio
 
 Image.MAX_IMAGE_PIXELS = None  # Ignore warning about Atlas texture can be very high resolution, will be downscaled
-TEXTURE_MAX_IMAGE_PIXELS = 80_000_000  # Atlas texture can be very high resolution
+TEXTURE_MAX_IMAGE_PIXELS = 40_000_000  # Atlas texture can be very high resolution
 
 def downscale_to_max_pixels(pil_img, max_pixels):
     """
@@ -62,7 +62,7 @@ class Model(nn.Module):
         camera_coords=None,
         device=None,
         optimize_kwargs=None,
-        raster_settings=None,
+        raster_settings={},
         min_max_proportion=(0.3, 0.8),
         batch_size=1,
         nb_clusters=4,
@@ -198,7 +198,6 @@ class Model(nn.Module):
         optimize_predicate = lambda k: (self.optimize_kwargs["camera"] and k=="camera") or \
                                         (k == 'texture_centroids' and self.optimize_kwargs['texture']) or \
                                         ((k == 'light_location' or k == 'light_intensity') and self.optimize_kwargs['lighting'])
-
         self.scene_params = {
             k: v.clone().detach().requires_grad_(optimize_predicate(k))
             for k, v in self.init_scene_params.items()
@@ -557,7 +556,7 @@ class Model(nn.Module):
 
     # ------ RENDERING METHODS ------
 
-    def render(self, with_grad: bool = True, image_res: Optional[int] = None) -> torch.Tensor:
+    def render(self, with_grad: bool = True, raster_settings: Optional[Dict] = {}) -> torch.Tensor:
         """
         Render the object with current parameters.
 
@@ -572,13 +571,12 @@ class Model(nn.Module):
         with torch.set_grad_enabled(with_grad):
             meshes = self.meshes.clone()
 
-            # Handle custom resolution if specified
-            if image_res is not None:
-                raster_settings = RasterizationSettings(
-                    **{**vars(self.raster_settings), 'image_size': image_res}
-                )
+            if raster_settings:
+                # Merge with existing settings and create a new RasterizationSettings object
+                merged_settings = {**vars(self.raster_settings), **raster_settings}
+                raster_settings_obj = RasterizationSettings(**merged_settings)
             else:
-                raster_settings = self.raster_settings
+                raster_settings_obj = self.raster_settings
 
             # Apply constraints to parameters if computing gradients
             if with_grad:
@@ -631,7 +629,7 @@ class Model(nn.Module):
             renderer = MeshRenderer(
                 rasterizer=MeshRasterizer(
                     cameras=camera,
-                    raster_settings=raster_settings
+                    raster_settings=raster_settings_obj
                 ),
                 shader=SoftPhongShader(
                     device=self.device,
