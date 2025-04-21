@@ -227,9 +227,9 @@ class RobustnessAnalyzer:
                             if "out of memory" in str(iter_err).lower():
                                 # if batch size is 1, we cannot reduce further
                                 if self.batch_size == 1:
-                                    raise Exception("Batch size is 1, cannot reduce further")
-                                print(f"GPU OOM error in iteration {i}, reducing batch size to {self.batch_size} and retrying...")
+                                    raise Exception("Batch size is 1, cannot reduce further, reduce image size or number of environments")
                                 self.batch_size = self.batch_size // 2
+                                print(f"GPU OOM error in iteration {i}, reducing batch size to {self.batch_size} and retrying...")
                                 self._setup_model()  # Reinitialize with new batch size
                                 self._setup_target()  # Update the target tensor with new batch size
                             else:

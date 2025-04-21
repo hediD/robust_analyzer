@@ -25,6 +25,23 @@ from pytorch3d.renderer import (
 from transformers import ViTForImageClassification, ViTImageProcessor
 import imageio.v3 as iio
 
+Image.MAX_IMAGE_PIXELS = None  # Ignore warning about Atlas texture can be very high resolution, will be downscaled
+TEXTURE_MAX_IMAGE_PIXELS = 80_000_000  # Atlas texture can be very high resolution
+
+def downscale_to_max_pixels(pil_img, max_pixels):
+    """
+    Downscale a PIL image so that its total number of pixels does not exceed max_pixels.
+    Preserves aspect ratio. Returns the (possibly) resized image.
+    """
+    w, h = pil_img.size
+    n_pixels = w * h
+    if n_pixels > max_pixels:
+        scale = (max_pixels / n_pixels) ** 0.5
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
+    return pil_img
+
 class Model(nn.Module):
     """
     A model that renders 3D objects and feeds them into an image classifier.
@@ -94,12 +111,16 @@ class Model(nn.Module):
         # ------ TEXTURE SETUP ------
         if texture_path is None:
             # Use first texture from MTL file
-            texture_image = list(aux.texture_images.values())[0].unsqueeze(0).to(self.device)
+            texture_arr = list(aux.texture_images.values())[0].cpu().numpy()
+            pil_texture = Image.fromarray((texture_arr * 255).astype(np.uint8))
         else:
             # Load texture from file
             pil_texture = Image.open(texture_path).convert('RGB')
-            texture_arr = np.array(pil_texture).astype(np.float32) / 255.0
-            texture_image = torch.from_numpy(texture_arr).unsqueeze(0).to(self.device)
+
+        max_pixels = globals().get("TEXTURE_MAX_IMAGE_PIXELS", float('inf'))
+        pil_texture = downscale_to_max_pixels(pil_texture, max_pixels)
+        texture_arr = np.array(pil_texture).astype(np.float32) / 255.0
+        texture_image = torch.from_numpy(texture_arr).unsqueeze(0).to(self.device)
 
         # Check if we can optimize texture (can't optimize with MTL)
         if use_mtl and self.optimize_kwargs["texture"]:
@@ -150,7 +171,7 @@ class Model(nn.Module):
 
         # ------ RENDERING SETTINGS ------
         default_raster_settings = {
-            'image_size': 256,
+            'image_size': 224,
             'blur_radius': 1e-6,
             'faces_per_pixel': 8,
             'bin_size': 16,

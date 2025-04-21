@@ -5,7 +5,7 @@ from collections import Counter
 import torchvision.transforms.functional as F
 from PIL import Image
 import pandas as pd
-from matplotlib.colors import TwoSlopeNorm, Normalize
+from matplotlib.colors import TwoSlopeNorm, Normalize, LinearSegmentedColormap
 from typing import List, Optional
 import torch
 ch = torch
@@ -355,7 +355,15 @@ def compute_spherical_coordinates(positions: np.ndarray):
     elevation = np.arcsin(positions[:, 2] / norm) * 180 / np.pi
     return azimuth, elevation, norm
 
-def visualize_positions_with_distributions(positions: np.ndarray, labels_correct: np.ndarray, title: str = None, fontsize: int = 18, return_stats: bool = False):
+
+def visualize_positions_with_distributions(
+    positions: np.ndarray,
+    labels_correct: np.ndarray,
+    title: str = None,
+    fontsize: int = 18,
+    return_stats: bool = False,
+    mode: str = "all"  # "all", "3d", or "distributions"
+):
     """
     Visualize 3D positions and distributions of azimuth, elevation, and norm.
 
@@ -368,7 +376,20 @@ def visualize_positions_with_distributions(positions: np.ndarray, labels_correct
         Base title for the plots
     fontsize : int, optional
         Font size for plot text. Default is 18.
+    return_stats : bool, optional
+        Whether to return statistics.
+    mode : str, optional
+        "all" (default): show both 3D scatter and histograms in one figure.
+        "3d": show only the 3D scatter plot.
+        "distributions": show only the histograms.
     """
+
+    def plot_max_normalized_hist(ax, data, bins, color, label):
+        counts, bin_edges = np.histogram(data, bins=bins)
+        if counts.max() > 0:
+            counts = counts / counts.max()  # Normalize so max bar is 1
+            bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+            ax.bar(bin_centers, counts, width=(bin_edges[1] - bin_edges[0]), color=color, alpha=0.5, label=label)
 
     # Convert to numpy arrays if not already
     positions = np.array(positions)
@@ -382,45 +403,134 @@ def visualize_positions_with_distributions(positions: np.ndarray, labels_correct
     norm_true, norm_wrong = norm[labels_correct == 1], norm[labels_correct == 0]
     positions_true, positions_wrong = positions[labels_correct == 1], positions[labels_correct == 0]
 
-    # Plot 1: 3D Scatter Plot
-    fig1 = plt.figure(figsize=(10, 8))
-    ax1 = fig1.add_subplot(111, projection='3d')
-    ax1.scatter(positions_true[:, 0], positions_true[:, 1], positions_true[:, 2],
-                c='blue', label='True label', alpha=0.5)
-    ax1.scatter(positions_wrong[:, 0], positions_wrong[:, 1], positions_wrong[:, 2],
-                c='red', label='Wrong label', alpha=0.5)
-    ax1.set_title(f'{title or "3D Positions"}', fontsize=fontsize)
-    ax1.set_xlabel('X', fontsize=fontsize)
-    ax1.set_ylabel('Y', fontsize=fontsize)
-    ax1.set_zlabel('Z', fontsize=fontsize)
-    ax1.legend(fontsize=fontsize)
-    plt.tight_layout()
-    plt.show()
+    if mode == "3d":
+        fig = plt.figure(figsize=(10, 8))
+        ax1 = fig.add_subplot(111, projection='3d')
+        ax1.scatter(positions_true[:, 0], positions_true[:, 1], positions_true[:, 2],
+                    c='blue', label='True label', alpha=0.5)
+        ax1.scatter(positions_wrong[:, 0], positions_wrong[:, 1], positions_wrong[:, 2],
+                    c='red', label='Wrong label', alpha=0.5)
+        ax1.set_xlabel('X', fontsize=fontsize)
+        ax1.set_ylabel('Y', fontsize=fontsize)
+        ax1.set_zlabel('Z', fontsize=fontsize)
+        ax1.set_title("3D Positions", fontsize=fontsize)
+        # Option 1: Legend on the right side
+        ax1.legend(
+            loc='center left',
+            bbox_to_anchor=(1.05, 0.5),
+            fontsize=fontsize,
+            frameon=False
+        )
+        # Option 2: Legend just under the title (uncomment to use)
+        # ax1.legend(
+        #     loc='upper center',
+        #     bbox_to_anchor=(0.5, 0.88),
+        #     fontsize=fontsize,
+        #     frameon=False
+        # )
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
+        plt.show()
 
-    # Plot 2: Histograms with unified legend
-    fig2, axes = plt.subplots(1, 3, figsize=(18, 6))
+    elif mode == "distributions":
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        # Azimuth Histogram
+        plot_max_normalized_hist(axes[0], azimuth_true, bins=20, color='blue', label='True')
+        plot_max_normalized_hist(axes[0], azimuth_wrong, bins=20, color='red', label='Wrong')
+        axes[0].set_xlabel('Azimuth (degrees)', fontsize=fontsize)
+        axes[0].set_ylabel('Relative Frequency\n(max=1 per true/wrong group)', fontsize=fontsize-3)
+        axes[0].set_title("Azimuth", fontsize=fontsize)
 
-    # Azimuth Histogram
-    axes[0].hist(azimuth_true, bins=20, color='blue', alpha=0.5, density=True)
-    axes[0].hist(azimuth_wrong, bins=20, color='red', alpha=0.5, density=True)
-    axes[0].set_xlabel('Azimuth (degrees)', fontsize=fontsize)
-    axes[0].set_ylabel('Likelihood', fontsize=fontsize)
+        # Elevation Histogram
+        plot_max_normalized_hist(axes[1], elevation_true, bins=20, color='blue', label='True')
+        plot_max_normalized_hist(axes[1], elevation_wrong, bins=20, color='red', label='Wrong')
+        axes[1].set_xlabel('Elevation (degrees)', fontsize=fontsize)
+        axes[1].set_title("Elevation", fontsize=fontsize)
+        # Norm/Distance Histogram
+        plot_max_normalized_hist(axes[2], norm_true, bins=20, color='blue', label='True')
+        plot_max_normalized_hist(axes[2], norm_wrong, bins=20, color='red', label='Wrong')
+        axes[2].set_xlabel('Distance', fontsize=fontsize)
+        axes[2].set_title("Distance", fontsize=fontsize)
+        fig.suptitle(
+            title or "Analysis of 3D Spherical Distribution of Model Classification",
+            fontsize=fontsize + 2,
+            y=1.05
+        )
+        fig.legend(
+            ['True', 'Wrong'],
+            loc='upper center',
+            fontsize=fontsize,
+            ncol=2,
+            bbox_to_anchor=(0.5, 1.01),
+            frameon=False
+        )
+        # Add total correct vs incorrect below the middle plot
+        axes[1].text(
+            0.5, -0.28,
+            f"Total correct: {len(azimuth_true)}   Total wrong: {len(azimuth_wrong)}",
+            ha='center', va='top', fontsize=fontsize - 2, transform=axes[1].transAxes
+        )
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
+        plt.show()
 
-    # Elevation Histogram
-    axes[1].hist(elevation_true, bins=20, color='blue', alpha=0.5, density=True)
-    axes[1].hist(elevation_wrong, bins=20, color='red', alpha=0.5, density=True)
-    axes[1].set_xlabel('Elevation (degrees)', fontsize=fontsize)
-
-    # Norm/Distance Histogram
-    axes[2].hist(norm_true, bins=20, color='blue', alpha=0.5, density=True)
-    axes[2].hist(norm_wrong, bins=20, color='red', alpha=0.5, density=True)
-    axes[2].set_xlabel('Distance', fontsize=fontsize)
-
-    # Add unified legend
-    fig2.legend(['True', 'Wrong'], loc='upper center', fontsize=fontsize, ncol=2, bbox_to_anchor=(0.5, 1.05))
-
-    plt.tight_layout(rect=[0, 0, 1, 0.95])  # Adjust layout to fit the legend
-    plt.show()
+    else:  # mode == "all"
+        fig = plt.figure(figsize=(24, 6))
+        gs = fig.add_gridspec(1, 4, width_ratios=[1.2, 1, 1, 1])
+        # 3D Scatter Plot
+        ax1 = fig.add_subplot(gs[0], projection='3d')
+        ax1.scatter(positions_true[:, 0], positions_true[:, 1], positions_true[:, 2],
+                    c='blue', label='True label', alpha=0.5)
+        ax1.scatter(positions_wrong[:, 0], positions_wrong[:, 1], positions_wrong[:, 2],
+                    c='red', label='Wrong label', alpha=0.5)
+        ax1.set_xlabel('X', fontsize=fontsize)
+        ax1.set_ylabel('Y', fontsize=fontsize)
+        ax1.set_zlabel('Z', fontsize=fontsize)
+        ax1.set_title("3D Positions", fontsize=fontsize)
+        # Azimuth Histogram
+        ax2 = fig.add_subplot(gs[1])
+        plot_max_normalized_hist(ax2, azimuth_true, bins=20, color='blue', label='True')
+        plot_max_normalized_hist(ax2, azimuth_wrong, bins=20, color='red', label='Wrong')
+        ax2.set_xlabel('Azimuth (degrees)', fontsize=fontsize)
+        ax2.set_ylabel('Max-normalized Frequency\n(per true/wrong group)', fontsize=fontsize-3)
+        ax2.set_title("Azimuth", fontsize=fontsize)
+        # Add the second line below the y-label, with smaller font
+        ax2.text(
+            -0.25, 1.02,  # x, y in axes fraction coordinates (tweak as needed)
+            "Each group is max-normalized\n(Tallest bar = 1 per true/wrong group)",
+            ha='left', va='bottom', fontsize=fontsize-4, transform=ax2.transAxes
+        )
+        # Elevation Histogram
+        ax3 = fig.add_subplot(gs[2])
+        plot_max_normalized_hist(ax3, elevation_true, bins=20, color='blue', label='True')
+        plot_max_normalized_hist(ax3, elevation_wrong, bins=20, color='red', label='Wrong')
+        ax3.set_xlabel('Elevation (degrees)', fontsize=fontsize)
+        ax3.set_title("Elevation", fontsize=fontsize)
+        # Norm/Distance Histogram
+        ax4 = fig.add_subplot(gs[3])
+        plot_max_normalized_hist(ax4, norm_true, bins=20, color='blue', label='True')
+        plot_max_normalized_hist(ax4, norm_wrong, bins=20, color='red', label='Wrong')
+        ax4.set_xlabel('Distance', fontsize=fontsize)
+        ax4.set_title("Distance", fontsize=fontsize)
+        fig.suptitle(
+            title or "Analysis of 3D Spherical Distribution of Model Classification",
+            fontsize=fontsize + 2,
+            y=1.05
+        )
+        handles, labels_ = ax1.get_legend_handles_labels()
+        fig.legend(
+            handles, labels_,
+            loc='upper center',
+            fontsize=fontsize,
+            ncol=2,
+            bbox_to_anchor=(0.5, 1.01),
+            frameon=False
+        )
+        ax3.text(
+            0.5, -0.18,
+            "Each group is max-normalized\n(Tallest bar = 1 per true/wrong group)",
+            ha='center', va='top', fontsize=fontsize - 4, transform=ax3.transAxes
+        )
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
+        plt.show()
 
     if return_stats:
         return {
@@ -441,6 +551,7 @@ def visualize_positions_with_distributions(positions: np.ndarray, labels_correct
                 'norm_std': np.std(norm_wrong)
             }
         }
+
 
 def visualize_positions_polar(positions: np.ndarray, labels_correct: np.ndarray, title: str = None):
     """
@@ -483,28 +594,39 @@ def visualize_positions_polar(positions: np.ndarray, labels_correct: np.ndarray,
     heatmap = heatmap_masked.T
     heatmap_masked = np.ma.masked_where(np.isnan(heatmap), heatmap)
 
-    # Handle all-true or all-false cases
-    data_min, data_max = heatmap.min(), heatmap.max()
-    if data_min == data_max:
-        norm = Normalize(vmin=data_min, vmax=data_max)
-    else:
-        if data_min < 0 < data_max:
-            norm = TwoSlopeNorm(vmin=data_min, vcenter=0, vmax=data_max)
-        else:
-            norm = Normalize(vmin=data_min, vmax=data_max)
+    valid_data = heatmap_masked.compressed()
+    if len(valid_data) == 0:
+        print("No valid data points to display")
+        return
 
-    # Fix: Use shading='gouraud' instead of 'auto' or 'flat'
+    data_min = valid_data.min()
+    data_max = valid_data.max()
+    abs_max = max(abs(data_min), abs(data_max))
+
+    if data_min < 0 < data_max:
+        colors = [(0.8, 0, 0), (1, 1, 1), (0, 0, 0.8)]  # Red -> White -> Blue
+        cmap = LinearSegmentedColormap.from_list('RedWhiteBlue', colors)
+        norm = TwoSlopeNorm(vmin=-abs_max, vcenter=0, vmax=abs_max)
+        cbar_label = 'Point Density\n(Red: Misclassified, Blue: Well Classified)'
+    elif data_max <= 0:
+        cmap = LinearSegmentedColormap.from_list('Reds', ['#AA0000', '#FFFFFF'])
+        norm = Normalize(vmin=-abs_max, vmax=0)
+        cbar_label = 'Point Density\n(Red: Misclassified)'
+    else:
+        cmap = LinearSegmentedColormap.from_list('Blues', ['#FFFFFF', '#0000AA'])
+        norm = Normalize(vmin=0, vmax=abs_max)
+        cbar_label = 'Point Density\n(Blue: Well Classified)'
+
     pcm = ax.pcolormesh(
         theta_edges, r_edges, heatmap_masked,
-        cmap='RdBu',
-        shading='auto',  # Changed to 'gouraud' to handle dimension differences
-        norm=norm
+        cmap=cmap,
+        norm=norm,
+        shading='auto'
     )
 
-    # Add colorbar
     cbar = plt.colorbar(pcm, ax=ax, pad=0.1)
+    cbar.set_label(cbar_label)
 
-    cbar.set_label('Point Density\n(Red: Misclassified, Blue: Well Classified)')
     # Add radial (elevation) ticks
     elevation_ticks = np.linspace(0, 1, 5)
     elevation_labels = np.linspace(elevation.min(), elevation.max(), len(elevation_ticks))
