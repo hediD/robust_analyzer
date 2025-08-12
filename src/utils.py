@@ -216,8 +216,10 @@ def look_at_rotation(camera_position: torch.Tensor, target_position: torch.Tenso
     if up_vector is None:
         up_vector = ch.tensor([0.0, 0.0, 1.0], device=camera_position.device, dtype=camera_position.dtype)
 
-    z_axis = F.normalize(camera_position - target_position, dim=-1)  # Camera direction (view axis)
-    x_axis = F.normalize(ch.cross(up_vector.expand_as(z_axis), z_axis), dim=-1)  # Right vector
+    z_axis = camera_position - target_position
+    z_axis /= ch.norm(z_axis, dim=-1, keepdim=True)  # Camera direction (view axis)
+    x_axis = ch.cross(up_vector.expand_as(z_axis), z_axis)
+    x_axis /= ch.norm(x_axis, dim=-1, keepdim=True)  # Right vector
     y_axis = ch.cross(z_axis, x_axis)  # Orthogonal up vector
 
     R = ch.stack([x_axis, y_axis, z_axis], dim=-1)  # Combine to form rotation matrix
@@ -346,7 +348,7 @@ def analyze_logits_detailed(logits: torch.Tensor, target_class: str = None, top_
 # ==========================
 # Visualization Utilities
 # ==========================
-def compute_spherical_coordinates(positions: np.ndarray):
+def compute_spherical_coordinates_old(positions: np.ndarray):
     """
     Compute spherical coordinates (azimuth, elevation, norm) from camera positions.
     """
@@ -355,14 +357,54 @@ def compute_spherical_coordinates(positions: np.ndarray):
     elevation = np.arcsin(positions[:, 2] / norm) * 180 / np.pi
     return azimuth, elevation, norm
 
+def compute_spherical_coordinates(positions: np.ndarray, shift_azimuth: bool = True):
+    """
+    Compute spherical coordinates (azimuth, elevation, norm)
+    from camera positions, assuming forward=(0,1,0), up=(0,0,1).
+    Returns azimuth (deg), elevation (deg), distance.
+    """
+    norm = np.linalg.norm(positions, axis=1)
+    azimuth = np.degrees(np.arctan2(positions[:, 0], positions[:, 1]))  # relative to +Y
+    elevation = np.degrees(np.arctan2(positions[:, 2], np.sqrt(positions[:, 0]**2 + positions[:, 1]**2)))
+    if shift_azimuth:
+        azimuth = ((azimuth + 90) % 360) - 180
+    return azimuth, elevation, norm
+
+
+def spherical_to_cartesian(azimuth: np.ndarray, elevation: np.ndarray, distance: np.ndarray) -> np.ndarray:
+    """
+    Convert spherical coordinates (azimuth, elevation, distance) to cartesian coordinates (x, y, z).
+    Assumes azimuth is measured relative to +Y axis (consistent with compute_spherical_coordinates).
+
+    Args:
+        azimuth: np.ndarray of azimuth angles in degrees.
+        elevation: np.ndarray of elevation angles in degrees.
+        distance: np.ndarray of distances (radii).
+
+    Returns:
+        positions: np.ndarray of shape (N, 3) with (x, y, z) coordinates.
+    """
+    # Convert degrees to radians
+    az_rad = np.radians(azimuth)
+    el_rad = np.radians(elevation)
+
+    # Compute projections
+    xy_proj = distance * np.cos(el_rad)  # projection on the XY plane
+    x = xy_proj * np.sin(az_rad)         # x relative to +Y azimuth
+    y = xy_proj * np.cos(az_rad)         # y relative to +Y azimuth
+    z = distance * np.sin(el_rad)        # height
+
+    return np.stack([x, y, z], axis=1)
+
 
 def visualize_positions_with_distributions(
     positions: np.ndarray,
-    labels_correct: np.ndarray,
+    labels_correct: np.ndarray = None,
     title: str = None,
     fontsize: int = 18,
     return_stats: bool = False,
-    mode: str = "all"  # "all", "3d", or "distributions"
+    mode: str = "all",  # "all", "3d", or "distributions"
+    show_distance: bool = False
 ):
     """
     Visualize 3D positions and distributions of azimuth, elevation, and norm.
@@ -370,8 +412,9 @@ def visualize_positions_with_distributions(
     Parameters:
     positions : numpy array or list of tuples
         Array of (x, y, z) camera positions.
-    labels_correct : numpy array or list
+    labels_correct : numpy array or list, optional
         Array of labels corresponding to each camera position. 1 for "True", 0 for "Wrong".
+        If None, all positions are treated as "True" (for visualizing overall distribution).
     title : str, optional
         Base title for the plots
     fontsize : int, optional
@@ -382,6 +425,9 @@ def visualize_positions_with_distributions(
         "all" (default): show both 3D scatter and histograms in one figure.
         "3d": show only the 3D scatter plot.
         "distributions": show only the histograms.
+    show_distance : bool, optional
+        Whether to show the distance histogram in "distributions" mode. Default is True.
+        Only applicable when mode is "distributions".
     """
 
     def plot_max_normalized_hist(ax, data, bins, color, label):
@@ -393,7 +439,12 @@ def visualize_positions_with_distributions(
 
     # Convert to numpy arrays if not already
     positions = np.array(positions)
-    labels_correct = np.array(labels_correct)
+
+    # If no labels provided, assume all are correct (True)
+    if labels_correct is None:
+        labels_correct = np.ones(len(positions), dtype=int)
+    else:
+        labels_correct = np.array(labels_correct)
 
     azimuth, elevation, norm = compute_spherical_coordinates(positions)
 
@@ -403,72 +454,97 @@ def visualize_positions_with_distributions(
     norm_true, norm_wrong = norm[labels_correct == 1], norm[labels_correct == 0]
     positions_true, positions_wrong = positions[labels_correct == 1], positions[labels_correct == 0]
 
+    # Check if we have any "wrong" labels to determine plotting strategy
+    has_wrong_labels = len(azimuth_wrong) > 0
+
     if mode == "3d":
         fig = plt.figure(figsize=(10, 8))
         ax1 = fig.add_subplot(111, projection='3d')
         ax1.scatter(positions_true[:, 0], positions_true[:, 1], positions_true[:, 2],
-                    c='blue', label='True label', alpha=0.5)
-        ax1.scatter(positions_wrong[:, 0], positions_wrong[:, 1], positions_wrong[:, 2],
-                    c='red', label='Wrong label', alpha=0.5)
+                    c='blue', label='True label' if has_wrong_labels else 'All positions', alpha=0.5)
+        if has_wrong_labels:
+            ax1.scatter(positions_wrong[:, 0], positions_wrong[:, 1], positions_wrong[:, 2],
+                        c='red', label='Wrong label', alpha=0.5)
         ax1.set_xlabel('X', fontsize=fontsize)
         ax1.set_ylabel('Y', fontsize=fontsize)
         ax1.set_zlabel('Z', fontsize=fontsize)
         ax1.set_title("3D Positions", fontsize=fontsize)
-        # Option 1: Legend on the right side
         ax1.legend(
             loc='center left',
             bbox_to_anchor=(1.05, 0.5),
             fontsize=fontsize,
             frameon=False
         )
-        # Option 2: Legend just under the title (uncomment to use)
-        # ax1.legend(
-        #     loc='upper center',
-        #     bbox_to_anchor=(0.5, 0.88),
-        #     fontsize=fontsize,
-        #     frameon=False
-        # )
         plt.tight_layout(rect=[0, 0, 1, 0.97])
         plt.show()
 
     elif mode == "distributions":
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        # Determine number of subplots and figure size based on show_distance
+        num_plots = 3 if show_distance else 2
+        fig_width = 18 if show_distance else 12
+        fig, axes = plt.subplots(1, num_plots, figsize=(fig_width, 6))
+
+        # Ensure axes is always a list for consistent indexing
+        if num_plots == 2:
+            axes = [axes[0], axes[1]]
+
         # Azimuth Histogram
-        plot_max_normalized_hist(axes[0], azimuth_true, bins=20, color='blue', label='True')
-        plot_max_normalized_hist(axes[0], azimuth_wrong, bins=20, color='red', label='Wrong')
+        plot_max_normalized_hist(axes[0], azimuth_true, bins=20, color='blue',
+                               label='True' if has_wrong_labels else 'All')
+        if has_wrong_labels:
+            plot_max_normalized_hist(axes[0], azimuth_wrong, bins=20, color='red', label='Wrong')
         axes[0].set_xlabel('Azimuth (degrees)', fontsize=fontsize)
-        axes[0].set_ylabel('Relative Frequency\n(max=1 per true/wrong group)', fontsize=fontsize-3)
+        axes[0].set_ylabel('Relative Frequency\n(max=1 per group)', fontsize=fontsize-3)
         axes[0].set_title("Azimuth", fontsize=fontsize)
 
         # Elevation Histogram
-        plot_max_normalized_hist(axes[1], elevation_true, bins=20, color='blue', label='True')
-        plot_max_normalized_hist(axes[1], elevation_wrong, bins=20, color='red', label='Wrong')
+        plot_max_normalized_hist(axes[1], elevation_true, bins=20, color='blue',
+                               label='True' if has_wrong_labels else 'All')
+        if has_wrong_labels:
+            plot_max_normalized_hist(axes[1], elevation_wrong, bins=20, color='red', label='Wrong')
         axes[1].set_xlabel('Elevation (degrees)', fontsize=fontsize)
         axes[1].set_title("Elevation", fontsize=fontsize)
-        # Norm/Distance Histogram
-        plot_max_normalized_hist(axes[2], norm_true, bins=20, color='blue', label='True')
-        plot_max_normalized_hist(axes[2], norm_wrong, bins=20, color='red', label='Wrong')
-        axes[2].set_xlabel('Distance', fontsize=fontsize)
-        axes[2].set_title("Distance", fontsize=fontsize)
+
+        # Distance Histogram (only if show_distance is True)
+        if show_distance:
+            plot_max_normalized_hist(axes[2], norm_true, bins=20, color='blue',
+                                   label='True' if has_wrong_labels else 'All')
+            if has_wrong_labels:
+                plot_max_normalized_hist(axes[2], norm_wrong, bins=20, color='red', label='Wrong')
+            axes[2].set_xlabel('Distance', fontsize=fontsize)
+            axes[2].set_title("Distance", fontsize=fontsize)
+
         fig.suptitle(
-            title or "Analysis of 3D Spherical Distribution of Model Classification",
+            title or ("Analysis of 3D Spherical Distribution" if not has_wrong_labels
+                     else "Analysis of 3D Spherical Distribution of Model Classification"),
             fontsize=fontsize + 2,
             y=1.05
         )
+
+        legend_labels = (['True', 'Wrong'] if has_wrong_labels else ['All positions'])
         fig.legend(
-            ['True', 'Wrong'],
+            legend_labels,
             loc='upper center',
             fontsize=fontsize,
-            ncol=2,
+            ncol=2 if has_wrong_labels else 1,
             bbox_to_anchor=(0.5, 1.01),
             frameon=False
         )
-        # Add total correct vs incorrect below the middle plot
-        axes[1].text(
-            0.5, -0.28,
-            f"Total correct: {len(azimuth_true)}   Total wrong: {len(azimuth_wrong)}",
-            ha='center', va='top', fontsize=fontsize - 2, transform=axes[1].transAxes
-        )
+
+        # Add total counts below the middle plot (or second plot if only 2 plots)
+        middle_plot_idx = 1 if num_plots == 2 else 1
+        if has_wrong_labels:
+            axes[middle_plot_idx].text(
+                0.5, -0.28,
+                f"Total correct: {len(azimuth_true)}   Total wrong: {len(azimuth_wrong)}",
+                ha='center', va='top', fontsize=fontsize - 2, transform=axes[middle_plot_idx].transAxes
+            )
+        else:
+            axes[middle_plot_idx].text(
+                0.5, -0.28,
+                f"Total positions: {len(azimuth_true)}",
+                ha='center', va='top', fontsize=fontsize - 2, transform=axes[middle_plot_idx].transAxes
+            )
         plt.tight_layout(rect=[0, 0, 1, 0.97])
         plt.show()
 
@@ -478,111 +554,162 @@ def visualize_positions_with_distributions(
         # 3D Scatter Plot
         ax1 = fig.add_subplot(gs[0], projection='3d')
         ax1.scatter(positions_true[:, 0], positions_true[:, 1], positions_true[:, 2],
-                    c='blue', label='True label', alpha=0.5)
-        ax1.scatter(positions_wrong[:, 0], positions_wrong[:, 1], positions_wrong[:, 2],
-                    c='red', label='Wrong label', alpha=0.5)
+                    c='blue', label='True label' if has_wrong_labels else 'All positions', alpha=0.5)
+        if has_wrong_labels:
+            ax1.scatter(positions_wrong[:, 0], positions_wrong[:, 1], positions_wrong[:, 2],
+                        c='red', label='Wrong label', alpha=0.5)
         ax1.set_xlabel('X', fontsize=fontsize)
         ax1.set_ylabel('Y', fontsize=fontsize)
         ax1.set_zlabel('Z', fontsize=fontsize)
         ax1.set_title("3D Positions", fontsize=fontsize)
+
         # Azimuth Histogram
         ax2 = fig.add_subplot(gs[1])
-        plot_max_normalized_hist(ax2, azimuth_true, bins=20, color='blue', label='True')
-        plot_max_normalized_hist(ax2, azimuth_wrong, bins=20, color='red', label='Wrong')
+        plot_max_normalized_hist(ax2, azimuth_true, bins=20, color='blue',
+                               label='True' if has_wrong_labels else 'All')
+        if has_wrong_labels:
+            plot_max_normalized_hist(ax2, azimuth_wrong, bins=20, color='red', label='Wrong')
         ax2.set_xlabel('Azimuth (degrees)', fontsize=fontsize)
-        ax2.set_ylabel('Max-normalized Frequency\n(per true/wrong group)', fontsize=fontsize-3)
+        ax2.set_ylabel('Max-normalized Frequency\n(per group)', fontsize=fontsize-3)
         ax2.set_title("Azimuth", fontsize=fontsize)
-        # Add the second line below the y-label, with smaller font
-        ax2.text(
-            -0.25, 1.02,  # x, y in axes fraction coordinates (tweak as needed)
-            "Each group is max-normalized\n(Tallest bar = 1 per true/wrong group)",
-            ha='left', va='bottom', fontsize=fontsize-4, transform=ax2.transAxes
-        )
+
         # Elevation Histogram
         ax3 = fig.add_subplot(gs[2])
-        plot_max_normalized_hist(ax3, elevation_true, bins=20, color='blue', label='True')
-        plot_max_normalized_hist(ax3, elevation_wrong, bins=20, color='red', label='Wrong')
+        plot_max_normalized_hist(ax3, elevation_true, bins=20, color='blue',
+                               label='True' if has_wrong_labels else 'All')
+        if has_wrong_labels:
+            plot_max_normalized_hist(ax3, elevation_wrong, bins=20, color='red', label='Wrong')
         ax3.set_xlabel('Elevation (degrees)', fontsize=fontsize)
         ax3.set_title("Elevation", fontsize=fontsize)
+
         # Norm/Distance Histogram
         ax4 = fig.add_subplot(gs[3])
-        plot_max_normalized_hist(ax4, norm_true, bins=20, color='blue', label='True')
-        plot_max_normalized_hist(ax4, norm_wrong, bins=20, color='red', label='Wrong')
+        plot_max_normalized_hist(ax4, norm_true, bins=20, color='blue',
+                               label='True' if has_wrong_labels else 'All')
+        if has_wrong_labels:
+            plot_max_normalized_hist(ax4, norm_wrong, bins=20, color='red', label='Wrong')
         ax4.set_xlabel('Distance', fontsize=fontsize)
         ax4.set_title("Distance", fontsize=fontsize)
+
         fig.suptitle(
-            title or "Analysis of 3D Spherical Distribution of Model Classification",
+            title or ("Analysis of 3D Spherical Distribution" if not has_wrong_labels
+                     else "Analysis of 3D Spherical Distribution of Model Classification"),
             fontsize=fontsize + 2,
             y=1.05
         )
+
         handles, labels_ = ax1.get_legend_handles_labels()
         fig.legend(
             handles, labels_,
             loc='upper center',
             fontsize=fontsize,
-            ncol=2,
+            ncol=len(handles),
             bbox_to_anchor=(0.5, 1.01),
             frameon=False
         )
-        ax3.text(
-            0.5, -0.18,
-            "Each group is max-normalized\n(Tallest bar = 1 per true/wrong group)",
-            ha='center', va='top', fontsize=fontsize - 4, transform=ax3.transAxes
-        )
+
+        # Add explanatory text
+        if has_wrong_labels:
+            ax2.text(
+                -0.25, 1.02,
+                "Each group is max-normalized\n(Tallest bar = 1 per true/wrong group)",
+                ha='left', va='bottom', fontsize=fontsize-4, transform=ax2.transAxes
+            )
+            ax3.text(
+                0.5, -0.18,
+                "Each group is max-normalized\n(Tallest bar = 1 per true/wrong group)",
+                ha='center', va='top', fontsize=fontsize - 4, transform=ax3.transAxes
+            )
+        else:
+            ax3.text(
+                0.5, -0.18,
+                f"Showing distribution of all {len(positions)} positions",
+                ha='center', va='top', fontsize=fontsize - 4, transform=ax3.transAxes
+            )
         plt.tight_layout(rect=[0, 0, 1, 0.97])
         plt.show()
 
     if return_stats:
-        return {
-            'true_stats': {
+        stats_dict = {
+            'all_stats': {
                 'azimuth_mean': np.mean(azimuth_true),
                 'azimuth_std': np.std(azimuth_true),
                 'elevation_mean': np.mean(elevation_true),
                 'elevation_std': np.std(elevation_true),
                 'norm_mean': np.mean(norm_true),
                 'norm_std': np.std(norm_true)
-            },
-            'wrong_stats': {
-                'azimuth_mean': np.mean(azimuth_wrong),
-                'azimuth_std': np.std(azimuth_wrong),
-                'elevation_mean': np.mean(elevation_wrong),
-                'elevation_std': np.std(elevation_wrong),
-                'norm_mean': np.mean(norm_wrong),
-                'norm_std': np.std(norm_wrong)
             }
         }
 
+        if has_wrong_labels:
+            stats_dict.update({
+                'true_stats': {
+                    'azimuth_mean': np.mean(azimuth_true),
+                    'azimuth_std': np.std(azimuth_true),
+                    'elevation_mean': np.mean(elevation_true),
+                    'elevation_std': np.std(elevation_true),
+                    'norm_mean': np.mean(norm_true),
+                    'norm_std': np.std(norm_true)
+                },
+                'wrong_stats': {
+                    'azimuth_mean': np.mean(azimuth_wrong),
+                    'azimuth_std': np.std(azimuth_wrong),
+                    'elevation_mean': np.mean(elevation_wrong),
+                    'elevation_std': np.std(elevation_wrong),
+                    'norm_mean': np.mean(norm_wrong),
+                    'norm_std': np.std(norm_wrong)
+                }
+            })
 
-def visualize_positions_polar(positions: np.ndarray, labels_correct: np.ndarray, title: str = None):
+        return stats_dict
+
+
+def visualize_positions_polar(positions: np.ndarray, labels_correct: np.ndarray = None, title: str = None):
     """
     Visualize camera positions with azimuth-elevation heatmaps in a circular (polar) layout.
 
     Parameters:
     positions : numpy array or list of tuples
         Array of (x, y, z) positions
-    labels_correct : numpy array or list
+    labels_correct : numpy array or list, optional
         Array of labels corresponding to each position. 1 for "correct", 0 for "incorrect".
+        If None, all positions are treated as "correct" (for visualizing overall distribution).
     title : str, optional
         Custom title for the plot
     """
     # Convert to numpy arrays if not already
     positions = np.array(positions)
-    labels_correct = np.array(labels_correct)
+
+    # If no labels provided, assume all are correct (True)
+    if labels_correct is None:
+        labels_correct = np.ones(len(positions), dtype=int)
+    else:
+        labels_correct = np.array(labels_correct)
 
     # Compute azimuth (theta) and elevation (r)
-    azimuth = np.arctan2(positions[:, 1], positions[:, 0])  # Radians
-    elevation = np.arcsin(positions[:, 2] / np.linalg.norm(positions, axis=1))  # Radians
+    azimuth, elevation, _ = compute_spherical_coordinates(positions)
 
-    # Normalize elevation to [0, 1] for radial plotting
-    elevation_normalized = (elevation - elevation.min()) / (elevation.max() - elevation.min())
+    # Separate data based on labels to check if we have mixed labels
+    azimuth_wrong = azimuth[labels_correct == 0]
 
-    # Combine data into a weighted histogram
-    weights = np.where(labels_correct == 1, 1, -1)  # +1 for correct, -1 for misclassified
+    # Check if we have any "wrong" labels to determine plotting strategy
+    has_wrong_labels = len(azimuth_wrong) > 0
+
+    if has_wrong_labels:
+        # Combine data into a weighted histogram (original behavior)
+        weights = np.where(labels_correct == 1, 1, -1)  # +1 for correct, -1 for misclassified
+        cbar_label_suffix = '\n(Red: Misclassified, Blue: Well Classified)'
+    else:
+        # All labels are the same, just show density
+        weights = np.ones_like(labels_correct)  # All positive weights
+        cbar_label_suffix = '\n(Showing overall distribution)'
+
+    # Create histogram using degrees for azimuth, normalized elevation for radius
     heatmap, theta_edges, r_edges = np.histogram2d(
-        azimuth, elevation_normalized, bins=(36, 18), range=[[-np.pi, np.pi], [0, 1]], weights=weights
+        azimuth, elevation, bins=(36, 18), range=[[-180, 180], [0, 90]], weights=weights
     )
     counts, _, _ = np.histogram2d(
-        azimuth, elevation_normalized, bins=(36, 18), range=[[-np.pi, np.pi], [0, 1]]
+        azimuth, elevation, bins=(36, 18), range=[[-180, 180], [0, 90]]
     )
 
     # Mask zero density areas
@@ -603,22 +730,30 @@ def visualize_positions_polar(positions: np.ndarray, labels_correct: np.ndarray,
     data_max = valid_data.max()
     abs_max = max(abs(data_min), abs(data_max))
 
-    if data_min < 0 < data_max:
+    # Choose colormap based on whether we have mixed labels
+    if has_wrong_labels and data_min < 0 < data_max:
         colors = [(0.8, 0, 0), (1, 1, 1), (0, 0, 0.8)]  # Red -> White -> Blue
         cmap = LinearSegmentedColormap.from_list('RedWhiteBlue', colors)
         norm = TwoSlopeNorm(vmin=-abs_max, vcenter=0, vmax=abs_max)
-        cbar_label = 'Point Density\n(Red: Misclassified, Blue: Well Classified)'
+        cbar_label = 'Point Density' + cbar_label_suffix
     elif data_max <= 0:
         cmap = LinearSegmentedColormap.from_list('Reds', ['#AA0000', '#FFFFFF'])
         norm = Normalize(vmin=-abs_max, vmax=0)
         cbar_label = 'Point Density\n(Red: Misclassified)'
     else:
+        # All positive or mixed but all positive weights
         cmap = LinearSegmentedColormap.from_list('Blues', ['#FFFFFF', '#0000AA'])
         norm = Normalize(vmin=0, vmax=abs_max)
-        cbar_label = 'Point Density\n(Blue: Well Classified)'
+        if has_wrong_labels:
+            cbar_label = 'Point Density\n(Blue: Well Classified)'
+        else:
+            cbar_label = 'Point Density' + cbar_label_suffix
+
+    # Convert theta_edges from degrees to radians for polar plot
+    theta_edges_rad = np.radians(theta_edges)
 
     pcm = ax.pcolormesh(
-        theta_edges, r_edges, heatmap_masked,
+        theta_edges_rad, r_edges, heatmap_masked,
         cmap=cmap,
         norm=norm,
         shading='auto'
@@ -627,13 +762,22 @@ def visualize_positions_polar(positions: np.ndarray, labels_correct: np.ndarray,
     cbar = plt.colorbar(pcm, ax=ax, pad=0.1)
     cbar.set_label(cbar_label)
 
-    # Add radial (elevation) ticks
-    elevation_ticks = np.linspace(0, 1, 5)
-    elevation_labels = np.linspace(elevation.min(), elevation.max(), len(elevation_ticks))
-    ax.set_yticks(elevation_ticks)
-    ax.set_yticklabels([f"{np.degrees(e):.1f}°" for e in elevation_labels])
+    # Add radial (elevation) ticks - Fixed version
+    # Map elevation range to radial range used in the histogram
+    r_min, r_max = r_edges[0], r_edges[-1]  # This should be 0 to 90 based on your histogram range
+    elevation_tick_positions = np.linspace(r_min, r_max, 5)
+    ax.set_yticks(elevation_tick_positions)
+    ax.set_yticklabels([f"{e:.1f}°" for e in elevation_tick_positions])
 
-    ax.set_title(title or 'Azimuth-Elevation Heatmap', va='bottom')
+    # Set theta (azimuth) labels in degrees
+    theta_labels = np.arange(0, 360, 45)  # Every 45 degrees
+    ax.set_thetagrids(theta_labels)
+
+    # Update title to reflect whether we're showing mixed labels or overall distribution
+    if title is None:
+        title = 'Azimuth-Elevation Heatmap' if not has_wrong_labels else 'Azimuth-Elevation Heatmap (Classification Results)'
+
+    ax.set_title(title, va='bottom')
     ax.set_theta_zero_location("N")  # Set 0° at the top
     ax.set_theta_direction(-1)  # Clockwise azimuth
     ax.grid(True)
@@ -739,8 +883,7 @@ def display_rendered_images(robust_analyzer, results, run_index=0, env_index=0, 
     render_ims = model.render(with_grad=False, raster_settings=raster_settings)
 
     # Get predictions for the rendered images
-    with torch.no_grad():
-        logits = model()
+    logits = model(return_render=False, with_grad=False)
 
     # Define image indices if not provided
     if image_indices is None:
@@ -768,9 +911,26 @@ def display_rendered_images(robust_analyzer, results, run_index=0, env_index=0, 
         azimuth, elevation, distance = compute_spherical_coordinates(camera_pos)
 
         # Check if prediction is correct
-        pred_idx = logits[im_idx, env_index].argmax().item()
-        is_correct = (pred_idx == target_class_idx) if target_class_idx is not None else None
+        im_logits = logits[im_idx, env_index]
+        pred_idx = im_logits.argmax().item()
+
+        # Calculate softmax probabilities
+        probs = torch.nn.functional.softmax(im_logits, dim=0)
+        pred_prob = probs[pred_idx].item()
+
+        # Get prediction class
         pred_class = get_target(pred_idx)
+
+        # Get target class ranking and confidence if available
+        target_info = ""
+        if target_class_idx is not None:
+            is_correct = (pred_idx == target_class_idx)
+            # Find rank of the target class
+            sorted_indices = torch.argsort(im_logits, descending=True)
+            target_rank = (sorted_indices == target_class_idx).nonzero().item() + 1
+            target_prob = probs[target_class_idx].item()
+            if not is_correct:
+                target_info = f" | rank {target_rank} ({target_prob:.2f})"
 
         # Create title with position and prediction info
         position_info = " ".join([
@@ -778,11 +938,12 @@ def display_rendered_images(robust_analyzer, results, run_index=0, env_index=0, 
             for value, metric in zip([azimuth, elevation, distance], ["azimuth", "elevation", "distance"])
         ])
 
-        if is_correct is not None:
-            # Add color codes
-            prediction_info = f"\n{pred_class[:20]}... ({'✓' if is_correct else '✗'})"
+        if target_class_idx is not None:
+            # Add prediction info with confidence and correctness
+            prediction_info = f"\n{pred_class[:20]}... ({pred_prob:.2f}) ({'✓' if is_correct else '✗'}){target_info}"
         else:
-            prediction_info = f"\n{pred_class[:20]}..."
+            # Just show prediction and confidence
+            prediction_info = f"\n{pred_class[:20]}... ({pred_prob:.2f})"
 
         title = position_info + prediction_info
 
@@ -798,3 +959,9 @@ def display_rendered_images(robust_analyzer, results, run_index=0, env_index=0, 
     plt.tight_layout()
     plt.show()
 
+
+def get_labels_correct(logits, true_class_name, topk=1):
+    topk_preds = logits.topk(topk, dim=1).indices  # shape: (batch_size, topk)
+    true_idx = int(get_idx(true_class_name))  # shape: (batch_size, 1)
+    labels_correct = (topk_preds == true_idx).any(dim=1)  # shape: (batch_size,), bools
+    return labels_correct

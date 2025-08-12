@@ -140,31 +140,38 @@ class RobustnessAnalyzer:
         Run the optimization process with robust error handling.
         Results are stored in self._current_results and updated continuously.
         """
+        self.model.reset_cache() # reset cache to remove cached mesh and texture from previous runs
         self._current_results = defaultdict(list)
 
-        for run in range(num_runs):
-            self._current_run = run
-            try:
-                self._setup_model()
-                self._create_optimizer(lr=kwargs.get('lr', 1e-1))
+        with tqdm(range(num_runs), desc="Initializing", mininterval=0.1) as pbar:
+            for run in pbar:
+                self._current_run = run
+                try:
+                    self._setup_model()
+                    self._create_optimizer(lr=kwargs.get('lr', 1e-1))
 
-                # Initialize lists to track probabilities and losses for this run
-                run_avg_probabilities = []
-                run_losses = []
+                    # Initialize lists to track probabilities and losses for this run
+                    run_avg_probabilities = []
+                    run_losses = []
 
-                with tqdm(total=num_iterations, mininterval=0.1) as pbar:
+                    assert num_iterations > 0, "num_iterations must be greater than 0"
+                    if num_iterations == 0:
+                        logits = self.model(return_render=False, with_grad=False).detach().cpu().clone()
+                        self._current_results['initial_logits'].append(logits)
+                        self._current_results['final_logits'].append(logits)
+                        pbar.set_description(f"Run {run + 1}/{num_runs} [Skipped: 0 iterations]")
+                        continue  # Skip the optimization loop
+
                     for i in range(num_iterations):
                         self._current_iteration = i
                         try:
                             self._optimizer_zero_grad()
-
-                            # Add gradient clipping to prevent extreme parameter updates
                             torch.nn.utils.clip_grad_norm_(
                                 [p for p in self.model.scene_params.values() if p.requires_grad],
                                 max_norm=1.0
                             )
 
-                            logits = self.model()
+                            logits = self.model(return_render=False, with_grad=True)
 
                             if i == 0:
                                 self._current_results['initial_logits'].append(logits.detach().cpu().clone())
@@ -210,11 +217,11 @@ class RobustnessAnalyzer:
                             # Calculate how many images are correctly classified according to the attack
                             adv_count = nb_ims - class_count if not self.targeted else class_count
 
-                            pbar.update(1)
+                            # Update progress bar description with iteration info
                             pbar.set_description(
-                                f"Loss: {loss_:.2f} - Class: {class_name:<15}"
-                                f" - 'adv acc': {adv_count}/{nb_ims} - Avg Prob: {avg_prob:.4f}"
-                                f" - LR: {self.param_groups[0]['lr']:.2e}"
+                                f"Run {run + 1}/{num_runs} [Iter {i + 1}/{num_iterations}] - "
+                                f"Loss: {loss_:.2f} - Class: {class_name:<15} - "
+                                f"Adv Acc: {adv_count}/{nb_ims} - Prob: {avg_prob:.4f}"
                             )
 
                             # Store intermediate results in class state
@@ -229,29 +236,34 @@ class RobustnessAnalyzer:
                                 if self.batch_size == 1:
                                     raise Exception("Batch size is 1, cannot reduce further, reduce image size or number of environments")
                                 self.batch_size = self.batch_size // 2
-                                print(f"GPU OOM error in iteration {i}, reducing batch size to {self.batch_size} and retrying...")
+                                pbar.write(f"GPU OOM error in iteration {i}, reducing batch size to {self.batch_size} and retrying...")
                                 self._setup_model()  # Reinitialize with new batch size
                                 self._setup_target()  # Update the target tensor with new batch size
+                                self.model.reset_cache() # remove cached mesh and texture to adjust to new batch size
                             else:
-                                print(f"Error in iteration {i}: {iter_err}")
+                                pbar.write(f"Error in iteration {i}: {iter_err}")
                             continue
 
-                # Store run-level results
-                self._current_results['loss'].append(run_losses)
-                self._current_results['avg_probability'].append(run_avg_probabilities)  # true class probability
-                self._current_results['initial_camera_coords'].append(self.model.camera_coords.detach().cpu())  # Camera position before optimization
-                self._current_results["initial_scene_params"].append({k: v.detach().cpu().clone() for k, v in self.model.init_scene_params.items()})  # Scene parameters at the end of optimization
-                self._current_results["final_scene_params"].append({k: v.detach().cpu().clone() for k, v in self.model.scene_params.items()})  # Scene parameters at the end of optimization
-                self._current_results['final_logits'].append(logits.detach().cpu().clone())  # Final logits after optimization
-                self._current_results['final_texture'].append(to_numpy(self.model._fill_texture()).copy())  # Final texture after optimization
+                    # Store run-level results
+                    self._current_results['loss'].append(run_losses)
+                    self._current_results['avg_probability'].append(run_avg_probabilities)  # true class probability
+                    self._current_results['initial_camera_coords'].append(self.model.camera_coords.detach().cpu())  # Camera position before optimization
+                    self._current_results["initial_scene_params"].append({k: v.detach().cpu().clone() for k, v in self.model.init_scene_params.items()})  # Scene parameters at the end of optimization
+                    self._current_results["final_scene_params"].append({k: v.detach().cpu().clone() for k, v in self.model.scene_params.items()})  # Scene parameters at the end of optimization
+                    self._current_results['final_logits'].append(logits.detach().cpu().clone())  # Final logits after optimization
 
-            except Exception as run_err:
-                print(f"Error in run {run}: {run_err}")
-                continue
+                    # Only store the final texture if texture optimization was enabled
+                    if self.optimize_kwargs.get("texture", False):
+                        self._current_results['final_texture'].append(to_numpy(self.model._fill_texture()).copy())
 
-            # free gpu memory
-            del logits, loss, logits_flat, target_flat
-            torch.cuda.empty_cache()
+                except Exception as run_err:
+                    raise run_err
+                    pbar.write(f"Error in run {run}: {run_err}")
+                    continue
+
+                # free gpu memory
+                del logits, loss, logits_flat, target_flat
+                torch.cuda.empty_cache()
 
         return self._current_results
 
@@ -260,20 +272,107 @@ class RobustnessAnalyzer:
         """Get the latest results, even if optimization has failed."""
         return self._current_results
 
+    def save_results(self, file_path: str) -> None:
+        """
+        Serialize and save the current results to a file.
+
+        Args:
+            file_path (str): Path where the results will be saved
+        """
+        # Make sure all tensors are detached and moved to CPU for proper serialization
+        serializable_results = {}
+
+        for key, values in self._current_results.items():
+            if isinstance(values, list):
+                if len(values) > 0 and isinstance(values[0], dict):
+                    # Handle dictionaries of tensors (like scene_params)
+                    serializable_results[key] = [
+                        {k: v.detach().cpu() if torch.is_tensor(v) else v
+                         for k, v in item.items()}
+                        for item in values
+                    ]
+                elif len(values) > 0 and torch.is_tensor(values[0]):
+                    # Handle lists of tensors
+                    serializable_results[key] = [v.detach().cpu() for v in values]
+                else:
+                    # Handle regular lists
+                    serializable_results[key] = values
+            elif torch.is_tensor(values):
+                # Handle tensor values
+                serializable_results[key] = values.detach().cpu()
+            else:
+                # Handle other types
+                serializable_results[key] = values
+
+        # Save the serialized results
+        torch.save(serializable_results, file_path)
+        print(f"Results saved to {file_path}")
+
+    def load_results(self, file_path: str) -> Dict:
+        """
+        Load saved results from a file.
+
+        Args:
+            file_path (str): Path to the saved results file
+
+        Returns:
+            Dict: The loaded results
+        """
+        try:
+            loaded_results = torch.load(file_path)
+            self._current_results = defaultdict(list)
+
+            # Copy loaded results to the current_results
+            for key, values in loaded_results.items():
+                self._current_results[key] = values
+
+            print(f"Results loaded from {file_path}")
+            return dict(self._current_results)
+        except Exception as e:
+            print(f"Error loading results: {e}")
+            return {}
+
 
 if __name__ == "__main__":
-    robustness_analyzer = RobustnessAnalyzer(
-        obj_path="airplane/mesh.obj",
-        texture_path="airplane/mesh.mtl",
-        envmap_paths=[
-            "environments/klippad_dawn_2_k.exr",
-            "environments/goegap_road_2k.exr"
-        ],
-        target_class="space shuttle",
-        batch_size=10,
-        targeted=True,
-        raster_settings={"image_size": 512, "blur_radius": 0.001},
-    )
+    import random, glob, os
 
-    # Run optimization
-    results = robustness_analyzer.run(num_runs=1)
+    data_dir = "../data"
+
+    # Envmap(s) we're using during optimization (one or more)
+    max_envs = 5 # -1 or None for all
+    envmap_paths = glob(os.path.join("../data", "environments_road/*"))
+    random.shuffle(envmap_paths)
+    envmap_paths = envmap_paths[:max_envs]
+    print("#environments used:", len(envmap_paths))
+
+    true_class = 'tank, army tank, armored combat vehicle, armoured combat vehicle'
+    target_class = true_class
+
+    object_dir = "leopard_tank"
+
+    params_to_optimize = ["camera"]
+
+    raster_settings = {
+        "image_size": 448, # image resolution (image_size, image_size, 3)
+        "bin_size": 32,  # Controls spatial partitioning for rasterization - larger values use less memory but may be slower
+        "max_faces_per_bin": 100_000,  # Maximum faces per spatial bin - increase for complex meshes, decrease to save memory
+    }
+
+    kwargs = {
+        "obj_path": os.path.join(data_dir, object_dir, "leopard_decimated.obj"),
+        "texture_path": None,
+        "envmap_paths": envmap_paths,
+        "target_class": target_class,
+        "batch_size": 2,  # How many different viewpoints we're optimizing in parallel (* #Environments)
+        "params_to_optimize": params_to_optimize,
+        "targeted": target_class!=true_class,
+        "positive_z": True, # constraints camera z>0 (positive elevation)
+        "raster_settings": raster_settings
+    }
+
+    robust_analyzer = RobustnessAnalyzer(**kwargs)
+
+    ##### Run optimization: This will generate num_runs*batch_size viewpoints
+    num_runs = 10
+    num_iterations = 1
+    results_camera = robust_analyzer.run(num_runs, num_iterations, lr=5e-3)

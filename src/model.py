@@ -24,6 +24,7 @@ from pytorch3d.renderer import (
 
 from transformers import ViTForImageClassification, ViTImageProcessor
 import imageio.v3 as iio
+import time
 
 Image.MAX_IMAGE_PIXELS = None  # Ignore warning about Atlas texture can be very high resolution, will be downscaled
 TEXTURE_MAX_IMAGE_PIXELS = 40_000_000  # Atlas texture can be very high resolution
@@ -53,6 +54,11 @@ class Model(nn.Module):
       4. Optimizes lighting location and intensity
       5. Renders the 3D object and passes it to a ViT model for classification
     """
+
+    # Class-level attributes for mesh and texture
+    _mesh = None
+    _texture_image = None
+    _is_initialized = False
 
     def __init__(
         self,
@@ -88,6 +94,9 @@ class Model(nn.Module):
         self.batch_size = batch_size
         self.positive_z = positive_z
 
+        # ------ TIMING SETUP ------
+        timings = {}
+
         # ------ DEVICE SETUP ------
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -100,56 +109,14 @@ class Model(nn.Module):
         if optimize_kwargs is not None and isinstance(optimize_kwargs, dict):
             self.optimize_kwargs.update(optimize_kwargs)
 
-        # ------ MESH LOADING ------
-        use_mtl = texture_path is None
+        # Initialize class-level attributes if not done already
+        if not self.__class__._is_initialized:
+            self.__class__._initialize_mesh_and_texture(obj_path, texture_path, self.optimize_kwargs, self.batch_size, self.device)
+            self.__class__._is_initialized = True
 
-        # Load geometry from obj file
-        verts, faces, aux = load_obj(obj_path, load_textures=use_mtl)
-        verts = verts.to(self.device)
-        faces_idx = faces.verts_idx.to(self.device)
-
-        # ------ TEXTURE SETUP ------
-        if texture_path is None:
-            # Use first texture from MTL file
-            texture_arr = list(aux.texture_images.values())[0].cpu().numpy()
-            pil_texture = Image.fromarray((texture_arr * 255).astype(np.uint8))
-        else:
-            # Load texture from file
-            pil_texture = Image.open(texture_path).convert('RGB')
-
-        max_pixels = globals().get("TEXTURE_MAX_IMAGE_PIXELS", float('inf'))
-        pil_texture = downscale_to_max_pixels(pil_texture, max_pixels)
-        texture_arr = np.array(pil_texture).astype(np.float32) / 255.0
-        texture_image = torch.from_numpy(texture_arr).unsqueeze(0).to(self.device)
-
-        # Check if we can optimize texture (can't optimize with MTL)
-        if use_mtl and self.optimize_kwargs["texture"]:
-            print("Warning: can't optimize texture when using MTL files. You need to extract the texture from the material file "
-                  "and feed it to the model via the texture_path argument.")
-            self.optimize_kwargs["texture"] = False
-
-        # Handle texture tensor based on optimization flag
-        if self.optimize_kwargs["texture"]:
-            texture_image = nn.Parameter(texture_image.repeat(batch_size, 1, 1, 1), requires_grad=True)
-        else:
-            texture_image = texture_image.expand(batch_size, -1, -1, -1).detach()
-        self.texture_image = texture_image.detach().clone()
-
-        # Create UV texture from loaded data
-        faces_uvs = faces.textures_idx.to(self.device)
-        verts_uvs = aux.verts_uvs.to(self.device)
-        texture = TexturesUV(
-            maps=texture_image,
-            faces_uvs=[faces_uvs] * batch_size,
-            verts_uvs=[verts_uvs] * batch_size
-        )
-
-        # ------ MESH CREATION ------
-        mesh = load_objs_as_meshes([obj_path], device=device)
-        # Scale mesh
-        mesh._verts_list = [v / 5.0 for v in mesh.verts_list()]
-        mesh = mesh.to(device).extend(batch_size)
-        self.meshes = mesh
+        # Assign class-level attributes to instance
+        self.meshes = self.__class__._mesh
+        self.texture_image = self.__class__._texture_image
 
         # ------ BOUNDING BOX PROPERTIES ------
         self._calculate_bbox_properties(min_max_proportion)
@@ -184,15 +151,22 @@ class Model(nn.Module):
 
         # ------ TEXTURE CLUSTERING ------
         # Cluster the texture for color centroid optimization
-        self.cluster_indices, self.cluster_colors = self._cluster_texture(nb_clusters=nb_clusters)
+        if self.optimize_kwargs["texture"]:
+            self.cluster_indices, self.cluster_colors = self._cluster_texture(nb_clusters=nb_clusters)
+        else:
+            self.cluster_indices = {}
+            self.cluster_colors = torch.zeros((0, 3), device=self.device)  # Empty tensor
 
         # ------ SCENE PARAMETERS SETUP ------
         self.init_scene_params = {
             'camera': self.camera_coords[:self.batch_size].to(self.device),
-            'texture_centroids': self.cluster_colors.to(self.device),
             'light_location': self.init_light_location.to(self.device),
-            'light_intensity': self.init_light_intensity.to(self.device)
+            'light_intensity': self.init_light_intensity.to(self.device) * 0.5
         }
+
+        # Add texture_centroids only if we're optimizing texture
+        if self.optimize_kwargs["texture"]:
+            self.init_scene_params['texture_centroids'] = self.cluster_colors.to(self.device)
 
         # Create scene_params dictionary with parameters that need gradients
         optimize_predicate = lambda k: (self.optimize_kwargs["camera"] and k=="camera") or \
@@ -232,9 +206,7 @@ class Model(nn.Module):
         )
 
         # ------ IMAGE CLASSIFICATION MODEL ------
-        # Vision Transformer model (frozen)
-        self.ml_model = ViTForImageClassification.from_pretrained('google/vit-base-patch16-224').to(self.device).eval()
-        self.processor = ViTImageProcessor.from_pretrained('google/vit-base-patch16-224')
+        self.ml_model = ViTForImageClassification.from_pretrained('google/vit-large-patch16-224').to(self.device).eval()
         for param in self.ml_model.parameters():
             param.requires_grad = False
 
@@ -252,12 +224,66 @@ class Model(nn.Module):
         self.optimize_lighting = self.optimize_kwargs["lighting"]
 
         # ------ ENVIRONMENT MAP SETUP ------
+        
         self.use_envmap = envmap_paths is not None and len(envmap_paths) > 0
         if self.use_envmap:
             if isinstance(envmap_paths, str):
                 envmap_paths = [envmap_paths]
             self.envmaps = torch.stack([self._load_envmap(path) for path in envmap_paths])
         self.n_envmaps = len(envmap_paths) if envmap_paths else 1
+
+
+    @classmethod
+    def reset_cache(cls):
+        cls._mesh = None
+        cls._texture_image = None
+        cls._is_initialized = False
+
+    def reset_cache(self) -> None:
+        """Reset class-level attributes via an instance method."""
+        self.__class__._mesh = None
+        self.__class__._texture_image = None
+        self.__class__._is_initialized = False
+
+    @classmethod
+    def _initialize_mesh_and_texture(cls, obj_path, texture_path, optimize_kwargs, batch_size, device):
+        """Initialize mesh and texture once for all instances."""
+        # ------ MESH LOADING ------
+        use_mtl = texture_path is None
+        verts, faces, aux = load_obj(obj_path, load_textures=use_mtl)
+        verts = verts.to(device)
+
+        # ------ TEXTURE SETUP ------
+        if texture_path is None:
+            texture_arr = list(aux.texture_images.values())[0].cpu().numpy()
+            pil_texture = Image.fromarray((texture_arr * 255).astype(np.uint8))
+        else:
+            pil_texture = Image.open(texture_path).convert('RGB')
+
+        max_pixels = globals().get("TEXTURE_MAX_IMAGE_PIXELS", float('inf'))
+        pil_texture = downscale_to_max_pixels(pil_texture, max_pixels)
+        texture_arr = np.array(pil_texture).astype(np.float32) / 255.0
+        texture_image = torch.from_numpy(texture_arr).unsqueeze(0).to(device)
+
+        # Check if we can optimize texture (can't optimize with MTL)
+        if use_mtl and optimize_kwargs["texture"]:
+            print("Warning: can't optimize texture when using MTL files. You need to extract the texture from the material file "
+                  "and feed it to the model via the texture_path argument.")
+            optimize_kwargs["texture"] = False
+
+        # Handle texture tensor based on optimization flag
+        if optimize_kwargs["texture"]:
+            texture_image = nn.Parameter(texture_image.repeat(batch_size, 1, 1, 1), requires_grad=True)
+        else:
+            texture_image = texture_image.expand(batch_size, -1, -1, -1).detach()
+        cls._texture_image = texture_image.detach().clone()
+
+        # ------ MESH CREATION ------
+        mesh = load_objs_as_meshes([obj_path], device=device)
+        # Scale mesh
+        mesh._verts_list = [v / 5.0 for v in mesh.verts_list()]
+        mesh = mesh.to(device).extend(batch_size)
+        cls._mesh = mesh
 
     # ------ SCENE PARAMETER METHODS ------
 
@@ -423,9 +449,10 @@ class Model(nn.Module):
 
     def _constrain_texture(self) -> None:
         """Ensure texture centroid colors stay within [0,1] range."""
-        self.scene_params['texture_centroids'].data = torch.clamp(
-            self.scene_params['texture_centroids'], 0.0, 1.0
-        )
+        if 'texture_centroids' in self.scene_params:
+            self.scene_params['texture_centroids'].data = torch.clamp(
+                self.scene_params['texture_centroids'], 0.0, 1.0
+            )
 
     # ------ LIGHTING METHODS ------
 
@@ -555,7 +582,6 @@ class Model(nn.Module):
         return background_mask
 
     # ------ RENDERING METHODS ------
-
     def render(self, with_grad: bool = True, raster_settings: Optional[Dict] = {}) -> torch.Tensor:
         """
         Render the object with current parameters.
@@ -586,7 +612,7 @@ class Model(nn.Module):
                     self._constrain_lights()
 
             # Update texture if optimizing color centroids
-            if with_grad and self.scene_params["texture_centroids"].requires_grad:
+            if with_grad and 'texture_centroids' in self.scene_params and self.scene_params["texture_centroids"].requires_grad:
                 texture_maps = self._fill_texture()
                 new_textures = TexturesUV(
                     maps=texture_maps,
@@ -755,9 +781,9 @@ class Model(nn.Module):
 
     # ------ FORWARD PASS ------
 
-    def forward(self, return_render: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, return_render: bool = True, with_grad: bool = True) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Forward pass: render object and classify with ViT.
+        Forward pass: render object and classify with ResNet-50.
 
         Args:
             return_render: If True, also return rendered images
@@ -767,35 +793,39 @@ class Model(nn.Module):
             - Classification logits with shape (B, N_envmaps, num_classes)
             - (Optional) Rendered images if return_render is True
         """
-        images = self.render()  # (B, N_envmaps, H, W, C)
+        images = self.render(with_grad=with_grad)  # (B, N_envmaps, H, W, C)
         images_orig = images.clone()
 
-        # Reshape for batch processing through ViT
+        # Reshape for batch processing through ResNet-50
         B, N, H, W, C = images.shape
         images = images.reshape(B * N, H, W, C)
         images = images.permute(0, 3, 1, 2)  # (B*N, C, H, W)
 
-        # Resize to ViT expected input size
+        # Resize to ResNet-50 expected input size
         if images.shape[2:4] != (224, 224):
             images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
 
-        # Normalize for ViT
-        mean = torch.tensor([0.5, 0.5, 0.5], device=self.device).view(1, 3, 1, 1)
-        std = torch.tensor([0.5, 0.5, 0.5], device=self.device).view(1, 3, 1, 1)
+        # Normalize for ResNet-50 (ImageNet standards)
+        mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
         pixel_values = (images - mean) / std
 
-        # ViT forward pass
-        outputs = self.ml_model(
-            pixel_values=pixel_values,
-            output_attentions=False
-        )
+        with torch.set_grad_enabled(with_grad):
+            outputs = self.ml_model(pixel_values)
+
+        # Extract logits from the outputs (if it's ImageClassifierOutput)
+        if hasattr(outputs, 'logits'):
+            logits = outputs.logits
+        else:
+            logits = outputs  # Fallback to assuming outputs is already logits
 
         # Reshape logits back to (B, N_envmaps, num_classes)
-        logits = outputs.logits.reshape(B, N, -1)
+        logits = logits.reshape(B, N, -1)
 
         if return_render:
             return logits, images_orig
-        return logits
+        else:
+            return logits
 
 
 if __name__ == "__main__":
