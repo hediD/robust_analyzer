@@ -525,7 +525,7 @@ def visualize_results(results, config):
         topk_value = st.slider(
             "Top-K Accuracy Threshold",
             min_value=1,
-            max_value=10,
+            max_value=5,
             value=1,
             step=1,
             help="Consider prediction correct if target class appears in top K predictions"
