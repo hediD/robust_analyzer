@@ -143,9 +143,17 @@ class RobustnessAnalyzer:
         self.model.reset_cache() # reset cache to remove cached mesh and texture from previous runs
         self._current_results = defaultdict(list)
 
+        # Get progress callback if provided
+        progress_callback = kwargs.get('progress_callback', None)
+
         with tqdm(range(num_runs), desc="Initializing", mininterval=0.1) as pbar:
             for run in pbar:
                 self._current_run = run
+
+                # Update Streamlit progress if callback provided
+                if progress_callback:
+                    progress_callback(run, num_runs)
+
                 try:
                     self._setup_model()
                     self._create_optimizer(lr=kwargs.get('lr', 1e-1))
@@ -164,6 +172,11 @@ class RobustnessAnalyzer:
 
                     for i in range(num_iterations):
                         self._current_iteration = i
+
+                        # Update progress with iteration info
+                        if progress_callback:
+                            progress_callback(run, num_runs, i, num_iterations)
+
                         try:
                             self._optimizer_zero_grad()
                             torch.nn.utils.clip_grad_norm_(

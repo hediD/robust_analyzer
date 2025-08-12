@@ -484,20 +484,43 @@ def run_analysis(obj_path, texture_path, envmap_paths, config):
     with st.spinner("Initializing robustness analyzer..."):
         robust_analyzer = RobustnessAnalyzer(**kwargs)
 
-    # Run optimization
+    # Run optimization with progress tracking
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    try:
-        with st.spinner(f"Running {config['num_runs']} optimization runs..."):
-            results = robust_analyzer.run(
-                num_runs=config['num_runs'],
-                num_iterations=config['num_iterations'],
-                lr=config['learning_rate']
+    # Create progress callback function
+    def progress_callback(run_num, total_runs, iteration=None, total_iterations=None):
+        """Update Streamlit progress indicators."""
+        # Calculate overall progress (runs are the main progress indicator)
+        run_progress = run_num / total_runs
+        progress_bar.progress(run_progress)
+
+        # Update status text with current run information
+        if iteration is not None and total_iterations is not None:
+            status_text.info(
+                f"🎯 **Run {run_num + 1}/{total_runs}** | "
+                f"Iteration {iteration + 1}/{total_iterations} | "
+                f"Overall Progress: {run_progress:.1%}"
+            )
+        else:
+            status_text.info(
+                f"🎯 **Run {run_num + 1}/{total_runs}** | "
+                f"Overall Progress: {run_progress:.1%}"
             )
 
-        progress_bar.progress(100)
-        status_text.success("✅ Analysis completed successfully!")
+    try:
+        # Remove the spinner and rely on our custom progress indicators
+        status_text.info(f"🚀 Starting {config['num_runs']} optimization runs...")
+
+        results = robust_analyzer.run(
+            num_runs=config['num_runs'],
+            num_iterations=config['num_iterations'],
+            lr=config['learning_rate'],
+            progress_callback=progress_callback
+        )
+
+        progress_bar.progress(1.0)
+        status_text.success(f"✅ Analysis completed successfully! Processed {config['num_runs']} runs.")
 
         return robust_analyzer, results
 
@@ -522,14 +545,17 @@ def visualize_results(results, config):
         # Interactive topk slider
         st.subheader("🎯 Camera Position Heatmap")
 
-        topk_value = st.slider(
-            "Top-K Accuracy Threshold",
-            min_value=1,
-            max_value=5,
-            value=1,
-            step=1,
-            help="Consider prediction correct if target class appears in top K predictions"
+        topk_value = int(
+            st.number_input(
+                "Top-K Accuracy Threshold",
+                min_value=1,
+                max_value=5,
+                value=st.session_state.get('topk_value', 1),
+                step=1,
+                help="Consider prediction correct if target class appears in top K predictions"
+            )
         )
+        st.session_state['topk_value'] = topk_value
 
         # Get labels correctness based on current topk value
         labels_correct = utils.get_labels_correct(logits, config['target_class'], topk=topk_value)
@@ -541,18 +567,36 @@ def visualize_results(results, config):
 
         st.info(f"📊 **Top-{topk_value} Accuracy:** {correct_count}/{total_positions} ({accuracy:.1f}%) correct")
 
-        # Call the visualization function directly (it creates its own figure)
-        utils.visualize_positions_polar(
-            camera_positions.numpy(),
-            labels_correct.numpy(),
-            title=f"Camera Position Analysis (Top-{topk_value}) - Target: {config['target_class'][:30]}..."
-        )
+        col_plot, col_classes = st.columns([2, 1])
 
-        # The function above shows the plot with plt.show(), but we need to capture it for Streamlit
-        # Get the current figure that was just created
-        current_fig = plt.gcf()
-        st.pyplot(current_fig)
-        plt.close(current_fig)  # Close to free memory
+        with col_plot:
+            utils.visualize_positions_polar(
+                camera_positions.numpy(),
+                labels_correct.numpy(),
+                title=f"Camera Position Analysis (Top-{topk_value}) - Target: {config['target_class'][:30]}..."
+            )
+            current_fig = plt.gcf()
+            st.pyplot(current_fig)
+            plt.close(current_fig)
+
+        with col_classes:
+            st.subheader("🏷️ Most Predicted Classes")
+
+            # Compute top-1 predictions and frequencies
+            preds_top1 = torch.argmax(logits, dim=1).cpu().numpy()
+            values, counts = np.unique(preds_top1, return_counts=True)
+            order = np.argsort(-counts)
+            top_n = min(10, len(order))
+
+            # Load label mapping (falls back to IDs if labels file missing)
+            _, id_to_class = load_imagenet_labels()
+
+            for rank in range(top_n):
+                cls_id = int(values[order[rank]])
+                cnt = int(counts[order[rank]])
+                pct = (cnt / total_positions) * 100.0
+                label = id_to_class.get(cls_id, f"class {cls_id}")
+                st.write(f"{rank+1}. {label} — {cnt} ({pct:.1f}%)")
 
         # Store plot data for download
         return {
