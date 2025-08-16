@@ -224,7 +224,7 @@ class Model(nn.Module):
         self.optimize_lighting = self.optimize_kwargs["lighting"]
 
         # ------ ENVIRONMENT MAP SETUP ------
-        
+
         self.use_envmap = envmap_paths is not None and len(envmap_paths) > 0
         if self.use_envmap:
             if isinstance(envmap_paths, str):
@@ -232,9 +232,8 @@ class Model(nn.Module):
             self.envmaps = torch.stack([self._load_envmap(path) for path in envmap_paths])
         self.n_envmaps = len(envmap_paths) if envmap_paths else 1
 
-
     @classmethod
-    def reset_cache(cls):
+    def reset_cache_cls(cls):
         cls._mesh = None
         cls._texture_image = None
         cls._is_initialized = False

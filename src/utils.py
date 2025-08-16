@@ -517,7 +517,7 @@ def visualize_positions_with_distributions(
         fig.suptitle(
             title or ("Analysis of 3D Spherical Distribution" if not has_wrong_labels
                      else "Analysis of 3D Spherical Distribution of Model Classification"),
-            fontsize=fontsize + 2,
+            fontsize=fontsize,
             y=1.05
         )
 
