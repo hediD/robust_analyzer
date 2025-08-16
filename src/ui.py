@@ -258,7 +258,7 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
     num_runs = st.sidebar.number_input(
         "Number of Runs",
         min_value=1,
-        max_value=1000,
+        max_value=20_000,
         value=1,
         step=1,
         help="Total number of optimization runs",
