@@ -959,7 +959,6 @@ def display_rendered_images(robust_analyzer, results, run_index=0, env_index=0, 
     plt.tight_layout()
     plt.show()
 
-
 def get_labels_correct(logits, true_class_name, topk=1):
     topk_preds = logits.topk(topk, dim=1).indices  # shape: (batch_size, topk)
     true_idx = int(get_idx(true_class_name))  # shape: (batch_size, 1)

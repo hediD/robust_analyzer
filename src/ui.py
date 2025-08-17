@@ -1,13 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-3D Adversarial Robustness Analyzer (Streamlit App)
-
-Refactor goals (without changing functionality):
-- Organize imports & constants
-- Add type hints & docstrings
-- Centralize repeated logic (envmap expansion, cache/meta IO, selection helpers)
-- Keep UI texts, controls, defaults, and behavior identical
-"""
+"""3D Adversarial Robustness Analyzer (Streamlit App)"""
 
 from __future__ import annotations
 
@@ -18,35 +10,28 @@ import os
 import hashlib
 import tempfile
 import zipfile
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
+import shutil
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
 import torch
 
-# Plotly express & subplots are imported in original code, even if not used directly elsewhere.
-# Keep them to avoid functional changes (e.g., potential downstream imports).
 import plotly.express as px  # noqa: F401
 from plotly.subplots import make_subplots  # noqa: F401
-
-# Matplotlib imported lazily in functions that need it.
 
 from model import Model
 from robustness_analyzer import RobustnessAnalyzer
 import utils
 
-try:
-    from PIL import Image  # type: ignore
-except ImportError:
-    import PIL.Image as Image  # type: ignore
+from PIL import ImageDraw, ImageFont, Image
+import matplotlib.pyplot as plt
 
-# -------------------------
 # Constants
-# -------------------------
-
 APP_TITLE = "🎯 3D Adversarial Robustness Analyzer"
 APP_TAGLINE = (
     "Upload 3D objects, textures, and environments to analyze adversarial robustness "
@@ -58,24 +43,15 @@ DEFAULT_TARGET_LABEL = (
 IMAGENET_JSON_REL = ("data", "imagenet1000_clsidx_to_labels.json")
 IMAGENET_JSON_ALT_REL = ("..", "data", "imagenet1000_clsidx_to_labels.json")
 
-# -------------------------
-# Utilities: Shared Helpers
-# -------------------------
-
+# Utilities
 def _safe_json_or_eval_text(text: str) -> Dict[int, str]:
-    """
-    Try json.loads first, then eval as fallback (keeps functionality).
-    The original code used eval; preserve behavior if JSON fails.
-    """
     try:
         return json.loads(text)
     except Exception:
-        # Fallback to eval exactly as original code did
         return eval(text)
 
 
 def _imagenet_labels_path() -> Optional[Path]:
-    """Resolve ImageNet labels file path, matching original two-path search."""
     p1 = Path(*IMAGENET_JSON_REL)
     if p1.exists():
         return p1
@@ -90,19 +66,7 @@ def _expand_for_envmaps(
     cam_positions_stack: torch.Tensor,
     envmap_paths: Optional[Sequence[str]],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Expand logits and camera positions to account for environment maps, matching the
-    logic used in multiple places in the original code.
-
-    Inputs:
-      logits: stacked logits of shape (num_runs, batch, [n_envmaps], 1000)
-      cam_positions_stack: stacked cameras of shape (num_runs, batch, 3)
-      envmap_paths: optional list of envmap paths
-
-    Returns:
-      logits_2d: (N, 1000)
-      cameras_2d: (N, 3)
-    """
+    """Expand logits and camera positions to account for environment maps."""
     if envmap_paths:
         n_env = len(envmap_paths)
         cams = cam_positions_stack.unsqueeze(2).expand(-1, -1, n_env, -1)
@@ -123,26 +87,19 @@ def _now_human() -> str:
 
 
 def _get_idx_safe(target: str) -> int:
-    """Thin wrapper around utils.get_idx for readability."""
     return utils.get_idx(target)
 
 
 def _softmax_max_probs(logits: torch.Tensor) -> np.ndarray:
-    """Return max softmax probabilities per row."""
     return torch.softmax(logits, dim=1).max(dim=1)[0].cpu().numpy()
 
 
 def _pred_top1(logits: torch.Tensor) -> np.ndarray:
-    """Return argmax per row."""
     return torch.argmax(logits, dim=1).cpu().numpy()
 
 
-# -------------------------
 # UI Setup
-# -------------------------
-
 def setup_page() -> None:
-    """Configure the Streamlit page."""
     st.set_page_config(
         page_title="3D Robustness Analyzer",
         page_icon="🎯",
@@ -153,15 +110,8 @@ def setup_page() -> None:
     st.markdown(APP_TAGLINE)
 
 
-# -------------------------
 # ImageNet Labeling & Target Selection
-# -------------------------
-
 def load_imagenet_labels() -> Tuple[List[Tuple[int, str]], Dict[int, str]]:
-    """
-    Load ImageNet 1000 class labels from JSON (or eval fallback),
-    returning (options_sorted_by_label, id_to_class_dict).
-    """
     try:
         labels_file = _imagenet_labels_path()
         if not labels_file:
@@ -180,17 +130,12 @@ def load_imagenet_labels() -> Tuple[List[Tuple[int, str]], Dict[int, str]]:
 
 
 def get_cached_imagenet_labels() -> Tuple[List[Tuple[int, str]], Dict[int, str]]:
-    """
-    Get ImageNet labels from cache (session state) or load them if not cached.
-    This prevents repeated file opening during bulk operations.
-    """
     if "imagenet_labels_cache" not in st.session_state:
         st.session_state["imagenet_labels_cache"] = load_imagenet_labels()
     return st.session_state["imagenet_labels_cache"]
 
 
 def create_target_class_selector() -> str:
-    """Create a searchable target class selector with ImageNet labels."""
     st.sidebar.subheader("🎯 Target Class Selection")
 
     class_options, id_to_class = get_cached_imagenet_labels()
@@ -204,7 +149,7 @@ def create_target_class_selector() -> str:
 
     display_options = [f"{idx}: {label}" for idx, label in class_options]
 
-    # Default to something that includes 'tank' and 'army' (original behavior)
+    # Default to tank class
     default_idx = 0
     for i, (_idx, label) in enumerate(class_options):
         if "tank" in label.lower() and "army" in label.lower():
@@ -227,12 +172,8 @@ def create_target_class_selector() -> str:
     return DEFAULT_TARGET_LABEL
 
 
-# -------------------------
 # Sidebar Config
-# -------------------------
-
 def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
-    """Create the parameter configuration sidebar."""
     st.sidebar.header("📋 Configuration")
     st.sidebar.subheader("Model Parameters")
 
@@ -317,6 +258,15 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
         )
         st.info("💡 **Tip:** Use smaller bin sizes and fewer faces per bin if you encounter GPU memory issues.")
 
+    st.sidebar.subheader("Download Settings")
+    include_heatmap = st.sidebar.checkbox(
+        "📊 Include heatmap in downloads",
+        value=True,
+        help="When checked: downloads include rendered image + heatmap composite. When unchecked: downloads only the rendered images with separate metadata files.",
+        key="global_include_heatmap"
+    )
+    st.session_state["include_heatmap_global"] = include_heatmap
+
     return {
         "target_class": target_class,
         "batch_size": int(batch_size),
@@ -329,19 +279,15 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
         "max_faces_per_bin": int(max_faces_per_bin),
         "positive_z": bool(positive_z),
         "targeted": bool(targeted),
+        "include_heatmap": include_heatmap,
     }
 
 
-# -------------------------
 # File Uploads & Cache
-# -------------------------
-
 def handle_file_uploads():
-    """Handle file uploads for OBJ, MTL, texture, and environment files."""
     st.header("📁 File Uploads")
     tab1, tab2 = st.tabs(["📦 Complete 3D Package", "🎨 Individual Files"])
 
-    # ZIP package tab
     with tab1:
         st.subheader("Upload Complete 3D Package")
         st.info("💡 Upload a ZIP file containing .obj, .mtl, and all texture files")
@@ -354,7 +300,6 @@ def handle_file_uploads():
             st.success(f"✅ Uploaded package: {zip_file.name}")
             return "zip", zip_file, None, None, None
 
-    # Individual files tab
     with tab2:
         col1, col2, col3 = st.columns(3)
 
@@ -415,7 +360,6 @@ def handle_file_uploads():
 
 
 def get_cache_dir() -> Path:
-    """Get or create a persistent cache directory with absolute path."""
     script_dir = Path(__file__).parent.absolute()
     cache_dir = script_dir / "file_cache"
     cache_dir.mkdir(exist_ok=True)
@@ -423,15 +367,10 @@ def get_cache_dir() -> Path:
 
 
 def get_file_hash(file_content: bytes) -> str:
-    """Generate a hash for file content to use as cache key."""
     return hashlib.md5(file_content).hexdigest()
 
 
 def _cache_entries_sorted_latest_first(cache_dir: Path) -> List[Dict]:
-    """
-    Load valid cache entries (with present files) and return them
-    sorted by timestamp desc.
-    """
     entries: List[Dict] = []
     for sub in cache_dir.iterdir():
         if not sub.is_dir():
@@ -460,10 +399,6 @@ def _cache_entries_sorted_latest_first(cache_dir: Path) -> List[Dict]:
 
 
 def check_cached_files() -> bool:
-    """
-    Check if cached files are available and load them into session state
-    (latest valid cache wins).
-    """
     cache_dir = get_cache_dir()
     entries = _cache_entries_sorted_latest_first(cache_dir)
     if not entries:
@@ -485,8 +420,7 @@ def check_cached_files() -> bool:
 
 
 def save_zip_package(zip_file, temp_dir: str) -> Tuple[str, Optional[str], List[str], str]:
-    """Extract and organize ZIP package."""
-    with zipfile.ZipFile(io.BytesIO(zip_file.read())) as zf:  # type: ignore[name-defined]
+    with zipfile.ZipFile(io.BytesIO(zip_file.read())) as zf:
         zf.extractall(temp_dir)
 
     obj_files = glob.glob(os.path.join(temp_dir, "**/*.obj"), recursive=True)
@@ -525,7 +459,7 @@ def save_zip_package(zip_file, temp_dir: str) -> Tuple[str, Optional[str], List[
                         if os.path.exists(tex_path):
                             texture_paths.append(tex_path)
 
-    # Find env maps (hdr/exr preferred, else inferred by filename)
+    # Find env maps
     envmap_paths: List[str] = []
     for ext in ("*.hdr", "*.exr"):
         envmap_paths.extend(glob.glob(os.path.join(temp_dir, "**", ext), recursive=True))
@@ -539,7 +473,6 @@ def save_zip_package(zip_file, temp_dir: str) -> Tuple[str, Optional[str], List[
 
 
 def update_obj_mtl_reference(obj_path: str, mtl_filename: str) -> None:
-    """Update OBJ file to reference the correct MTL file."""
     with open(obj_path, "r") as f:
         lines = f.readlines()
 
@@ -552,7 +485,6 @@ def update_obj_mtl_reference(obj_path: str, mtl_filename: str) -> None:
 def save_individual_files(
     obj_file, mtl_file, texture_files, env_files, temp_dir: str
 ) -> Tuple[Optional[str], Optional[str], List[str], str]:
-    """Save individual uploaded files."""
     obj_path: Optional[str] = None
     texture_path: Optional[str] = None
     envmap_paths: List[str] = []
@@ -570,7 +502,6 @@ def save_individual_files(
             update_obj_mtl_reference(obj_path, mtl_file.name)
 
     if texture_files:
-        # Either a single override or multiple files
         if hasattr(texture_files, "read"):
             texture_path = os.path.join(temp_dir, texture_files.name)
             with open(texture_path, "wb") as f:
@@ -592,7 +523,6 @@ def save_individual_files(
 
 
 def validate_mtl_textures(mtl_path: str, temp_dir: str) -> Tuple[bool, List[str]]:
-    """Validate that all textures referenced in MTL file are available."""
     if not mtl_path or not os.path.exists(mtl_path):
         return True, []
 
@@ -614,7 +544,6 @@ def validate_mtl_textures(mtl_path: str, temp_dir: str) -> Tuple[bool, List[str]
 
 
 def save_files_to_cache(upload_type, *files):
-    """Save uploaded files to persistent cache directory (with caching)."""
     cache_dir = get_cache_dir()
     file_names: List[str] = []
 
@@ -650,7 +579,7 @@ def save_files_to_cache(upload_type, *files):
     upload_cache = cache_dir / cache_key
     meta_path = upload_cache / "metadata.json"
 
-    # Use cached data if complete
+    # Use cached data if available
     if meta_path.exists():
         try:
             cached = json.loads(meta_path.read_text())
@@ -687,15 +616,11 @@ def save_files_to_cache(upload_type, *files):
     except Exception as e:
         st.error(f"❌ Error caching files: {str(e)}")
         if upload_cache.exists():
-            import shutil
             shutil.rmtree(upload_cache, ignore_errors=True)
         raise
 
 
-# -------------------------
 # Visualization
-# -------------------------
-
 def create_interactive_polar_plot(
     camera_positions: np.ndarray,
     labels_correct: np.ndarray,
@@ -705,11 +630,10 @@ def create_interactive_polar_plot(
     selected_indices: Optional[Sequence[int]] = None,
     current_highlighted_index: Optional[int] = None,
 ) -> go.Figure:
-    """Create an interactive polar plot using Plotly."""
     azimuth, elevation, _ = utils.compute_spherical_coordinates(camera_positions)
-    azimuth_rad = np.radians(azimuth)  # kept for parity; theta uses degrees via plotly
+    azimuth_rad = np.radians(azimuth)
 
-    _, id_to_class = get_cached_imagenet_labels()  # Use cached version
+    _, id_to_class = get_cached_imagenet_labels()
     preds_top1 = _pred_top1(logits)
     pred_probs = _softmax_max_probs(logits)
 
@@ -855,7 +779,6 @@ def render_image_at_position(
     position_idx: int,
     envmap_idx: int = 0,
 ) -> Optional[Dict]:
-    """Render an image at a specific camera position."""
     try:
         total_envmaps = len(results.get("envmap_paths", [])) or 1
 
@@ -870,7 +793,7 @@ def render_image_at_position(
         batch_idx = min(batch_idx, robust_analyzer.batch_size - 1)
         env_idx = min(env_idx, total_envmaps - 1)
 
-        # Update model with the scene parameters from this specific run
+        # Update model with scene parameters
         scene_params = results["final_scene_params"][run_idx]
         robust_analyzer.model.update_scene_params(scene_params)
 
@@ -886,7 +809,7 @@ def render_image_at_position(
             if image_np.max() <= 1.0:
                 image_np = (image_np * 255).astype(np.uint8)
 
-            stored_logits = torch.stack(results["final_logits"])  # (runs, batch, [env], 1000)
+            stored_logits = torch.stack(results["final_logits"])
             if len(stored_logits.shape) == 4:  # [runs, batch, env, classes]
                 pred_logits = stored_logits[run_idx, batch_idx, env_idx]
             else:  # [runs, batch, classes]
@@ -895,7 +818,16 @@ def render_image_at_position(
             pred_class_idx = int(pred_logits.argmax().item())
             pred_prob = float(torch.softmax(pred_logits, dim=0)[pred_class_idx].item())
 
-            _, id_to_class = get_cached_imagenet_labels()  # Use cached version
+            # Calculate target class ranking
+            target_class_ranking = None
+            target_class_confidence = None
+            if st.session_state.get("target_class"):
+                target_idx = _get_idx_safe(st.session_state["target_class"])
+                sorted_indices = torch.argsort(pred_logits, descending=True)
+                target_class_ranking = int((sorted_indices == target_idx).nonzero(as_tuple=True)[0].item()) + 1
+                target_class_confidence = float(torch.softmax(pred_logits, dim=0)[target_idx].item())
+
+            _, id_to_class = get_cached_imagenet_labels()
             pred_class = id_to_class.get(pred_class_idx, f"class {pred_class_idx}")
 
             camera_pos = scene_params["camera"][batch_idx:batch_idx + 1]
@@ -913,6 +845,8 @@ def render_image_at_position(
                 "run_idx": run_idx,
                 "batch_idx": batch_idx,
                 "env_idx": env_idx,
+                "target_class_ranking": target_class_ranking,
+                "target_class_confidence": target_class_confidence,
             }
 
     except Exception as e:
@@ -925,7 +859,6 @@ def render_multiple_images(
     results: Dict,
     position_indices: Sequence[int],
 ) -> List[Dict]:
-    """Render images for multiple positions with progress tracking."""
     if not position_indices:
         return []
 
@@ -950,10 +883,7 @@ def render_multiple_images(
     return rendered_images
 
 
-# -------------------------
 # Composite Image Creation
-# -------------------------
-
 def create_individual_heatmap(
     camera_positions: np.ndarray,
     labels_correct: np.ndarray,
@@ -964,7 +894,6 @@ def create_individual_heatmap(
     config: Dict,
     image_info: Optional[Dict] = None,
 ) -> go.Figure:
-    """Create a heatmap with a single highlighted position for download."""
     fig = create_interactive_polar_plot(
         camera_positions,
         labels_correct,
@@ -994,12 +923,6 @@ def create_composite_image(
     logits: torch.Tensor,
     config: Dict,
 ) -> Image.Image:
-    """
-    Create a composite PNG with rendered image and heatmap (Plotly preferred, Matplotlib fallback).
-    """
-    from PIL import ImageDraw, ImageFont
-    import matplotlib.pyplot as plt
-
     rendered_img = Image.fromarray(image_info["image"])
 
     topk_value = st.session_state.get("topk_value", 1)
@@ -1019,12 +942,14 @@ def create_composite_image(
         )
         heatmap_bytes = fig.to_image(format="png", width=500, height=500, scale=2)
         heatmap_img = Image.open(io.BytesIO(heatmap_bytes))
+        print("✅ Plotly heatmap created successfully")
 
-    except Exception:
+    except Exception as e:
+        print(f"❌ Plotly heatmap failed: {e}")
         # Matplotlib fallback
         try:
-            plt.figure(figsize=(5, 5))
-            ax = plt.subplot(111, projection="polar")
+            fig = plt.figure(figsize=(5, 5))
+            ax = fig.add_subplot(111, projection="polar")
 
             azimuth, elevation, _ = utils.compute_spherical_coordinates(camera_positions)
             azimuth_rad = np.radians(azimuth)
@@ -1062,12 +987,13 @@ def create_composite_image(
             ax.legend(loc="upper left", bbox_to_anchor=(0, 1), fontsize="small")
 
             buf = io.BytesIO()
-            plt.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+            fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
             buf.seek(0)
             heatmap_img = Image.open(buf)
-            plt.close()
+            plt.close(fig)
 
-        except Exception:
+        except Exception as e2:
+            print(f"Matplotlib fallback also failed: {e2}")
             # Last resort placeholder
             heatmap_img = Image.new("RGB", (500, 500), color="lightgray")
             draw = ImageDraw.Draw(heatmap_img)
@@ -1107,7 +1033,7 @@ def create_composite_image(
     heatmap_size = (400, 400)
 
     rendered_img = rendered_img.resize(rendered_size, Image.Resampling.LANCZOS)
-    heatmap_img = heatmap_img.resize(heatmap_size, Image.Resampling.LANCZOS)  # type: ignore
+    heatmap_img = heatmap_img.resize(heatmap_size, Image.Resampling.LANCZOS)
 
     margin = 20
     total_w = rendered_size[0] + heatmap_size[0] + 3 * margin
@@ -1132,7 +1058,6 @@ def create_composite_image(
             continue
     if label is None:
         try:
-            from PIL import ImageFont
             label = ImageFont.load_default()
         except Exception:
             label = None
@@ -1150,10 +1075,7 @@ def create_composite_image(
     return composite
 
 
-# -------------------------
 # Downloads
-# -------------------------
-
 def download_single_image_package(
     image_info: Dict,
     camera_positions: np.ndarray,
@@ -1161,8 +1083,6 @@ def download_single_image_package(
     logits: torch.Tensor,
     config: Dict,
 ) -> bytes:
-    """Create a downloadable package with a single composite PNG for the image."""
-    import zipfile  # local to match original
     with tempfile.TemporaryDirectory() as temp_dir:
         pkg_dir = Path(temp_dir) / f"robustness_image_{image_info['position_idx']}"
         pkg_dir.mkdir(exist_ok=True)
@@ -1212,8 +1132,6 @@ def download_all_images_package(
     logits: torch.Tensor,
     config: Dict,
 ) -> bytes:
-    """Create a downloadable package with composite PNGs for all rendered images."""
-    import zipfile  # local to match original
     with tempfile.TemporaryDirectory() as temp_dir:
         pkg_dir = Path(temp_dir) / "robustness_analysis_all_images"
         pkg_dir.mkdir(exist_ok=True)
@@ -1269,7 +1187,6 @@ def download_all_images_package(
             width=800,
         )
 
-        # Try PNG; else HTML
         try:
             overall_fig.write_image(str(pkg_dir / "overview_heatmap.png"), width=800, height=800, scale=2)
         except Exception:
@@ -1284,12 +1201,8 @@ def download_all_images_package(
         return buf.getvalue()
 
 
-# -------------------------
 # Carousel
-# -------------------------
-
 def create_image_carousel(rendered_images: Sequence[Dict]) -> None:
-    """Create a carousel interface for navigating through rendered images."""
     if not rendered_images:
         st.info("No images to display")
         return
@@ -1316,7 +1229,8 @@ def create_image_carousel(rendered_images: Sequence[Dict]) -> None:
     st.markdown("---")
     d1, d2, _, d4, _ = st.columns([1, 2, 0.5, 2, 1])
 
-    # Pre-generate current image data for direct download
+    include_heatmap = st.session_state.get("include_heatmap_global", True)
+
     with d2:
         if ("results" in st.session_state and "config" in st.session_state):
             try:
@@ -1330,31 +1244,40 @@ def create_image_carousel(rendered_images: Sequence[Dict]) -> None:
                 topk = st.session_state.get("topk_value", 1)
                 labels_correct = utils.get_labels_correct(logits2d, config["target_class"], topk=topk)
 
-                composite = create_composite_image(
-                    current, cams2d.numpy(), labels_correct.numpy(), logits2d, config
-                )
-                buf = io.BytesIO()
-                composite.save(buf, format="PNG", dpi=(300, 300))
-                buf.seek(0)
+                if include_heatmap:
+                    composite = create_composite_image(
+                        current, cams2d.numpy(), labels_correct.numpy(), logits2d, config
+                    )
+                    buf = io.BytesIO()
+                    composite.save(buf, format="PNG", dpi=(300, 300))
+                    buf.seek(0)
+                    file_name = f"robustness_position_{current['position_idx']}_analysis.png"
+                    button_label = "📥 Download Current Image"
+                else:
+                    rendered_img = Image.fromarray(current["image"])
+                    buf = io.BytesIO()
+                    rendered_img.save(buf, format="PNG", dpi=(300, 300))
+                    buf.seek(0)
+                    file_name = f"robustness_position_{current['position_idx']}_rendered.png"
+                    button_label = "📥 Download Current Image"
 
                 st.download_button(
-                    label="📥 Download Current Image",
+                    label=button_label,
                     data=buf.getvalue(),
-                    file_name=f"robustness_position_{current['position_idx']}_analysis.png",
+                    file_name=file_name,
                     mime="image/png",
-                    key=f"dl_btn_single_{idx}",
+                    key=f"dl_btn_single_{idx}_{include_heatmap}",
                     use_container_width=True
                 )
             except Exception as e:
                 st.error(f"❌ Error creating image: {str(e)}")
+                st.code(traceback.format_exc())
         else:
             st.button("📥 Download Current Image", disabled=True, help="Analysis data not available", use_container_width=True)
 
-    # Pre-generate all rendered images ZIP for direct download
     with d4:
         if ("results" in st.session_state and "config" in st.session_state and rendered_images):
-            # Use caching for expensive ZIP generation
-            cache_key = f"carousel_zip_{len(rendered_images)}_{hash(tuple(img['position_idx'] for img in rendered_images))}"
+            cache_key = f"carousel_zip_{len(rendered_images)}_{hash(tuple(img['position_idx'] for img in rendered_images))}_{include_heatmap}"
 
             if cache_key not in st.session_state:
                 try:
@@ -1369,31 +1292,57 @@ def create_image_carousel(rendered_images: Sequence[Dict]) -> None:
                         topk = st.session_state.get("topk_value", 1)
                         labels_correct = utils.get_labels_correct(logits2d, config["target_class"], topk=topk)
 
-                        # Build ZIP with just PNGs (composites)
                         zbuf = io.BytesIO()
-                        with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zipf:  # type: ignore[name-defined]
+                        with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zipf:
                             for image_info in rendered_images:
-                                composite = create_composite_image(
-                                    image_info, cams2d.numpy(), labels_correct.numpy(), logits2d, config
-                                )
-                                ibuf = io.BytesIO()
-                                composite.save(ibuf, format="PNG", dpi=(300, 300))
-                                ibuf.seek(0)
-                                zipf.writestr(f"position_{image_info['position_idx']:03d}_analysis.png", ibuf.getvalue())
+                                if include_heatmap:
+                                    composite = create_composite_image(
+                                        image_info, cams2d.numpy(), labels_correct.numpy(), logits2d, config
+                                    )
+                                    ibuf = io.BytesIO()
+                                    composite.save(ibuf, format="PNG", dpi=(300, 300))
+                                    ibuf.seek(0)
+                                    zipf.writestr(f"position_{image_info['position_idx']:03d}_analysis.png", ibuf.getvalue())
+                                else:
+                                    rendered_img = Image.fromarray(image_info["image"])
+                                    ibuf = io.BytesIO()
+                                    rendered_img.save(ibuf, format="PNG", dpi=(300, 300))
+                                    ibuf.seek(0)
+                                    zipf.writestr(f"position_{image_info['position_idx']:03d}_rendered.png", ibuf.getvalue())
+
+                                    metadata = {
+                                        "position_idx": image_info["position_idx"],
+                                        "azimuth": float(image_info["azimuth"]),
+                                        "elevation": float(image_info["elevation"]),
+                                        "distance": float(image_info["distance"]),
+                                        "prediction": image_info["prediction"],
+                                        "confidence": float(image_info["confidence"]),
+                                        "class_idx": int(image_info["class_idx"]),
+                                        "run_idx": image_info["run_idx"],
+                                        "batch_idx": image_info["batch_idx"],
+                                        "env_idx": image_info["env_idx"],
+                                        "target_class_ranking": image_info.get("target_class_ranking"),
+                                        "target_class_confidence": image_info.get("target_class_confidence"),
+                                    }
+                                    zipf.writestr(f"position_{image_info['position_idx']:03d}_metadata.json",
+                                                json.dumps(metadata, indent=2))
 
                         zbuf.seek(0)
                         st.session_state[cache_key] = zbuf.getvalue()
                 except Exception as e:
                     st.error(f"❌ Error creating images: {str(e)}")
+                    st.code(traceback.format_exc())
                     st.session_state[cache_key] = None
 
             if st.session_state.get(cache_key):
+                file_suffix = "composite" if include_heatmap else "render"
+                image_type = "composite images" if include_heatmap else "rendered images"
                 st.download_button(
-                    label="📥 Download Rendered Images",
+                    label=f"📥 Download {image_type.title()}",
                     data=st.session_state[cache_key],
-                    file_name=f"robustness_all_images_{len(rendered_images)}_positions.zip",
+                    file_name=f"robustness_all_images_{len(rendered_images)}_positions_{file_suffix}.zip",
                     mime="application/zip",
-                    key=f"dl_btn_all_{len(rendered_images)}",
+                    key=f"dl_btn_all_{len(rendered_images)}_{include_heatmap}",
                     use_container_width=True
                 )
             else:
@@ -1422,21 +1371,28 @@ def create_image_carousel(rendered_images: Sequence[Dict]) -> None:
             status = "✅ Correct" if current["class_idx"] == target_idx else "❌ Incorrect"
             st.write(f"• **Status:** {status}")
 
-        with st.expander("🔧 Image Info", expanded=False):
-            st.write(f"• **Run Index:** {current['run_idx']}")
-            st.write(f"• **Batch Index:** {current['batch_idx']}")
-            st.write(f"• **Environment Index:** {current['env_idx']}")
+            if current.get("target_class_ranking") is not None:
+                ranking = current["target_class_ranking"]
+                target_confidence = current.get("target_class_confidence", 0.0)
+
+                if ranking % 10 == 1 and ranking % 100 != 11:
+                    suffix = "st"
+                elif ranking % 10 == 2 and ranking % 100 != 12:
+                    suffix = "nd"
+                elif ranking % 10 == 3 and ranking % 100 != 13:
+                    suffix = "rd"
+                else:
+                    suffix = "th"
+
+                st.write(f"• **Target Class Ranking:** {ranking}{suffix} place (confidence: {target_confidence:.3f})")
 
 
-# -------------------------
-# Results Visualization Block
-# -------------------------
-
+# Results Visualization
 def visualize_results(results: Dict, config: Dict):
-    """Create interactive polar heatmap visualization with clickable points."""
     st.header("📊 Interactive Results Visualization")
+
     try:
-        logits_stack = torch.stack(results["final_logits"])  # (runs, batch, [env], 1000)
+        logits_stack = torch.stack(results["final_logits"])
         cams_stack = torch.stack([x["camera"] for x in results["final_scene_params"]])
 
         logits2d, cams2d = _expand_for_envmaps(logits_stack, cams_stack, results.get("envmap_paths"))
@@ -1449,7 +1405,7 @@ def visualize_results(results: Dict, config: Dict):
             values, counts = np.unique(preds_top1, return_counts=True)
             order = np.argsort(-counts)
             top_n = min(5, len(order))
-            _, id_to_class = get_cached_imagenet_labels()  # Use cached version
+            _, id_to_class = get_cached_imagenet_labels()
             for rank in range(top_n):
                 cls_id = int(values[order[rank]])
                 cnt = int(counts[order[rank]])
@@ -1463,7 +1419,6 @@ def visualize_results(results: Dict, config: Dict):
 
         col_plot, col_manual = st.columns([2, 1])
 
-        # --- Plot column
         with col_plot:
             all_rendered_indices: Optional[List[int]] = None
             current_highlighted_index: Optional[int] = None
@@ -1491,7 +1446,7 @@ def visualize_results(results: Dict, config: Dict):
                 current_highlighted_index=current_highlighted_index,
             )
 
-            event = st.plotly_chart(fig, use_container_width=True, on_select="rerun", key="polar_plot")  # type: ignore[arg-type]
+            event = st.plotly_chart(fig, use_container_width=True, on_select="rerun", key="polar_plot")
 
             if st.checkbox("🔍 Debug Mode", value=False):
                 st.write("**Event Debug Info:**")
@@ -1532,7 +1487,6 @@ def visualize_results(results: Dict, config: Dict):
                     except Exception as e:
                         st.error(f"❌ Error processing selection: {str(e)}")
 
-        # --- Manual selection column
         with col_manual:
             topk = int(st.number_input(
                 "Top-K Accuracy Threshold",
@@ -1612,7 +1566,7 @@ def visualize_results(results: Dict, config: Dict):
                 confs = target_probs[selected_indices]
                 st.caption(f"**Confidence range:** {confs.min():.3f} - {confs.max():.3f} (avg: {confs.mean():.3f})")
                 with st.expander("🔍 Preview selected positions", expanded=False):
-                    _, id_to_class = get_cached_imagenet_labels()  # Use cached version
+                    _, id_to_class = get_cached_imagenet_labels()
                     for i, pos_idx in enumerate(selected_indices):
                         conf = target_probs[pos_idx]
                         pred_idx = int(torch.argmax(logits2d[pos_idx]).item())
@@ -1627,7 +1581,7 @@ def visualize_results(results: Dict, config: Dict):
                     st.success(f"✅ Selected {len(selected_indices)} positions - updating heatmap and rendering...")
                     st.rerun()
 
-        # Render selected (with cache) if triggered
+        # Render selected images
         if (st.session_state.get("trigger_render", False)
             and st.session_state.get("selected_positions")
             and st.session_state.get("robust_analyzer")):
@@ -1671,38 +1625,31 @@ def visualize_results(results: Dict, config: Dict):
             else:
                 st.info("👆 Choose a point (or multiple points) on the polar plot or use the position selection to the right to see the rendered images!")
 
-        # --- Static Polar Plot and Distributions (separate expanders) - reduced size
         with st.expander("📊 Static Polar Plot", expanded=False):
-            import matplotlib.pyplot as plt
-            # Static polar plot (matplotlib)
             utils.visualize_positions_polar(
                 cams2d.numpy(),
                 labels_correct.numpy(),
                 title=f"Camera Position Analysis (Top-{topk}) - Target: {config['target_class'][:30]}...",
             )
             polar_fig = plt.gcf()
-            # Reduce size by 50% using columns
             col1, col2, col3 = st.columns([1, 2, 1])
             with col2:
                 st.pyplot(polar_fig, use_container_width=True)
-            plt.close(polar_fig)  # Clean up the figure
+            plt.close()
 
         with st.expander("📈 Distribution Histograms", expanded=False):
-            import matplotlib.pyplot as plt
-            # Use the existing utils function for distributions
             utils.visualize_positions_with_distributions(
                 cams2d.numpy(),
                 labels_correct.numpy(),
                 title=f"Distribution Analysis (Top-{topk}) - Target: {config['target_class'][:30]}...",
                 mode="distributions",
-                show_distance=False  # Only show azimuth and elevation
+                show_distance=False
             )
             dist_fig = plt.gcf()
-            # Reduce size by 50% using columns
             col1, col2, col3 = st.columns([1, 2, 1])
             with col2:
                 st.pyplot(dist_fig, use_container_width=True)
-            plt.close(dist_fig)  # Clean up the figure
+            plt.close()
 
         return {
             "camera_positions": cams2d.numpy(),
@@ -1713,22 +1660,17 @@ def visualize_results(results: Dict, config: Dict):
 
     except Exception as e:
         st.error(f"❌ Error in processing results: {str(e)}")
-        import traceback
         st.code(traceback.format_exc())
         return None
 
 
-# -------------------------
 # Analysis
-# -------------------------
-
 def run_analysis(
     obj_path: str,
     texture_path: Optional[str],
     envmap_paths: Sequence[str],
     config: Dict,
 ):
-    """Run the robustness analysis with the given configuration."""
     raster_settings = {
         "image_size": config["image_size"],
         "bin_size": config["bin_size"],
@@ -1746,8 +1688,6 @@ def run_analysis(
         "positive_z": config["positive_z"],
         "raster_settings": raster_settings,
     }
-
-    #Model.reset_cache_cls()
 
     with st.spinner("Initializing robustness analyzer..."):
         robust_analyzer = RobustnessAnalyzer(**kwargs)
@@ -1788,12 +1728,8 @@ def run_analysis(
         return None, None
 
 
-# -------------------------
 # Downloads Panel
-# -------------------------
-
 def download_results(results: Dict, plot_data: Optional[Dict]) -> None:
-    """Provide download functionality for results and visualization."""
     st.write(""); st.write(""); st.write("")
     st.header("💾 Download Results")
     st.write(""); st.write("")
@@ -1801,7 +1737,6 @@ def download_results(results: Dict, plot_data: Optional[Dict]) -> None:
     col1, col2, col3 = st.columns(3)
     st.write(""); st.write("")
 
-    # Pre-generate JSON data for direct download
     with col1:
         try:
             serializable_results: Dict[str, Union[List, Dict, None]] = {}
@@ -1829,16 +1764,11 @@ def download_results(results: Dict, plot_data: Optional[Dict]) -> None:
         except Exception as e:
             st.button("📄 Download Results as JSON", disabled=True, help=f"Error preparing JSON: {str(e)}")
 
-    # Pre-generate polar heatmap for direct download
     with col2:
         if plot_data:
             cache_key = f"heatmap_{hash(str(plot_data))}"
             if cache_key not in st.session_state:
                 try:
-                    import matplotlib.pyplot as plt
-                    from PIL import Image
-
-                    # Generate polar plot
                     utils.visualize_positions_polar(
                         plot_data["camera_positions"],
                         plot_data["labels_correct"],
@@ -1846,14 +1776,12 @@ def download_results(results: Dict, plot_data: Optional[Dict]) -> None:
                     )
                     polar_fig = plt.gcf()
 
-                    # Save polar plot to buffer
                     polar_buf = io.BytesIO()
                     polar_fig.savefig(polar_buf, format="png", dpi=300, bbox_inches="tight")
                     polar_buf.seek(0)
                     polar_img = Image.open(polar_buf)
-                    plt.close(polar_fig)
+                    plt.close()
 
-                    # Generate distributions plot
                     utils.visualize_positions_with_distributions(
                         plot_data["camera_positions"],
                         plot_data["labels_correct"],
@@ -1863,12 +1791,11 @@ def download_results(results: Dict, plot_data: Optional[Dict]) -> None:
                     )
                     dist_fig = plt.gcf()
 
-                    # Save distributions plot to buffer
                     dist_buf = io.BytesIO()
                     dist_fig.savefig(dist_buf, format="png", dpi=300, bbox_inches="tight")
                     dist_buf.seek(0)
                     dist_img = Image.open(dist_buf)
-                    plt.close(dist_fig)
+                    plt.close()
 
                     # Combine both images vertically
                     polar_width, polar_height = polar_img.size
@@ -1905,7 +1832,6 @@ def download_results(results: Dict, plot_data: Optional[Dict]) -> None:
         else:
             st.button("📊 Download Current Polar Heatmap", disabled=True, help="Plot data not available")
 
-    # Pre-generate all images ZIP with confirmation for large datasets
     with col3:
         if plot_data and all(k in st.session_state for k in ("robust_analyzer", "results", "config")):
             robust_analyzer = st.session_state["robust_analyzer"]
@@ -1917,13 +1843,14 @@ def download_results(results: Dict, plot_data: Optional[Dict]) -> None:
 
             total_positions = len(cams2d)
 
+            include_heatmap = st.session_state.get("include_heatmap_global", True)
+
             if total_positions > 100:
                 st.write(f"⚠️ Large dataset: {total_positions} positions")
                 confirm_large = st.checkbox("I understand this will take time", key="confirm_large_download")
                 if not confirm_large:
                     st.button("🖼️ Download All Images", disabled=True, help="Please confirm for large datasets")
                 else:
-                    # Manual generation for all datasets (consistent behavior)
                     if st.button("🖼️ Download All Images"):
                         with st.spinner("Rendering all images for download..."):
                             try:
@@ -1935,10 +1862,11 @@ def download_results(results: Dict, plot_data: Optional[Dict]) -> None:
                                     labels_correct = utils.get_labels_correct(logits2d, config["target_class"], topk=topk)
 
                                     zbuf = io.BytesIO()
-                                    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zipf:  # type: ignore[name-defined]
+                                    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zipf:
                                         summary = {
                                             "total_images": len(rendered_images),
                                             "target_class": config.get("target_class", ""),
+                                            "image_format": "composite_with_heatmap" if include_heatmap else "render",
                                             "analysis_config": {
                                                 "batch_size": config.get("batch_size"),
                                                 "params_to_optimize": config.get("params_to_optimize"),
@@ -1955,34 +1883,60 @@ def download_results(results: Dict, plot_data: Optional[Dict]) -> None:
                                         status = st.empty()
                                         for i, image_info in enumerate(rendered_images):
                                             pbar.progress((i + 1) / len(rendered_images))
-                                            status.info(f"💾 Creating composite image {i + 1}/{len(rendered_images)}...")
-                                            composite = create_composite_image(
-                                                image_info, cams2d.numpy(), labels_correct.numpy(), logits2d, config
-                                            )
-                                            ibuf = io.BytesIO()
-                                            composite.save(ibuf, format="PNG", dpi=(300, 300))
-                                            ibuf.seek(0)
-                                            zipf.writestr(f"position_{image_info['position_idx']:03d}_analysis.png", ibuf.getvalue())
+
+                                            if include_heatmap:
+                                                status.info(f"💾 Creating composite image {i + 1}/{len(rendered_images)}...")
+                                                composite = create_composite_image(
+                                                    image_info, cams2d.numpy(), labels_correct.numpy(), logits2d, config
+                                                )
+                                                ibuf = io.BytesIO()
+                                                composite.save(ibuf, format="PNG", dpi=(300, 300))
+                                                ibuf.seek(0)
+                                                zipf.writestr(f"position_{image_info['position_idx']:03d}_analysis.png", ibuf.getvalue())
+                                            else:
+                                                status.info(f"💾 Saving rendered image {i + 1}/{len(rendered_images)}...")
+                                                rendered_img = Image.fromarray(image_info["image"])
+                                                ibuf = io.BytesIO()
+                                                rendered_img.save(ibuf, format="PNG", dpi=(300, 300))
+                                                ibuf.seek(0)
+                                                zipf.writestr(f"position_{image_info['position_idx']:03d}_rendered.png", ibuf.getvalue())
+
+                                                metadata = {
+                                                    "position_idx": image_info["position_idx"],
+                                                    "azimuth": float(image_info["azimuth"]),
+                                                    "elevation": float(image_info["elevation"]),
+                                                    "distance": float(image_info["distance"]),
+                                                    "prediction": image_info["prediction"],
+                                                    "confidence": float(image_info["confidence"]),
+                                                    "class_idx": int(image_info["class_idx"]),
+                                                    "run_idx": image_info["run_idx"],
+                                                    "batch_idx": image_info["batch_idx"],
+                                                    "env_idx": image_info["env_idx"],
+                                                    "target_class_ranking": image_info.get("target_class_ranking"),
+                                                    "target_class_confidence": image_info.get("target_class_confidence"),
+                                                }
+                                                zipf.writestr(f"position_{image_info['position_idx']:03d}_metadata.json",
+                                                            json.dumps(metadata, indent=2))
                                         pbar.empty(); status.empty()
 
                                     zbuf.seek(0)
+                                    file_suffix = "composite" if include_heatmap else "render"
                                     st.download_button(
                                         label="💾 Download ZIP",
                                         data=zbuf.getvalue(),
-                                        file_name=f"robustness_all_{len(rendered_images)}_positions_complete.zip",
+                                        file_name=f"robustness_all_{len(rendered_images)}_positions_{file_suffix}.zip",
                                         mime="application/zip",
                                         key="download_all_images_complete_small",
                                     )
-                                    st.success(f"✅ Created ZIP with {len(rendered_images)} composite images!")
+                                    image_type = "composite images" if include_heatmap else "rendered images"
+                                    st.success(f"✅ Created ZIP with {len(rendered_images)} {image_type}!")
                                 else:
                                     st.error("❌ No images were successfully rendered")
                             except Exception as e:
                                 st.error(f"❌ Error creating all images: {str(e)}")
-                                import traceback
                                 st.code(traceback.format_exc())
             else:
-                # Pre-generate for smaller datasets
-                cache_key = f"all_images_zip_{total_positions}_{hash(str(config))}"
+                cache_key = f"all_images_zip_{total_positions}_{hash(str(config))}_{include_heatmap}"
                 if cache_key not in st.session_state:
                     with st.spinner("Preparing all images..."):
                         try:
@@ -1994,10 +1948,11 @@ def download_results(results: Dict, plot_data: Optional[Dict]) -> None:
                                 labels_correct = utils.get_labels_correct(logits2d, config["target_class"], topk=topk)
 
                                 zbuf = io.BytesIO()
-                                with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zipf:  # type: ignore[name-defined]
+                                with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zipf:
                                     summary = {
                                         "total_images": len(rendered_images),
                                         "target_class": config.get("target_class", ""),
+                                        "image_format": "composite_with_heatmap" if include_heatmap else "render",
                                         "analysis_config": {
                                             "batch_size": config.get("batch_size"),
                                             "params_to_optimize": config.get("params_to_optimize"),
@@ -2011,13 +1966,37 @@ def download_results(results: Dict, plot_data: Optional[Dict]) -> None:
                                     zipf.writestr("analysis_summary.json", json.dumps(summary, indent=2))
 
                                     for image_info in rendered_images:
-                                        composite = create_composite_image(
-                                            image_info, cams2d.numpy(), labels_correct.numpy(), logits2d, config
-                                        )
-                                        ibuf = io.BytesIO()
-                                        composite.save(ibuf, format="PNG", dpi=(300, 300))
-                                        ibuf.seek(0)
-                                        zipf.writestr(f"position_{image_info['position_idx']:03d}_analysis.png", ibuf.getvalue())
+                                        if include_heatmap:
+                                            composite = create_composite_image(
+                                                image_info, cams2d.numpy(), labels_correct.numpy(), logits2d, config
+                                            )
+                                            ibuf = io.BytesIO()
+                                            composite.save(ibuf, format="PNG", dpi=(300, 300))
+                                            ibuf.seek(0)
+                                            zipf.writestr(f"position_{image_info['position_idx']:03d}_analysis.png", ibuf.getvalue())
+                                        else:
+                                            rendered_img = Image.fromarray(image_info["image"])
+                                            ibuf = io.BytesIO()
+                                            rendered_img.save(ibuf, format="PNG", dpi=(300, 300))
+                                            ibuf.seek(0)
+                                            zipf.writestr(f"position_{image_info['position_idx']:03d}_rendered.png", ibuf.getvalue())
+
+                                            metadata = {
+                                                "position_idx": image_info["position_idx"],
+                                                "azimuth": float(image_info["azimuth"]),
+                                                "elevation": float(image_info["elevation"]),
+                                                "distance": float(image_info["distance"]),
+                                                "prediction": image_info["prediction"],
+                                                "confidence": float(image_info["confidence"]),
+                                                "class_idx": int(image_info["class_idx"]),
+                                                "run_idx": image_info["run_idx"],
+                                                "batch_idx": image_info["batch_idx"],
+                                                "env_idx": image_info["env_idx"],
+                                                "target_class_ranking": image_info.get("target_class_ranking"),
+                                                "target_class_confidence": image_info.get("target_class_confidence"),
+                                            }
+                                            zipf.writestr(f"position_{image_info['position_idx']:03d}_metadata.json",
+                                                        json.dumps(metadata, indent=2))
 
                                 zbuf.seek(0)
                                 st.session_state[cache_key] = zbuf.getvalue()
@@ -2027,10 +2006,12 @@ def download_results(results: Dict, plot_data: Optional[Dict]) -> None:
                             st.session_state[cache_key] = None
 
                 if st.session_state.get(cache_key):
+                    file_suffix = "composite" if include_heatmap else "render"
+                    image_type = "composite images" if include_heatmap else "rendered images"
                     st.download_button(
-                        label="🖼️ Download All Images",
+                        label=f"🖼️ Download All {image_type.title()}",
                         data=st.session_state[cache_key],
-                        file_name=f"robustness_all_{total_positions}_positions_complete.zip",
+                        file_name=f"robustness_all_{total_positions}_positions_{file_suffix}.zip",
                         mime="application/zip",
                         key="download_all_images_complete",
                     )
@@ -2040,12 +2021,102 @@ def download_results(results: Dict, plot_data: Optional[Dict]) -> None:
             st.button("🖼️ Download All Images", disabled=True, help="Analysis data not available")
 
 
-# -------------------------
-# Main App
-# -------------------------
+def create_distribution_histograms(
+    camera_positions: np.ndarray,
+    labels_correct: np.ndarray,
+    target_class: str,
+    topk_value: int,
+) -> Tuple["plt.Figure", "plt.Figure"]:
+    def plot_max_normalized_hist(ax, data, bins, color, label):
+        counts, bin_edges = np.histogram(data, bins=bins)
+        if counts.max() > 0:
+            counts = counts / counts.max()
+            bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+            ax.bar(bin_centers, counts, width=(bin_edges[1] - bin_edges[0]),
+                  color=color, alpha=0.7, label=label, edgecolor='black', linewidth=0.5)
 
+    azimuth, elevation, _ = utils.compute_spherical_coordinates(camera_positions)
+
+    azimuth_correct = azimuth[labels_correct == 1]
+    azimuth_incorrect = azimuth[labels_correct == 0]
+    elevation_correct = elevation[labels_correct == 1]
+    elevation_incorrect = elevation[labels_correct == 0]
+
+    has_incorrect = len(azimuth_incorrect) > 0
+
+    # Azimuth histogram
+    azimuth_fig, azimuth_ax = plt.subplots(1, 1, figsize=(10, 6))
+    plot_max_normalized_hist(azimuth_ax, azimuth_correct, bins=20, color='lightblue',
+                           label='Correct' if has_incorrect else 'All positions')
+    if has_incorrect:
+        plot_max_normalized_hist(azimuth_ax, azimuth_incorrect, bins=20, color='lightcoral',
+                               label='Incorrect')
+
+    azimuth_ax.set_xlabel('Azimuth (degrees)', fontsize=14)
+    azimuth_ax.set_ylabel('Relative Frequency (max=1 per group)', fontsize=14)
+    azimuth_ax.set_title(f'Azimuth Distribution (Top-{topk_value})\nTarget: {target_class[:40]}...', fontsize=16)
+    azimuth_ax.legend(fontsize=12)
+    azimuth_ax.grid(True, alpha=0.3)
+
+    if has_incorrect:
+        azimuth_ax.text(0.02, 0.98,
+                       f"Correct: {len(azimuth_correct)} | Incorrect: {len(azimuth_incorrect)}",
+                       transform=azimuth_ax.transAxes, fontsize=12,
+                       verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+    else:
+        azimuth_ax.text(0.02, 0.98,
+                       f"Total positions: {len(azimuth_correct)}",
+                       transform=azimuth_ax.transAxes, fontsize=12,
+                       verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+
+    plt.tight_layout()
+
+    # Elevation histogram
+    elevation_fig, elevation_ax = plt.subplots(1, 1, figsize=(10, 6))
+    plot_max_normalized_hist(elevation_ax, elevation_correct, bins=20, color='lightblue',
+                           label='Correct' if has_incorrect else 'All positions')
+    if has_incorrect:
+        plot_max_normalized_hist(elevation_ax, elevation_incorrect, bins=20, color='lightcoral',
+                               label='Incorrect')
+
+    elevation_ax.set_xlabel('Elevation (degrees)', fontsize=14)
+    elevation_ax.set_ylabel('Relative Frequency (max=1 per group)', fontsize=14)
+    elevation_ax.set_title(f'Elevation Distribution (Top-{topk_value})\nTarget: {target_class[:40]}...', fontsize=16)
+    elevation_ax.legend(fontsize=12)
+    elevation_ax.grid(True, alpha=0.3)
+
+    if has_incorrect:
+        elevation_ax.text(0.02, 0.98,
+                         f"Correct: {len(elevation_correct)} | Incorrect: {len(elevation_incorrect)}",
+                         transform=elevation_ax.transAxes, fontsize=12,
+                         verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+    else:
+        elevation_ax.text(0.02, 0.98,
+                         f"Total positions: {len(elevation_correct)}",
+                         transform=elevation_ax.transAxes, fontsize=12,
+                         verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+
+    plt.tight_layout()
+
+    return azimuth_fig, elevation_fig
+
+
+def clear_cache_directory() -> bool:
+    try:
+        cache_dir = get_cache_dir()
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            cache_dir.mkdir(exist_ok=True)
+            print("✅ Cache directory cleared successfully")
+            return True
+    except Exception as e:
+        print(f"❌ Error clearing cache directory: {str(e)}")
+        return False
+    return False
+
+
+# Main App
 def main() -> None:
-    """Main application function."""
     setup_page()
 
     has_cached = check_cached_files()
@@ -2062,6 +2133,12 @@ def main() -> None:
                 st.session_state["file_paths"] = None
                 st.session_state["using_cached_files"] = False
                 st.session_state.pop("cache_info", None)
+
+                if clear_cache_directory():
+                    st.success("🗑️ Cache cleared successfully!")
+                else:
+                    st.error("❌ Error clearing cache directory")
+
                 st.rerun()
 
     config = create_sidebar()
@@ -2210,101 +2287,6 @@ def main() -> None:
 - **Environment maps**: HDR/EXR or regular images for lighting
             """
         )
-
-
-# Add this function after the create_composite_image function
-
-def create_distribution_histograms(
-    camera_positions: np.ndarray,
-    labels_correct: np.ndarray,
-    target_class: str,
-    topk_value: int,
-) -> Tuple["plt.Figure", "plt.Figure"]:
-    """
-    Create separate azimuth and elevation distribution histograms for download.
-
-    Returns:
-        Tuple of (azimuth_fig, elevation_fig)
-    """
-    import matplotlib.pyplot as plt
-
-    def plot_max_normalized_hist(ax, data, bins, color, label):
-        """Helper function to create normalized histograms."""
-        counts, bin_edges = np.histogram(data, bins=bins)
-        if counts.max() > 0:
-            counts = counts / counts.max()  # Normalize so max bar is 1
-            bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-            ax.bar(bin_centers, counts, width=(bin_edges[1] - bin_edges[0]),
-                  color=color, alpha=0.7, label=label, edgecolor='black', linewidth=0.5)
-
-    # Compute spherical coordinates
-    azimuth, elevation, _ = utils.compute_spherical_coordinates(camera_positions)
-
-    # Separate data based on correctness
-    azimuth_correct = azimuth[labels_correct == 1]
-    azimuth_incorrect = azimuth[labels_correct == 0]
-    elevation_correct = elevation[labels_correct == 1]
-    elevation_incorrect = elevation[labels_correct == 0]
-
-    has_incorrect = len(azimuth_incorrect) > 0
-
-    # Create azimuth histogram
-    azimuth_fig, azimuth_ax = plt.subplots(1, 1, figsize=(10, 6))
-    plot_max_normalized_hist(azimuth_ax, azimuth_correct, bins=20, color='lightblue',
-                           label='Correct' if has_incorrect else 'All positions')
-    if has_incorrect:
-        plot_max_normalized_hist(azimuth_ax, azimuth_incorrect, bins=20, color='lightcoral',
-                               label='Incorrect')
-
-    azimuth_ax.set_xlabel('Azimuth (degrees)', fontsize=14)
-    azimuth_ax.set_ylabel('Relative Frequency (max=1 per group)', fontsize=14)
-    azimuth_ax.set_title(f'Azimuth Distribution (Top-{topk_value})\nTarget: {target_class[:40]}...', fontsize=16)
-    azimuth_ax.legend(fontsize=12)
-    azimuth_ax.grid(True, alpha=0.3)
-
-    # Add statistics text
-    if has_incorrect:
-        azimuth_ax.text(0.02, 0.98,
-                       f"Correct: {len(azimuth_correct)} | Incorrect: {len(azimuth_incorrect)}",
-                       transform=azimuth_ax.transAxes, fontsize=12,
-                       verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
-    else:
-        azimuth_ax.text(0.02, 0.98,
-                       f"Total positions: {len(azimuth_correct)}",
-                       transform=azimuth_ax.transAxes, fontsize=12,
-                       verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
-
-    plt.tight_layout()
-
-    # Create elevation histogram
-    elevation_fig, elevation_ax = plt.subplots(1, 1, figsize=(10, 6))
-    plot_max_normalized_hist(elevation_ax, elevation_correct, bins=20, color='lightblue',
-                           label='Correct' if has_incorrect else 'All positions')
-    if has_incorrect:
-        plot_max_normalized_hist(elevation_ax, elevation_incorrect, bins=20, color='lightcoral',
-                               label='Incorrect')
-
-    elevation_ax.set_xlabel('Elevation (degrees)', fontsize=14)
-    elevation_ax.set_ylabel('Relative Frequency (max=1 per group)', fontsize=14)
-    elevation_ax.set_title(f'Elevation Distribution (Top-{topk_value})\nTarget: {target_class[:40]}...', fontsize=16)
-    elevation_ax.legend(fontsize=12)
-    elevation_ax.grid(True, alpha=0.3)
-
-    # Add statistics text
-    if has_incorrect:
-        elevation_ax.text(0.02, 0.98,
-                         f"Correct: {len(elevation_correct)} | Incorrect: {len(elevation_incorrect)}",
-                         transform=elevation_ax.transAxes, fontsize=12,
-                         verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
-    else:
-        elevation_ax.text(0.02, 0.98,
-                         f"Total positions: {len(elevation_correct)}",
-                         transform=elevation_ax.transAxes, fontsize=12,
-                         verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
-
-    plt.tight_layout()
-
-    return azimuth_fig, elevation_fig
 
 
 if __name__ == "__main__":
