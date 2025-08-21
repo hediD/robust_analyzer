@@ -24,12 +24,14 @@ import torch
 import plotly.express as px  # noqa: F401
 from plotly.subplots import make_subplots  # noqa: F401
 
-from model import Model
+from model import Model, MODEL_CONFIGS
 from robustness_analyzer import RobustnessAnalyzer
 import utils
 
 from PIL import ImageDraw, ImageFont, Image
 import matplotlib.pyplot as plt
+import subprocess
+import sys
 
 # Constants
 APP_TITLE = "🎯 3D Adversarial Robustness Analyzer"
@@ -179,6 +181,58 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
 
     target_class = create_target_class_selector()
 
+    # Model selection
+    model_options = list(MODEL_CONFIGS.keys())
+    model_display_names = [MODEL_CONFIGS[key]["description"] for key in model_options]
+
+    selected_model_display = st.sidebar.selectbox(
+        "🤖 Classification Model:",
+        model_display_names,
+        index=0,  # Default to first model (ViT-L/16)
+        help="Select the neural network model to use for classification"
+    )
+
+    # Get the model key from the display name
+    selected_model = model_options[model_display_names.index(selected_model_display)]
+
+    st.sidebar.success(f"✅ Selected: {MODEL_CONFIGS[selected_model]['description']}")
+
+    # Custom weights upload
+    custom_weights_path = None
+    with st.sidebar.expander("🔧 Custom Model Weights", expanded=False):
+        st.write("**Upload custom pre-trained weights (optional)**")
+
+        use_custom_weights = st.checkbox(
+            "Use custom weights",
+            value=False,
+            help="Upload your own model weights instead of using default pre-trained weights"
+        )
+
+        if use_custom_weights:
+            weights_file = st.file_uploader(
+                "Upload model weights",
+                type=["pth", "pt", "bin", "safetensors"],
+                help="Supported formats: .pth, .pt, .bin, .safetensors"
+            )
+
+            if weights_file:
+                try:
+                    # Cache the weights file
+                    custom_weights_path = cache_weights_file(weights_file, selected_model)
+                    st.success(f"✅ Weights cached: {weights_file.name}")
+
+                    # Show file info
+                    file_size = len(weights_file.getvalue()) / (1024 * 1024)  # MB
+                    st.info(f"📊 File size: {file_size:.1f} MB")
+
+                except Exception as e:
+                    st.error(f"❌ Error processing weights: {str(e)}")
+                    custom_weights_path = None
+            else:
+                st.info("💡 Upload a weights file to use custom model")
+        else:
+            st.info("💡 Using default pre-trained weights")
+
     batch_size = st.sidebar.number_input(
         "Batch Size",
         min_value=1,
@@ -191,7 +245,7 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
     st.sidebar.subheader("Optimization Parameters")
     params_to_optimize = st.sidebar.multiselect(
         "Parameters to Optimize",
-        options=["camera", "texture", "lighting"],
+        options=["camera"],
         default=["camera"],
         help="Select which parameters to optimize during adversarial attack",
     )
@@ -221,19 +275,32 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
         format_func=lambda x: f"{x:.1e}",
     )
 
-    st.sidebar.subheader("Constraints")
-    positive_z = st.sidebar.checkbox(
-        "Positive Z Constraint",
-        value=True,
-        help="Constrain camera to positive elevation (z > 0)",
-    )
     targeted = st.sidebar.checkbox(
         "Targeted Attack",
         value=False,
         help="Whether this is a targeted adversarial attack",
     )
 
-    with st.sidebar.expander("Advanced Rendering Settings", expanded=False):
+    st.text("")
+
+    with st.sidebar.expander("Camera Constraints", expanded=True):
+        positive_z = st.checkbox(
+            "Positive Z",
+            value=True,
+            help="Constrain camera to positive elevation (z > 0)",
+        )
+
+        min_max_proportion = st.slider(
+            "Object proportion in image range",
+            min_value=0.05,
+            max_value=0.8,
+            value=(0.3, 0.8),
+            step=0.1,
+            help="Camera distance range as proportion of bounding box size (min, max)",
+        )
+        st.caption(f"💡 object size proportion in image ({min_max_proportion[0]:.1f}x to {min_max_proportion[1]:.1f}x).")
+
+    with st.sidebar.expander("Rendering Settings", expanded=False):
         st.write("**Rendering Paramters**")
         image_size = st.select_slider(
             "Image Size",
@@ -269,6 +336,8 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
 
     return {
         "target_class": target_class,
+        "model_name": selected_model,
+        "custom_weights_path": custom_weights_path,
         "batch_size": int(batch_size),
         "params_to_optimize": list(params_to_optimize),
         "num_runs": int(num_runs),
@@ -280,83 +349,106 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
         "positive_z": bool(positive_z),
         "targeted": bool(targeted),
         "include_heatmap": include_heatmap,
+        "min_max_proportion": min_max_proportion,
     }
 
 
 # File Uploads & Cache
 def handle_file_uploads():
     st.header("📁 File Uploads")
-    tab1, tab2 = st.tabs(["📦 Complete 3D Package", "🎨 Individual Files"])
+    tab1, tab2 = st.tabs(["🎯 Robustness Analysis Files", "🔧 Texture Atlas Creator"])
 
     with tab1:
-        st.subheader("Upload Complete 3D Package")
-        st.info("💡 Upload a ZIP file containing .obj, .mtl, and all texture files")
-        zip_file = st.file_uploader(
-            "Upload ZIP package",
-            type=["zip"],
-            help="ZIP file containing .obj, .mtl, and texture files with correct folder structure",
+        st.subheader("📦 3D Files for Robustness Analysis")
+        st.info("💡 Upload your 3D object files and environment maps for adversarial robustness testing")
+
+        mode = st.radio(
+            "Input source",
+            options=["ZIP package", "Individual files"],
+            horizontal=True,
+            key="robustness_input_mode",
         )
-        if zip_file:
-            st.success(f"✅ Uploaded package: {zip_file.name}")
-            return "zip", zip_file, None, None, None
+
+        if mode == "ZIP package":
+            st.subheader("Upload Complete 3D Package")
+            st.info("💡 Upload a ZIP file containing .obj, .mtl, and all texture files")
+            zip_file = st.file_uploader(
+                "Upload ZIP package",
+                type=["zip"],
+                help="ZIP file containing .obj, .mtl, and texture files with correct folder structure",
+                key="robustness_zip_upload"
+            )
+            if zip_file:
+                st.success(f"✅ Uploaded package: {zip_file.name}")
+                return "zip", zip_file, None, None, None
+
+        else:  # Individual files
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                st.subheader("3D Object Files")
+                obj_file = st.file_uploader(
+                    "Upload OBJ file",
+                    type=["obj"],
+                    help="Upload the 3D mesh file (.obj format)",
+                    key="robustness_obj_upload"
+                )
+                mtl_file = st.file_uploader(
+                    "Upload MTL file (optional)",
+                    type=["mtl"],
+                    help="Upload material definition file (.mtl format)",
+                    key="robustness_mtl_upload"
+                )
+                if obj_file:
+                    st.success(f"✅ OBJ: {obj_file.name}")
+                if mtl_file:
+                    st.success(f"✅ MTL: {mtl_file.name}")
+
+            with col2:
+                st.subheader("Textures")
+                single_texture = st.file_uploader(
+                    "Single texture override",
+                    type=["png", "jpg", "jpeg"],
+                    help="Single texture to override MTL materials (optional)",
+                    key="robustness_single_texture_upload"
+                )
+                texture_files = st.file_uploader(
+                    "Multiple texture files",
+                    type=["png", "jpg", "jpeg", "bmp", "tga"],
+                    accept_multiple_files=True,
+                    help="Upload all texture files referenced in the MTL file",
+                    key="robustness_texture_files_upload"
+                )
+                if single_texture:
+                    st.success(f"✅ Single texture: {single_texture.name}")
+                    st.info("This will override MTL materials")
+                elif texture_files:
+                    st.success(f"✅ Uploaded {len(texture_files)} texture(s)")
+                    for tex_file in texture_files:
+                        st.text(f"  • {tex_file.name}")
+                else:
+                    st.info("💡 Will use MTL materials if available")
+
+            with col3:
+                st.subheader("Environment Maps")
+                env_files = st.file_uploader(
+                    "Upload environment maps",
+                    type=["png", "jpg", "jpeg", "hdr", "exr"],
+                    accept_multiple_files=True,
+                    help="Upload one or more environment map files",
+                    key="robustness_env_files_upload"
+                )
+                if env_files:
+                    st.success(f"✅ Uploaded {len(env_files)} environment map(s)")
+                    for env_file in env_files:
+                        st.text(f"  • {env_file.name}")
+
+            return "individual", obj_file, mtl_file, (single_texture or texture_files), env_files
 
     with tab2:
-        col1, col2, col3 = st.columns(3)
+        handle_texture_atlas()
 
-        with col1:
-            st.subheader("3D Object Files")
-            obj_file = st.file_uploader(
-                "Upload OBJ file",
-                type=["obj"],
-                help="Upload the 3D mesh file (.obj format)",
-            )
-            mtl_file = st.file_uploader(
-                "Upload MTL file (optional)",
-                type=["mtl"],
-                help="Upload material definition file (.mtl format)",
-            )
-            if obj_file:
-                st.success(f"✅ OBJ: {obj_file.name}")
-            if mtl_file:
-                st.success(f"✅ MTL: {mtl_file.name}")
-
-        with col2:
-            st.subheader("Textures")
-            single_texture = st.file_uploader(
-                "Single texture override",
-                type=["png", "jpg", "jpeg"],
-                help="Single texture to override MTL materials (optional)",
-            )
-            texture_files = st.file_uploader(
-                "Multiple texture files",
-                type=["png", "jpg", "jpeg", "bmp", "tga"],
-                accept_multiple_files=True,
-                help="Upload all texture files referenced in the MTL file",
-            )
-            if single_texture:
-                st.success(f"✅ Single texture: {single_texture.name}")
-                st.info("This will override MTL materials")
-            elif texture_files:
-                st.success(f"✅ Uploaded {len(texture_files)} texture(s)")
-                for tex_file in texture_files:
-                    st.text(f"  • {tex_file.name}")
-            else:
-                st.info("💡 Will use MTL materials if available")
-
-        with col3:
-            st.subheader("Environment Maps")
-            env_files = st.file_uploader(
-                "Upload environment maps",
-                type=["png", "jpg", "jpeg", "hdr", "exr"],
-                accept_multiple_files=True,
-                help="Upload one or more environment map files",
-            )
-            if env_files:
-                st.success(f"✅ Uploaded {len(env_files)} environment map(s)")
-                for env_file in env_files:
-                    st.text(f"  • {env_file.name}")
-
-        return "individual", obj_file, mtl_file, (single_texture or texture_files), env_files
+    return "individual", None, None, None, None
 
 
 def get_cache_dir() -> Path:
@@ -754,7 +846,7 @@ def create_interactive_polar_plot(
             customdata=np.where(current_incorrect)[0],
         ))
 
-    title_text = f"Interactive Camera Position Analysis (Top-{topk_value})<br>Class: {target_class[:50]}..."
+    title_text = f"Camera Position Analysis (Top-{topk_value})<br>Class: {target_class[:50]}..."
     if current_highlighted_index is not None:
         title_text += f"<br>🎯 Currently displaying position {current_highlighted_index}"
     elif selected_indices:
@@ -1389,7 +1481,7 @@ def create_image_carousel(rendered_images: Sequence[Dict]) -> None:
 
 # Results Visualization
 def visualize_results(results: Dict, config: Dict):
-    st.header("📊 Interactive Results Visualization")
+    st.header("📊 Results Visualization")
 
     try:
         logits_stack = torch.stack(results["final_logits"])
@@ -1413,7 +1505,7 @@ def visualize_results(results: Dict, config: Dict):
                 label = id_to_class.get(cls_id, f"class {cls_id}")
                 st.write(f"{rank+1}. {label[:30]}... — {cnt} ({pct:.1f}%)")
 
-        st.subheader("🎯 Interactive Camera Position Heatmap")
+        st.subheader("🎯 Camera Position Heatmap")
         topk = st.session_state.get("topk_value", 1)
         labels_correct = utils.get_labels_correct(logits2d, config["target_class"], topk=topk)
 
@@ -1504,7 +1596,7 @@ def visualize_results(results: Dict, config: Dict):
             st.info(f"📊 **Top-{topk} Accuracy:** {correct_count}/{total_positions} ({accuracy:.1f}%) correct")
 
             st.write(""); st.write("");
-            st.subheader("🎯 Position Selection")
+            st.subheader("🎯 Render Selection")
             target_idx = _get_idx_safe(config["target_class"])
             target_probs = torch.softmax(logits2d, dim=1)[:, target_idx].cpu().numpy()
 
@@ -1687,6 +1779,8 @@ def run_analysis(
         "targeted": config["targeted"],
         "positive_z": config["positive_z"],
         "raster_settings": raster_settings,
+        "model_name": config["model_name"],
+        "min_max_proportion": config["min_max_proportion"],
     }
 
     with st.spinner("Initializing robustness analyzer..."):
@@ -1707,13 +1801,21 @@ def run_analysis(
             status_text.info(
                 f"🎯 **Run {run_num + 1}/{total_runs}** | "
                 f"Iteration {iteration + 1}/{total_iterations} | "
-                f"Overall Progress: {run_progress:.1%}"
+                f"Overall Progress: {run_progress:.1%} | "
+                f"Model: {MODEL_CONFIGS[config['model_name']]['description']}"
             )
         else:
-            status_text.info(f"🎯 **Run {run_num + 1}/{total_runs}** | Overall Progress: {run_progress:.1%}")
+            status_text.info(
+                f"🎯 **Run {run_num + 1}/{total_runs}** | "
+                f"Overall Progress: {run_progress:.1%} | "
+                f"Model: {MODEL_CONFIGS[config['model_name']]['description']}"
+            )
 
     try:
-        status_text.info(f"🚀 Starting {config['num_runs']} optimization runs...")
+        status_text.info(
+            f"🚀 Starting {config['num_runs']} optimization runs with "
+            f"{MODEL_CONFIGS[config['model_name']]['description']}..."
+        )
         results = robust_analyzer.run(
             num_runs=config["num_runs"],
             num_iterations=config["num_iterations"],
@@ -1721,7 +1823,10 @@ def run_analysis(
             progress_callback=progress_callback,
         )
         progress_bar.progress(1.0)
-        status_text.success(f"✅ Analysis completed successfully! Processed {config['num_runs']} runs.")
+        status_text.success(
+            f"✅ Analysis completed successfully! Processed {config['num_runs']} runs "
+            f"with {MODEL_CONFIGS[config['model_name']]['description']}."
+        )
         return robust_analyzer, results
     except Exception as e:
         st.error(f"❌ Error during analysis: {str(e)}")
@@ -2115,6 +2220,448 @@ def clear_cache_directory() -> bool:
     return False
 
 
+# Add this function near the other caching functions
+
+def cache_weights_file(weights_file, model_name: str) -> str:
+    """
+    Cache uploaded weights file for reuse.
+
+    Args:
+        weights_file: Streamlit uploaded file object
+        model_name: Name of the model architecture
+
+    Returns:
+        Path to cached weights file
+    """
+    cache_dir = get_cache_dir()
+    weights_cache_dir = cache_dir / "model_weights"
+    weights_cache_dir.mkdir(exist_ok=True)
+
+    # Create hash of file content for caching
+    content = weights_file.read()
+    weights_file.seek(0)  # Reset file pointer
+
+    file_hash = hashlib.md5(content).hexdigest()
+    file_extension = Path(weights_file.name).suffix
+
+    cached_weights_path = weights_cache_dir / f"{model_name}_{file_hash}{file_extension}"
+
+    # Save if not already cached
+    if not cached_weights_path.exists():
+        with open(cached_weights_path, "wb") as f:
+            f.write(content)
+        print(f"✅ Weights cached to {cached_weights_path}")
+    else:
+        print(f"✅ Using cached weights from {cached_weights_path}")
+
+    return str(cached_weights_path)
+
+
+def validate_weights_compatibility(weights_path: str, model_name: str) -> Tuple[bool, str]:
+    """
+    Validate if uploaded weights are compatible with selected model.
+
+    Args:
+        weights_path: Path to weights file
+        model_name: Name of the model architecture
+
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    try:
+        import torch
+
+        # Load weights to check format
+        if weights_path.endswith('.safetensors'):
+            try:
+                from safetensors.torch import load_file
+                state_dict = load_file(weights_path)
+            except ImportError:
+                return False, "safetensors library not installed"
+        else:
+            state_dict = torch.load(weights_path, map_location='cpu')
+
+        # Handle different state dict formats
+        if isinstance(state_dict, dict):
+            if 'state_dict' in state_dict:
+                state_dict = state_dict['state_dict']
+            elif 'model' in state_dict:
+                state_dict = state_dict['model']
+
+        # Basic validation - check if it looks like a neural network
+        if not isinstance(state_dict, dict):
+            return False, "Invalid state dict format"
+
+        if len(state_dict) == 0:
+            return False, "Empty state dict"
+
+        # Check for typical model keys
+        keys = list(state_dict.keys())
+        if not any('weight' in key or 'bias' in key for key in keys):
+            return False, "No weight or bias parameters found"
+
+        return True, "Weights appear valid"
+
+    except Exception as e:
+        return False, f"Error loading weights: {str(e)}"
+
+def visualize_textures(textures_info: List[Dict], title: str = "Textures", compact: bool = False, show_used_status: bool = False) -> None:
+    """Display texture images in a grid layout."""
+    if not textures_info:
+        st.info("No textures to display")
+        return
+
+    st.subheader(f"🖼️ {title}")
+
+    # Calculate grid layout - more columns if compact
+    num_textures = len(textures_info)
+    cols_per_row = min(4 if compact else 3, num_textures)
+    rows = (num_textures + cols_per_row - 1) // cols_per_row
+
+    for row in range(rows):
+        cols = st.columns(cols_per_row)
+        for col_idx in range(cols_per_row):
+            texture_idx = row * cols_per_row + col_idx
+            if texture_idx < num_textures:
+                with cols[col_idx]:
+                    tex_info = textures_info[texture_idx]
+
+                    # Show usage status if requested
+                    if show_used_status:
+                        status_icon = "✅" if tex_info.get("used_in_atlas", False) else "⚪"
+                        caption = f"{status_icon} {tex_info['name']}\n{tex_info['size']}"
+                    else:
+                        caption = f"{tex_info['name']}\n{tex_info['size']}"
+
+                    st.image(
+                        tex_info["image"],
+                        caption=caption,
+                        use_container_width=True
+                    )
+
+
+def create_texture_atlas(obj_file, mtl_file, texture_files: List = None) -> Optional[Dict]:
+    """
+    Create texture atlas using the make_atlas.py script.
+
+    Returns:
+        Dict with paths to generated files or None if failed
+    """
+    if not obj_file or not mtl_file:
+        st.error("Both OBJ and MTL files are required for atlas creation")
+        return None
+
+    try:
+        # Create temporary directory for processing
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Save uploaded files
+            obj_path = os.path.join(temp_dir, obj_file.name)
+            mtl_path = os.path.join(temp_dir, mtl_file.name)
+
+            with open(obj_path, "wb") as f:
+                f.write(obj_file.read())
+            with open(mtl_path, "wb") as f:
+                f.write(mtl_file.read())
+
+            # Save texture files if provided
+            if texture_files:
+                for tex_file in texture_files:
+                    tex_path = os.path.join(temp_dir, tex_file.name)
+                    with open(tex_path, "wb") as f:
+                        f.write(tex_file.read())
+
+            # Define output paths
+            output_obj = os.path.join(temp_dir, "atlas_combined.obj")
+            output_mtl = os.path.join(temp_dir, "atlas_combined.mtl")
+            output_atlas = os.path.join(temp_dir, "atlas.png")
+
+            # Get the script path relative to current file
+            script_dir = Path(__file__).parent.absolute()
+            atlas_script = script_dir / "make_atlas.py"
+
+            # Call make_atlas.py script
+            cmd = [
+                sys.executable, str(atlas_script),
+                obj_path, mtl_path, output_obj, output_mtl, output_atlas
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, cwd=temp_dir)
+
+            if result.returncode != 0:
+                st.error(f"Atlas creation failed: {result.stderr}")
+                return None
+
+            # Read generated files into memory
+            atlas_data = {}
+
+            if os.path.exists(output_obj):
+                with open(output_obj, "rb") as f:
+                    atlas_data["obj_content"] = f.read()
+                    atlas_data["obj_name"] = "atlas_combined.obj"
+
+            if os.path.exists(output_mtl):
+                with open(output_mtl, "rb") as f:
+                    atlas_data["mtl_content"] = f.read()
+                    atlas_data["mtl_name"] = "atlas_combined.mtl"
+
+            if os.path.exists(output_atlas):
+                with open(output_atlas, "rb") as f:
+                    atlas_data["atlas_content"] = f.read()
+                    atlas_data["atlas_name"] = "atlas.png"
+                # Also load for preview
+                atlas_data["atlas_image"] = Image.open(output_atlas)
+
+            st.success("✅ Texture atlas created successfully!")
+            return atlas_data
+
+    except Exception as e:
+        st.error(f"Error creating texture atlas: {str(e)}")
+        return None
+
+
+def handle_texture_atlas():
+    """Handle texture atlas creation interface."""
+    st.subheader("🔧 Texture Atlas Creator")
+    st.info("💡 Combine multiple textures from an OBJ/MTL into a single atlas texture")
+
+    mode = st.radio(
+        "Input source",
+        options=["ZIP package", "Individual files"],
+        horizontal=True,
+        key="atlas_input_mode",
+    )
+
+    if mode == "ZIP package":
+        atlas_zip_file = st.file_uploader(
+            "Upload ZIP package (OBJ+MTL at root, textures/ folder included)",
+            type=["zip"],
+            key="atlas_zip_upload",
+            help="ZIP should contain: root: *.obj, *.mtl; and a textures/ folder containing all referenced textures",
+        )
+        if atlas_zip_file:
+            st.success(f"✅ Uploaded package: {atlas_zip_file.name}")
+
+        if atlas_zip_file and st.button("🔧 Create Texture Atlas", type="primary", key="create_atlas_zip_btn"):
+            with st.spinner("Creating texture atlas from ZIP..."):
+                atlas_result = create_texture_atlas_from_zip(atlas_zip_file)
+                if atlas_result:
+                    st.session_state["atlas_result"] = atlas_result
+                    st.rerun()
+
+    else:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write("**Required Files**")
+            atlas_obj_file = st.file_uploader(
+                "Upload OBJ file",
+                type=["obj"],
+                help="3D mesh file with multiple materials",
+                key="atlas_obj_upload"
+            )
+            atlas_mtl_file = st.file_uploader(
+                "Upload MTL file",
+                type=["mtl"],
+                help="Material file referencing multiple textures",
+                key="atlas_mtl_upload"
+            )
+
+        with col2:
+            st.write("**Texture Files (Optional)**")
+            atlas_texture_files = st.file_uploader(
+                "Upload texture files",
+                type=["png", "jpg", "jpeg", "bmp", "tga"],
+                accept_multiple_files=True,
+                help="Only needed if textures referenced by MTL aren't available",
+                key="atlas_texture_upload"
+            )
+            if atlas_texture_files:
+                st.success(f"✅ Uploaded {len(atlas_texture_files)} texture(s)")
+                for tex_file in atlas_texture_files:
+                    st.text(f"  • {tex_file.name}")
+
+        if atlas_obj_file:
+            st.success(f"✅ OBJ: {atlas_obj_file.name}")
+        if atlas_mtl_file:
+            st.success(f"✅ MTL: {atlas_mtl_file.name}")
+
+        if atlas_obj_file and atlas_mtl_file:
+            if st.button("🔧 Create Texture Atlas", type="primary", key="create_atlas_btn"):
+                with st.spinner("Creating texture atlas..."):
+                    atlas_result = create_texture_atlas(atlas_obj_file, atlas_mtl_file, atlas_texture_files)
+                    if atlas_result:
+                        st.session_state["atlas_result"] = atlas_result
+                        st.rerun()
+
+    # Display results and download options
+    if st.session_state.get("atlas_result"):
+        atlas_result = st.session_state["atlas_result"]
+
+        st.subheader("📥 Download Generated Files")
+
+        # Individual downloads in a row
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            if "obj_content" in atlas_result:
+                st.download_button(
+                    label="📄 Download Combined OBJ",
+                    data=atlas_result["obj_content"],
+                    file_name=atlas_result["obj_name"],
+                    mime="application/octet-stream",
+                    key="download_atlas_obj"
+                )
+
+        with col2:
+            if "mtl_content" in atlas_result:
+                st.download_button(
+                    label="📄 Download Combined MTL",
+                    data=atlas_result["mtl_content"],
+                    file_name=atlas_result["mtl_name"],
+                    mime="application/octet-stream",
+                    key="download_atlas_mtl"
+                )
+
+        with col3:
+            if "atlas_content" in atlas_result:
+                st.download_button(
+                    label="🖼️ Download Atlas Texture",
+                    data=atlas_result["atlas_content"],
+                    file_name=atlas_result["atlas_name"],
+                    mime="image/png",
+                    key="download_atlas_texture"
+                )
+
+        # Reset button
+        if st.button("🔄 Create Another Atlas", key="reset_atlas"):
+            if "atlas_result" in st.session_state:
+                del st.session_state["atlas_result"]
+            st.rerun()
+
+
+def _collect_original_textures_from_mtl(mtl_path: str) -> List[Dict]:
+    """Parse MTL and load referenced textures for preview."""
+    textures: List[Dict] = []
+    used_texture_names = set()
+
+    try:
+        mtl_dir = os.path.dirname(mtl_path)
+
+        # First pass: collect all referenced texture names
+        with open(mtl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or not line.startswith("map_"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    tex_name = parts[-1]
+                    used_texture_names.add(os.path.basename(tex_name))
+
+        # Second pass: find all texture files and mark which are used
+        texture_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tga', '.tiff', '.gif'}
+
+        # Check MTL directory and parent directory for textures
+        search_dirs = [mtl_dir, os.path.dirname(mtl_dir)]
+        if os.path.exists(os.path.join(os.path.dirname(mtl_dir), "textures")):
+            search_dirs.append(os.path.join(os.path.dirname(mtl_dir), "textures"))
+
+        found_textures = set()
+        for search_dir in search_dirs:
+            if not os.path.exists(search_dir):
+                continue
+            for file in os.listdir(search_dir):
+                if any(file.lower().endswith(ext) for ext in texture_extensions):
+                    tex_path = os.path.join(search_dir, file)
+                    if file not in found_textures and os.path.isfile(tex_path):
+                        found_textures.add(file)
+                        is_used = file in used_texture_names
+                        info = load_texture_for_preview(tex_path, file)
+                        if info:
+                            info["used_in_atlas"] = is_used
+                            textures.append(info)
+
+        # Sort so used textures appear first
+        textures.sort(key=lambda x: (not x.get("used_in_atlas", False), x["name"]))
+
+    except Exception:
+        pass
+    return textures
+
+
+def create_texture_atlas_from_zip(zip_file) -> Optional[Dict]:
+    """
+    Create texture atlas from a ZIP that contains:
+      - root: *.obj, *.mtl
+      - textures/: all images referenced by MTL
+    """
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Extract ZIP
+            data = zip_file.read()
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                zf.extractall(temp_dir)
+
+            # Prefer root-level OBJ/MTL; else fall back to first found recursively
+            root_files = [f for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f))]
+            root_objs = [os.path.join(temp_dir, f) for f in root_files if f.lower().endswith(".obj")]
+            root_mtls = [os.path.join(temp_dir, f) for f in root_files if f.lower().endswith(".mtl")]
+
+            if root_objs and root_mtls:
+                obj_path = root_objs[0]
+                mtl_path = root_mtls[0]
+            else:
+                obj_candidates = glob.glob(os.path.join(temp_dir, "**/*.obj"), recursive=True)
+                mtl_candidates = glob.glob(os.path.join(temp_dir, "**/*.mtl"), recursive=True)
+                if not obj_candidates or not mtl_candidates:
+                    st.error("ZIP must contain an OBJ and MTL (preferably at root).")
+                    return None
+                # Choose shallowest path
+                obj_path = min(obj_candidates, key=lambda p: len(Path(p).parts))
+                mtl_path = min(mtl_candidates, key=lambda p: len(Path(p).parts))
+
+            # Prepare outputs
+            output_obj = os.path.join(temp_dir, "atlas_combined.obj")
+            output_mtl = os.path.join(temp_dir, "atlas_combined.mtl")
+            output_atlas = os.path.join(temp_dir, "atlas.png")
+
+            # Run make_atlas.py
+            script_dir = Path(__file__).parent.absolute()
+            atlas_script = script_dir / "make_atlas.py"
+            cmd = [sys.executable, str(atlas_script), obj_path, mtl_path, output_obj, output_mtl, output_atlas]
+            result = subprocess.run(cmd, capture_output=True, text=True, cwd=temp_dir)
+            if result.returncode != 0:
+                st.error(f"Atlas creation failed: {result.stderr}")
+                return None
+
+            atlas_data: Dict = {}
+
+            if os.path.exists(output_obj):
+                with open(output_obj, "rb") as f:
+                    atlas_data["obj_content"] = f.read()
+                    atlas_data["obj_name"] = "atlas_combined.obj"
+
+            if os.path.exists(output_mtl):
+                with open(output_mtl, "rb") as f:
+                    atlas_data["mtl_content"] = f.read()
+                    atlas_data["mtl_name"] = "atlas_combined.mtl"
+
+            if os.path.exists(output_atlas):
+                with open(output_atlas, "rb") as f:
+                    atlas_data["atlas_content"] = f.read()
+                    atlas_data["atlas_name"] = "atlas.png"
+                atlas_data["atlas_image"] = Image.open(io.BytesIO(atlas_data["atlas_content"]))
+
+            # Load original textures referenced by MTL for preview
+            atlas_data["original_textures"] = _collect_original_textures_from_mtl(mtl_path)
+
+            st.success("✅ Texture atlas created successfully!")
+            return atlas_data
+
+    except Exception as e:
+        st.error(f"Error creating texture atlas from ZIP: {str(e)}")
+        return None
+
+
 # Main App
 def main() -> None:
     setup_page()
@@ -2143,10 +2690,12 @@ def main() -> None:
 
     config = create_sidebar()
 
+    # Only show file uploads if not using cached files
     if not st.session_state.get("using_cached_files", False):
         upload_result = handle_file_uploads()
         upload_type = upload_result[0]
 
+        # Regular file processing for robustness analysis
         if "files_processed" not in st.session_state:
             st.session_state["files_processed"] = False
             st.session_state["file_paths"] = None
@@ -2243,6 +2792,7 @@ def main() -> None:
             else:
                 st.warning("⚠️ Please upload at least an OBJ file and environment map(s) to proceed.")
 
+    # Show robustness analysis sections
     if st.session_state.get("files_processed", False):
         st.header("🚀 Run Analysis")
         with st.expander("📋 Current Configuration", expanded=False):
@@ -2271,12 +2821,12 @@ def main() -> None:
         st.header("📖 Example Usage")
         st.markdown(
             """
-**Typical workflow:**
+**Robustness Analysis Workflow:**
 1. Upload your 3D object (.obj file)
 2. Optionally upload a texture image
 3. Upload one or more environment maps
 4. Configure optimization parameters in the sidebar
-5. Expand "Advanced Rendering Settings" if needed
+5. Expand "Rendering Settings" if needed
 6. Click "Run Robustness Analysis"
 7. View the polar heatmap results
 8. Download results as JSON
@@ -2285,6 +2835,11 @@ def main() -> None:
 - **OBJ file**: 3D mesh in Wavefront OBJ format
 - **Texture**: PNG/JPG image (optional, will use MTL if not provided)
 - **Environment maps**: HDR/EXR or regular images for lighting
+
+**Texture Atlas Creator:**
+- Upload OBJ and MTL files with multiple materials
+- Automatically combines all textures into a single atlas
+- Downloads combined OBJ, MTL, and atlas texture files
             """
         )
 

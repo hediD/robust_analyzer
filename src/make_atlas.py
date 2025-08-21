@@ -206,7 +206,7 @@ def write_atlas_mtl(mtl_out_path, materials, atlas_texture_name="atlas.png"):
 
         if base_material:
             for key, value in base_material.items():
-                if key != 'map_Kd':
+                if key not in ['map_Kd', '_mtl_dir']:
                     f.write(f"{key} {value}\n")
         else:
             f.write("Kd 1.000 1.000 1.000\n")

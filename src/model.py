@@ -6,7 +6,6 @@ from typing import Dict, Tuple, Optional
 
 from PIL import Image
 from sklearn.cluster import KMeans
-from torchvision import transforms
 import pyexr
 
 from pytorch3d.io import load_obj, load_objs_as_meshes
@@ -22,12 +21,105 @@ from pytorch3d.renderer import (
     BlendParams
 )
 
-from transformers import ViTForImageClassification, ViTImageProcessor
+from transformers import (
+    ViTForImageClassification,
+    ResNetForImageClassification,
+    ConvNextForImageClassification,
+    EfficientNetForImageClassification,
+    AutoConfig
+)
 import imageio.v3 as iio
 import time
 
 Image.MAX_IMAGE_PIXELS = None  # Ignore warning about Atlas texture can be very high resolution, will be downscaled
-TEXTURE_MAX_IMAGE_PIXELS = 40_000_000  # Atlas texture can be very high resolution
+TEXTURE_MAX_IMAGE_PIXELS = 40_000_000  # limit it texture to 40M pixels, downscale to that if needed
+
+MEAN = [0.485, 0.456, 0.406]
+STD = [0.229, 0.224, 0.225]
+
+# ------ MODEL CONFIGURATIONS ------
+MODEL_CONFIGS = {
+    "vit-large-patch16-224": {
+        "model_class": ViTForImageClassification,
+        "model_name": "google/vit-large-patch16-224",
+        "input_size": (224, 224),
+        "mean": MEAN,
+        "std": STD,
+        "description": "ViT-L/16"
+    },
+    "vit-base-patch16-224": {
+        "model_class": ViTForImageClassification,
+        "model_name": "google/vit-base-patch16-224",
+        "input_size": (224, 224),
+        "mean": MEAN,
+        "std": STD,
+        "description": "ViT-B/16"
+    },
+    "resnet50": {
+        "model_class": ResNetForImageClassification,
+        "model_name": "microsoft/resnet-50",
+        "input_size": (224, 224),
+        "mean": [0.485, 0.456, 0.406],
+        "std": [0.229, 0.224, 0.225],
+        "description": "ResNet-50"
+    },
+    "resnet101": {
+        "model_class": ResNetForImageClassification,
+        "model_name": "microsoft/resnet-101",
+        "input_size": (224, 224),
+        "mean": MEAN,
+        "std": STD,
+        "description": "ResNet-101"
+    },
+    "resnet152": {
+        "model_class": ResNetForImageClassification,
+        "model_name": "microsoft/resnet-152",
+        "input_size": (224, 224),
+        "mean": MEAN,
+        "std": STD,
+        "description": "ResNet-152"
+    },
+    "efficientnet-b0": {
+        "model_class": EfficientNetForImageClassification,
+        "model_name": "google/efficientnet-b0",
+        "input_size": (224, 224),
+        "mean": MEAN,
+        "std": STD,
+        "description": "EfficientNet B0"
+    },
+    "efficientnet-b1": {
+        "model_class": EfficientNetForImageClassification,
+        "model_name": "google/efficientnet-b1",
+        "input_size": (240, 240),
+        "mean": MEAN,
+        "std": STD,
+        "description": "EfficientNet B1"
+    },
+    "efficientnet-b2": {
+        "model_class": EfficientNetForImageClassification,
+        "model_name": "google/efficientnet-b2",
+        "input_size": (260, 260),
+        "mean": MEAN,
+        "std": STD,
+        "description": "EfficientNet B2"
+    },
+    "efficientnet-b3": {
+        "model_class": EfficientNetForImageClassification,
+        "model_name": "google/efficientnet-b3",
+        "input_size": (300, 300),
+        "mean": MEAN,
+        "std": STD,
+        "description": "EfficientNet B3"
+    },
+    "efficientnet-b4": {
+        "model_class": EfficientNetForImageClassification,
+        "model_name": "google/efficientnet-b4",
+        "input_size": (380, 380),
+        "mean": MEAN,
+        "std": STD,
+        "description": "EfficientNet B4"
+    }
+}
 
 def downscale_to_max_pixels(pil_img, max_pixels):
     """
@@ -52,10 +144,9 @@ class Model(nn.Module):
       2. Creates and optionally optimizes a texture (using clustering for color reduction)
       3. Optimizes camera position in 3D space
       4. Optimizes lighting location and intensity
-      5. Renders the 3D object and passes it to a ViT model for classification
+      5. Renders the 3D object and passes it to a selected model for classification
     """
 
-    # Class-level attributes for mesh and texture
     _mesh = None
     _texture_image = None
     _is_initialized = False
@@ -72,7 +163,9 @@ class Model(nn.Module):
         min_max_proportion=(0.3, 0.8),
         batch_size=1,
         nb_clusters=4,
-        positive_z=True
+        positive_z=True,
+        model_name="vit-large-patch16-224",
+        custom_weights_path=None
     ):
         """
         Initialize the model with mesh, texture, and rendering parameters.
@@ -89,13 +182,14 @@ class Model(nn.Module):
             batch_size (int): Number of images to render in parallel
             nb_clusters (int): Number of color clusters for texture optimization
             positive_z (bool): If True, constrain camera to positive z coordinates
+            model_name (str): Name of the classification model to use
+            custom_weights_path (str, optional): Path to custom weights file
         """
         super().__init__()
         self.batch_size = batch_size
         self.positive_z = positive_z
-
-        # ------ TIMING SETUP ------
-        timings = {}
+        self.model_name = model_name
+        self.custom_weights_path = custom_weights_path
 
         # ------ DEVICE SETUP ------
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -130,7 +224,7 @@ class Model(nn.Module):
 
         # ------ LIGHTING SETUP ------
         self.light_color = torch.tensor([[1.0, 1.0, 1.0]], device=self.device)
-        self.specular_strength = 0.5  # Reduced specular strength
+        self.specular_strength = 0.5
 
         # Initialize light parameters
         self.init_light_location = self._get_random_camera_coords().to(self.device)
@@ -146,16 +240,14 @@ class Model(nn.Module):
         }
 
         raster_settings = {**default_raster_settings, **raster_settings}
-
         self.raster_settings = RasterizationSettings(**raster_settings)
 
         # ------ TEXTURE CLUSTERING ------
-        # Cluster the texture for color centroid optimization
         if self.optimize_kwargs["texture"]:
             self.cluster_indices, self.cluster_colors = self._cluster_texture(nb_clusters=nb_clusters)
         else:
             self.cluster_indices = {}
-            self.cluster_colors = torch.zeros((0, 3), device=self.device)  # Empty tensor
+            self.cluster_colors = torch.zeros((0, 3), device=self.device)
 
         # ------ SCENE PARAMETERS SETUP ------
         self.init_scene_params = {
@@ -164,7 +256,6 @@ class Model(nn.Module):
             'light_intensity': self.init_light_intensity.to(self.device) * 0.5
         }
 
-        # Add texture_centroids only if we're optimizing texture
         if self.optimize_kwargs["texture"]:
             self.init_scene_params['texture_centroids'] = self.cluster_colors.to(self.device)
 
@@ -198,39 +289,100 @@ class Model(nn.Module):
                 cameras=camera,
                 lights=self.lights,
                 blend_params=BlendParams(
-                    sigma=1e-2,  # more stable blending
-                    gamma=1e-2,  # prevent z-fighting artifacts
-                    background_color=(0.1, 0.1, 0.1)  # dark gray
+                    sigma=1e-2,
+                    gamma=1e-2,
+                    background_color=(0.1, 0.1, 0.1)
                 )
             )
         )
 
         # ------ IMAGE CLASSIFICATION MODEL ------
-        self.ml_model = ViTForImageClassification.from_pretrained('google/vit-large-patch16-224').to(self.device).eval()
-        for param in self.ml_model.parameters():
-            param.requires_grad = False
-
-        # Image transformations
-        mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-        self.transforms = transforms.Compose([
-            transforms.Lambda(
-                lambda tensor: tensor[..., :3].permute(0, 3, 1, 2) if tensor.dim() == 4 else tensor.permute(2, 0, 1).unsqueeze(0)
-            ),
-            transforms.Normalize(mean, std),
-            transforms.Resize((224, 224)),
-        ])
+        self._setup_classification_model(custom_weights_path)
 
         # Store lighting optimization flag for convenience
         self.optimize_lighting = self.optimize_kwargs["lighting"]
 
         # ------ ENVIRONMENT MAP SETUP ------
-
         self.use_envmap = envmap_paths is not None and len(envmap_paths) > 0
         if self.use_envmap:
             if isinstance(envmap_paths, str):
                 envmap_paths = [envmap_paths]
             self.envmaps = torch.stack([self._load_envmap(path) for path in envmap_paths])
         self.n_envmaps = len(envmap_paths) if envmap_paths else 1
+
+    def _setup_classification_model(self, custom_weights_path: Optional[str] = None):
+        """Setup the selected classification model with appropriate preprocessing."""
+        if self.model_name not in MODEL_CONFIGS:
+            raise ValueError(f"Unknown model: {self.model_name}. Available models: {list(MODEL_CONFIGS.keys())}")
+
+        config = MODEL_CONFIGS[self.model_name]
+
+        print(f"🤖 Loading {config['description']} from {config['model_name']}...")
+
+        # All models now use transformers - consistent interface!
+        if custom_weights_path is None:
+            # Load pre-trained model
+            self.ml_model = config["model_class"].from_pretrained(
+                config["model_name"],
+                torch_dtype=torch.float32  # Ensure consistent dtype
+            ).to(self.device).eval()
+        else:
+            # Load model architecture without pre-trained weights, then load custom weights
+            print(f"🔧 Loading custom weights from {custom_weights_path}")
+            model_config = AutoConfig.from_pretrained(config["model_name"])
+            self.ml_model = config["model_class"](model_config).to(self.device).eval()
+            self._load_custom_weights(custom_weights_path)
+
+        # Freeze model parameters
+        for param in self.ml_model.parameters():
+            param.requires_grad = False
+
+        # Store model configuration
+        self.model_config = config
+        self.input_size = config["input_size"]
+        self.mean = torch.tensor(config["mean"], device=self.device).view(1, 3, 1, 1)
+        self.std = torch.tensor(config["std"], device=self.device).view(1, 3, 1, 1)
+
+        print(f"✅ {config['description']} loaded successfully!")
+
+    def _load_custom_weights(self, weights_path: str):
+        """Load custom weights into the model."""
+        try:
+            # Load weights
+            if weights_path.endswith('.safetensors'):
+                try:
+                    from safetensors.torch import load_file
+                    state_dict = load_file(weights_path)
+                except ImportError:
+                    raise ImportError("safetensors library required for .safetensors files")
+            else:
+                state_dict = torch.load(weights_path, map_location=self.device)
+
+            # Handle different state dict formats
+            if isinstance(state_dict, dict):
+                if 'state_dict' in state_dict:
+                    state_dict = state_dict['state_dict']
+                elif 'model' in state_dict:
+                    state_dict = state_dict['model']
+
+            # Try to load the state dict
+            try:
+                self.ml_model.load_state_dict(state_dict, strict=True)
+                print(f"✅ Successfully loaded custom weights from {weights_path}")
+            except RuntimeError as e:
+                # Try loading with strict=False for partial matches
+                missing_keys, unexpected_keys = self.ml_model.load_state_dict(state_dict, strict=False)
+
+                if missing_keys:
+                    print(f"⚠️ Missing keys in custom weights: {missing_keys[:5]}...")
+                if unexpected_keys:
+                    print(f"⚠️ Unexpected keys in custom weights: {unexpected_keys[:5]}...")
+
+                print(f"✅ Loaded custom weights with some mismatches from {weights_path}")
+
+        except Exception as e:
+            print(f"❌ Error loading custom weights: {str(e)}")
+            raise
 
     @classmethod
     def reset_cache_cls(cls):
@@ -587,7 +739,7 @@ class Model(nn.Module):
 
         Args:
             with_grad: Whether to compute gradients during rendering
-            image_res: Override default image resolution
+            raster_settings: Override default raster settings
 
         Returns:
             Rendered images tensor with shape (B, N_envmaps, H, W, C)
@@ -782,10 +934,11 @@ class Model(nn.Module):
 
     def forward(self, return_render: bool = True, with_grad: bool = True) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Forward pass: render object and classify with ResNet-50.
+        Forward pass: render object and classify with the selected model.
 
         Args:
             return_render: If True, also return rendered images
+            with_grad: Whether to compute gradients
 
         Returns:
             Tuple containing:
@@ -795,28 +948,23 @@ class Model(nn.Module):
         images = self.render(with_grad=with_grad)  # (B, N_envmaps, H, W, C)
         images_orig = images.clone()
 
-        # Reshape for batch processing through ResNet-50
+        # Reshape for batch processing through the model
         B, N, H, W, C = images.shape
         images = images.reshape(B * N, H, W, C)
         images = images.permute(0, 3, 1, 2)  # (B*N, C, H, W)
 
-        # Resize to ResNet-50 expected input size
-        if images.shape[2:4] != (224, 224):
-            images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
+        # Resize to model expected input size
+        if images.shape[2:4] != self.input_size:
+            images = F.interpolate(images, size=self.input_size, mode='bilinear', align_corners=False)
 
-        # Normalize for ResNet-50 (ImageNet standards)
-        mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
-        pixel_values = (images - mean) / std
+        # Normalize for the selected model (consistent across all transformers models)
+        pixel_values = (images - self.mean) / self.std
 
         with torch.set_grad_enabled(with_grad):
             outputs = self.ml_model(pixel_values)
 
-        # Extract logits from the outputs (if it's ImageClassifierOutput)
-        if hasattr(outputs, 'logits'):
-            logits = outputs.logits
-        else:
-            logits = outputs  # Fallback to assuming outputs is already logits
+        # All transformers models return objects with .logits attribute - consistent interface!
+        logits = outputs.logits
 
         # Reshape logits back to (B, N_envmaps, num_classes)
         logits = logits.reshape(B, N, -1)
@@ -848,7 +996,8 @@ if __name__ == "__main__":
         batch_size=32,
         optimize_kwargs={"camera": True, "texture": True, "lighting": True},
         raster_settings={"image_size": 224},
-        device="cuda"
+        device="cuda",
+        model_name="vit-large-patch16-224"
     )
 
     logits, renders = model(return_render=True)

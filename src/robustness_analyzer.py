@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from tqdm.auto import tqdm
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from model import Model
 from collections import defaultdict
 from utils import analyze_logits, get_target_label, to_numpy
@@ -22,6 +22,7 @@ class RobustnessAnalyzer:
         num_iterations (int): Number of optimization iterations
         device (str): Device to run optimization on ('cuda' or 'cpu')
         raster_settings (Dict, optional): Dictionary of rasterization settings. Defaults to {"image_size": 224}.
+        model_name (str): Name of the classification model to use
     """
 
     def __init__(
@@ -36,7 +37,10 @@ class RobustnessAnalyzer:
         nb_clusters: int = 4,
         positive_z: bool = True,
         device: str = "cuda",
-        raster_settings: Optional[Dict] = {}
+        raster_settings: Optional[Dict] = {},
+        model_name: str = "vit-large-patch16-224",
+        custom_weights_path: Optional[str] = None,
+        min_max_proportion: Tuple[float, float] = (0.3, 0.8)
     ):
         self.obj_path = obj_path
         self.texture_path = texture_path
@@ -46,6 +50,9 @@ class RobustnessAnalyzer:
         self.targeted = targeted
         self.device = device
         self.positive_z = positive_z
+        self.model_name = model_name
+        self.custom_weights_path = custom_weights_path
+        self.min_max_proportion = min_max_proportion
 
         # Default optimization settings if none provided
         self.nb_clusters = nb_clusters
@@ -80,13 +87,16 @@ class RobustnessAnalyzer:
             texture_path=self.texture_path,
             envmap_paths=self.envmap_paths,
             optimize_kwargs=self.optimize_kwargs,
+            min_max_proportion=self.min_max_proportion,
             raster_settings=self.raster_settings,
             device=self.device,
             batch_size=self.batch_size,
             nb_clusters=self.nb_clusters,
-            positive_z=self.positive_z
+            positive_z=self.positive_z,
+            model_name=self.model_name,
+            custom_weights_path=self.custom_weights_path
         )
-        self.model.train()
+        self.model.eval()
 
     def _setup_target(self) -> None:
         """Setup target tensor for optimization."""
@@ -234,7 +244,8 @@ class RobustnessAnalyzer:
                             pbar.set_description(
                                 f"Run {run + 1}/{num_runs} [Iter {i + 1}/{num_iterations}] - "
                                 f"Loss: {loss_:.2f} - Class: {class_name:<15} - "
-                                f"Adv Acc: {adv_count}/{nb_ims} - Prob: {avg_prob:.4f}"
+                                f"Adv Acc: {adv_count}/{nb_ims} - Prob: {avg_prob:.4f} - "
+                                f"Model: {self.model_name}"
                             )
 
                             # Store intermediate results in class state
@@ -380,7 +391,8 @@ if __name__ == "__main__":
         "params_to_optimize": params_to_optimize,
         "targeted": target_class!=true_class,
         "positive_z": True, # constraints camera z>0 (positive elevation)
-        "raster_settings": raster_settings
+        "raster_settings": raster_settings,
+        "model_name": "vit-large-patch16-224"
     }
 
     robust_analyzer = RobustnessAnalyzer(**kwargs)
