@@ -34,97 +34,12 @@ import time
 Image.MAX_IMAGE_PIXELS = None  # Ignore warning about Atlas texture can be very high resolution, will be downscaled
 TEXTURE_MAX_IMAGE_PIXELS = 40_000_000  # limit it texture to 40M pixels, downscale to that if needed
 
-MEAN = [0.485, 0.456, 0.406]
-STD = [0.229, 0.224, 0.225]
-
-# ------ MODEL CONFIGURATIONS ------
-MODEL_CONFIGS = {
-    "vit-large-patch16-224": {
-        "model_class": ViTForImageClassification,
-        "model_name": "google/vit-large-patch16-224",
-        "input_size": (224, 224),
-        "mean": MEAN,
-        "std": STD,
-        "description": "ViT-L/16"
-    },
-    "vit-base-patch16-224": {
-        "model_class": ViTForImageClassification,
-        "model_name": "google/vit-base-patch16-224",
-        "input_size": (224, 224),
-        "mean": MEAN,
-        "std": STD,
-        "description": "ViT-B/16"
-    },
-    "resnet50": {
-        "model_class": ResNetForImageClassification,
-        "model_name": "microsoft/resnet-50",
-        "input_size": (224, 224),
-        "mean": [0.485, 0.456, 0.406],
-        "std": [0.229, 0.224, 0.225],
-        "description": "ResNet-50"
-    },
-    "resnet101": {
-        "model_class": ResNetForImageClassification,
-        "model_name": "microsoft/resnet-101",
-        "input_size": (224, 224),
-        "mean": MEAN,
-        "std": STD,
-        "description": "ResNet-101"
-    },
-    "resnet152": {
-        "model_class": ResNetForImageClassification,
-        "model_name": "microsoft/resnet-152",
-        "input_size": (224, 224),
-        "mean": MEAN,
-        "std": STD,
-        "description": "ResNet-152"
-    },
-    "efficientnet-b0": {
-        "model_class": EfficientNetForImageClassification,
-        "model_name": "google/efficientnet-b0",
-        "input_size": (224, 224),
-        "mean": MEAN,
-        "std": STD,
-        "description": "EfficientNet B0"
-    },
-    "efficientnet-b1": {
-        "model_class": EfficientNetForImageClassification,
-        "model_name": "google/efficientnet-b1",
-        "input_size": (240, 240),
-        "mean": MEAN,
-        "std": STD,
-        "description": "EfficientNet B1"
-    },
-    "efficientnet-b2": {
-        "model_class": EfficientNetForImageClassification,
-        "model_name": "google/efficientnet-b2",
-        "input_size": (260, 260),
-        "mean": MEAN,
-        "std": STD,
-        "description": "EfficientNet B2"
-    },
-    "efficientnet-b3": {
-        "model_class": EfficientNetForImageClassification,
-        "model_name": "google/efficientnet-b3",
-        "input_size": (300, 300),
-        "mean": MEAN,
-        "std": STD,
-        "description": "EfficientNet B3"
-    },
-    "efficientnet-b4": {
-        "model_class": EfficientNetForImageClassification,
-        "model_name": "google/efficientnet-b4",
-        "input_size": (380, 380),
-        "mean": MEAN,
-        "std": STD,
-        "description": "EfficientNet B4"
-    }
-}
+from model_configs import MODEL_CONFIGS
 
 def downscale_to_max_pixels(pil_img, max_pixels):
     """
     Downscale a PIL image so that its total number of pixels does not exceed max_pixels.
-    Preserves aspect ratio. Returns the (possibly) resized image.
+    Preserves aspect ratio. Returns the downscaled (if original exceeds max_pixels) image.
     """
     w, h = pil_img.size
     n_pixels = w * h
@@ -150,6 +65,12 @@ class Model(nn.Module):
     _mesh = None
     _texture_image = None
     _is_initialized = False
+
+    # Classification model caching
+    _cached_model = None
+    _cached_model_config = None
+    _cached_model_key = None  # Will store (model_name, custom_weights_path, device)
+    _model_cache_initialized = False
 
     def __init__(
         self,
@@ -315,14 +236,29 @@ class Model(nn.Module):
         if self.model_name not in MODEL_CONFIGS:
             raise ValueError(f"Unknown model: {self.model_name}. Available models: {list(MODEL_CONFIGS.keys())}")
 
+        # Create cache key based on model parameters
+        cache_key = (self.model_name, custom_weights_path, str(self.device))
+
+        # Check if we already have this model cached
+        if (self.__class__._model_cache_initialized and
+            self.__class__._cached_model_key == cache_key and
+            self.__class__._cached_model is not None):
+
+            # Reuse cached model and configuration
+            self.ml_model = self.__class__._cached_model
+            self.model_config = self.__class__._cached_model_config
+            self.input_size = self.model_config["input_size"]
+            self.mean = torch.tensor(self.model_config["mean"], device=self.device).view(1, 3, 1, 1)
+            self.std = torch.tensor(self.model_config["std"], device=self.device).view(1, 3, 1, 1)
+            return
+
         config = MODEL_CONFIGS[self.model_name]
 
-        print(f"🤖 Loading {config['description']} from {config['model_name']}...")
 
-        # All models now use transformers - consistent interface!
         if custom_weights_path is None:
+            print(f"🤖 Loading {config['description']} from {config['model_name']}...")
             # Load pre-trained model
-            self.ml_model = config["model_class"].from_pretrained(
+            ml_model = config["model_class"].from_pretrained(
                 config["model_name"],
                 torch_dtype=torch.float32  # Ensure consistent dtype
             ).to(self.device).eval()
@@ -330,14 +266,22 @@ class Model(nn.Module):
             # Load model architecture without pre-trained weights, then load custom weights
             print(f"🔧 Loading custom weights from {custom_weights_path}")
             model_config = AutoConfig.from_pretrained(config["model_name"])
-            self.ml_model = config["model_class"](model_config).to(self.device).eval()
+            ml_model = config["model_class"](model_config).to(self.device).eval()
+            self.ml_model = ml_model
             self._load_custom_weights(custom_weights_path)
 
         # Freeze model parameters
-        for param in self.ml_model.parameters():
+        for param in ml_model.parameters():
             param.requires_grad = False
 
-        # Store model configuration
+        # Cache the model and configuration at class level
+        self.__class__._cached_model = ml_model
+        self.__class__._cached_model_config = config
+        self.__class__._cached_model_key = cache_key
+        self.__class__._model_cache_initialized = True
+
+        # Assign to instance
+        self.ml_model = ml_model
         self.model_config = config
         self.input_size = config["input_size"]
         self.mean = torch.tensor(config["mean"], device=self.device).view(1, 3, 1, 1)
@@ -389,12 +333,20 @@ class Model(nn.Module):
         cls._mesh = None
         cls._texture_image = None
         cls._is_initialized = False
+        cls._cached_model = None
+        cls._cached_model_config = None
+        cls._cached_model_key = None
+        cls._model_cache_initialized = False
 
     def reset_cache(self) -> None:
         """Reset class-level attributes via an instance method."""
         self.__class__._mesh = None
         self.__class__._texture_image = None
         self.__class__._is_initialized = False
+        self.__class__._cached_model = None
+        self.__class__._cached_model_config = None
+        self.__class__._cached_model_key = None
+        self.__class__._model_cache_initialized = False
 
     @classmethod
     def _initialize_mesh_and_texture(cls, obj_path, texture_path, optimize_kwargs, batch_size, device):

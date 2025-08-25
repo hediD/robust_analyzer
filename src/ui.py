@@ -202,36 +202,104 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
     with st.sidebar.expander("🔧 Custom Model Weights", expanded=False):
         st.write("**Upload custom pre-trained weights (optional)**")
 
-        use_custom_weights = st.checkbox(
-            "Use custom weights",
-            value=False,
-            help="Upload your own model weights instead of using default pre-trained weights"
-        )
+        # Check for cached weights for current model
+        cached_weights_info = get_cached_weights_for_model(selected_model)
 
-        if use_custom_weights:
-            weights_file = st.file_uploader(
-                "Upload model weights",
-                type=["pth", "pt", "bin", "safetensors"],
-                help="Supported formats: .pth, .pt, .bin, .safetensors"
+        if cached_weights_info:
+            st.success(f"📦 **Cached weights found for {MODEL_CONFIGS[selected_model]['description']}**")
+
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.write(f"**File:** {cached_weights_info['original_name']}")
+                st.write(f"**Size:** {cached_weights_info['file_size_mb']:.1f} MB")
+                cached_time = datetime.fromisoformat(cached_weights_info['timestamp'].strip('"'))
+                st.write(f"**Cached:** {cached_time.strftime('%Y-%m-%d %H:%M')}")
+
+            with col2:
+                if st.button("❌", help="Remove cached weights", key="remove_cached_weights"):
+                    if remove_cached_weights_for_model(selected_model):
+                        st.success("✅ Cached weights removed")
+                        st.rerun()
+                    else:
+                        st.error("❌ Error removing weights")
+
+            use_cached_weights = st.checkbox(
+                "Use cached weights",
+                value=True,
+                help="Use the cached weights for this model"
             )
 
-            if weights_file:
-                try:
-                    # Cache the weights file
-                    custom_weights_path = cache_weights_file(weights_file, selected_model)
-                    st.success(f"✅ Weights cached: {weights_file.name}")
-
-                    # Show file info
-                    file_size = len(weights_file.getvalue()) / (1024 * 1024)  # MB
-                    st.info(f"📊 File size: {file_size:.1f} MB")
-
-                except Exception as e:
-                    st.error(f"❌ Error processing weights: {str(e)}")
-                    custom_weights_path = None
+            if use_cached_weights:
+                custom_weights_path = cached_weights_info["path"]
+                st.info("💡 Using cached weights")
             else:
-                st.info("💡 Upload a weights file to use custom model")
+                st.info("💡 Using default pre-trained weights")
+
+            # Option to upload new weights
+            with st.expander("📤 Upload new weights", expanded=False):
+                upload_new_weights = st.checkbox(
+                    "Upload new weights (will replace cached)",
+                    value=False,
+                    help="Upload new weights to replace the current cached ones"
+                )
+
+                if upload_new_weights:
+                    weights_file = st.file_uploader(
+                        "Upload model weights",
+                        type=["pth", "pt", "bin", "safetensors"],
+                        help="Supported formats: .pth, .pt, .bin, .safetensors",
+                        key="new_weights_upload"
+                    )
+
+                    if weights_file:
+                        try:
+                            # Remove old cached weights first
+                            remove_cached_weights_for_model(selected_model)
+
+                            # Cache the new weights file
+                            custom_weights_path = cache_weights_file(weights_file, selected_model)
+                            st.success(f"✅ New weights cached: {weights_file.name}")
+
+                            # Show file info
+                            file_size = len(weights_file.getvalue()) / (1024 * 1024)  # MB
+                            st.info(f"📊 File size: {file_size:.1f} MB")
+                            st.rerun()  # Refresh to show new cached weights
+
+                        except Exception as e:
+                            st.error(f"❌ Error processing weights: {str(e)}")
+                            custom_weights_path = None
         else:
-            st.info("💡 Using default pre-trained weights")
+            # No cached weights - show upload interface
+            use_custom_weights = st.checkbox(
+                "Use custom weights",
+                value=False,
+                help="Upload your own model weights instead of using default pre-trained weights"
+            )
+
+            if use_custom_weights:
+                weights_file = st.file_uploader(
+                    "Upload model weights",
+                    type=["pth", "pt", "bin", "safetensors"],
+                    help="Supported formats: .pth, .pt, .bin, .safetensors"
+                )
+
+                if weights_file:
+                    try:
+                        # Cache the weights file
+                        custom_weights_path = cache_weights_file(weights_file, selected_model)
+                        st.success(f"✅ Weights cached: {weights_file.name}")
+
+                        # Show file info
+                        file_size = len(weights_file.getvalue()) / (1024 * 1024)  # MB
+                        st.info(f"📊 File size: {file_size:.1f} MB")
+
+                    except Exception as e:
+                        st.error(f"❌ Error processing weights: {str(e)}")
+                        custom_weights_path = None
+                else:
+                    st.info("💡 Upload a weights file to use custom model")
+            else:
+                st.info("💡 Using default pre-trained weights")
 
     batch_size = st.sidebar.number_input(
         "Batch Size",
@@ -507,7 +575,12 @@ def check_cached_files() -> bool:
         "timestamp": latest["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
         "file_names": cached_metadata.get("file_names", ["Unknown files"]),
     }
-    print(f"✅ Loaded cached files from {latest['cache_key'][:8]}...")
+
+    # Only print the message once per session to avoid spam
+    if not st.session_state.get("cache_message_shown", False):
+        print(f"✅ Loaded cached files from {latest['cache_key'][:8]}...")
+        st.session_state["cache_message_shown"] = True
+
     return True
 
 
@@ -1037,8 +1110,8 @@ def create_composite_image(
         print("✅ Plotly heatmap created successfully")
 
     except Exception as e:
-        print(f"❌ Plotly heatmap failed: {e}")
-        # Matplotlib fallback
+        # Silent fallback to matplotlib when Plotly fails
+        heatmap_img = None
         try:
             fig = plt.figure(figsize=(5, 5))
             ax = fig.add_subplot(111, projection="polar")
@@ -1085,7 +1158,6 @@ def create_composite_image(
             plt.close(fig)
 
         except Exception as e2:
-            print(f"Matplotlib fallback also failed: {e2}")
             # Last resort placeholder
             heatmap_img = Image.new("RGB", (500, 500), color="lightgray")
             draw = ImageDraw.Draw(heatmap_img)
@@ -1108,7 +1180,7 @@ def create_composite_image(
 
             azimuth, elevation, _ = utils.compute_spherical_coordinates(camera_positions)
             msg = (
-                "Heatmap unavailable\n(Kaleido not installed)\n\n"
+                "Heatmap unavailable\n(Plotting libraries unavailable)\n\n"
                 f"Position: {image_info['position_idx']}\n"
                 f"Azimuth: {azimuth[image_info['position_idx']]:.1f}°\n"
                 f"Elevation: {elevation[image_info['position_idx']]:.1f}°\n"
@@ -1334,7 +1406,12 @@ def create_image_carousel(rendered_images: Sequence[Dict]) -> None:
                 logits2d, cams2d = _expand_for_envmaps(logits, cameras, results.get("envmap_paths"))
 
                 topk = st.session_state.get("topk_value", 1)
-                labels_correct = utils.get_labels_correct(logits2d, config["target_class"], topk=topk)
+                try:
+                    labels_correct = utils.get_labels_correct(logits2d, config["target_class"], topk=topk)
+                except Exception as e:
+                    st.error(f"Error getting labels: {str(e)}")
+                    # Create a fallback labels_correct array (assume all incorrect)
+                    labels_correct = torch.zeros(len(logits2d), dtype=torch.bool)
 
                 if include_heatmap:
                     composite = create_composite_image(
@@ -1382,7 +1459,12 @@ def create_image_carousel(rendered_images: Sequence[Dict]) -> None:
                         logits2d, cams2d = _expand_for_envmaps(logits, cameras, results.get("envmap_paths"))
 
                         topk = st.session_state.get("topk_value", 1)
-                        labels_correct = utils.get_labels_correct(logits2d, config["target_class"], topk=topk)
+                        try:
+                            labels_correct = utils.get_labels_correct(logits2d, config["target_class"], topk=topk)
+                        except Exception as e:
+                            st.error(f"Error getting labels: {str(e)}")
+                            # Create a fallback labels_correct array (assume all incorrect)
+                            labels_correct = torch.zeros(len(logits2d), dtype=torch.bool)
 
                         zbuf = io.BytesIO()
                         with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zipf:
@@ -1446,7 +1528,13 @@ def create_image_carousel(rendered_images: Sequence[Dict]) -> None:
 
     c1, c2 = st.columns([0.8, 1.2])
     with c1:
-        st.image(current["image"], caption=f"Position {current['position_idx']}", use_container_width=True)
+        # Convert numpy array to PIL Image to avoid Streamlit caching issues
+        image_array = current["image"].copy().astype(np.uint8)
+        st.image(
+            image_array,
+            caption=f"Position {current['position_idx']}",
+            use_container_width=True
+        )
     with c2:
         st.write("**Position Information:**")
         st.write(f"• **Position Index:** {current['position_idx']}")
@@ -1780,6 +1868,7 @@ def run_analysis(
         "positive_z": config["positive_z"],
         "raster_settings": raster_settings,
         "model_name": config["model_name"],
+        "custom_weights_path": config["custom_weights_path"],
         "min_max_proportion": config["min_max_proportion"],
     }
 
@@ -2222,6 +2311,73 @@ def clear_cache_directory() -> bool:
 
 # Add this function near the other caching functions
 
+def get_weights_metadata_path() -> Path:
+    """Get path to weights metadata file."""
+    cache_dir = get_cache_dir()
+    weights_cache_dir = cache_dir / "model_weights"
+    weights_cache_dir.mkdir(exist_ok=True)
+    return weights_cache_dir / "weights_metadata.json"
+
+
+def load_weights_metadata() -> Dict[str, Dict]:
+    """Load weights metadata from cache."""
+    metadata_path = get_weights_metadata_path()
+    if metadata_path.exists():
+        try:
+            with open(metadata_path, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_weights_metadata(metadata: Dict[str, Dict]) -> None:
+    """Save weights metadata to cache."""
+    metadata_path = get_weights_metadata_path()
+    try:
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+    except Exception as e:
+        print(f"Error saving weights metadata: {e}")
+
+
+def get_cached_weights_for_model(model_name: str) -> Optional[Dict]:
+    """Get cached weights info for a specific model."""
+    metadata = load_weights_metadata()
+    if model_name in metadata:
+        # Verify the file still exists
+        weights_info = metadata[model_name]
+        if Path(weights_info["path"]).exists():
+            return weights_info
+        else:
+            # Clean up metadata for missing file
+            del metadata[model_name]
+            save_weights_metadata(metadata)
+    return None
+
+
+def remove_cached_weights_for_model(model_name: str) -> bool:
+    """Remove cached weights for a specific model."""
+    metadata = load_weights_metadata()
+    if model_name in metadata:
+        weights_info = metadata[model_name]
+        weights_path = Path(weights_info["path"])
+
+        # Remove the file if it exists
+        if weights_path.exists():
+            try:
+                weights_path.unlink()
+            except Exception as e:
+                print(f"Error removing weights file: {e}")
+                return False
+
+        # Remove from metadata
+        del metadata[model_name]
+        save_weights_metadata(metadata)
+        return True
+    return False
+
+
 def cache_weights_file(weights_file, model_name: str) -> str:
     """
     Cache uploaded weights file for reuse.
@@ -2253,6 +2409,19 @@ def cache_weights_file(weights_file, model_name: str) -> str:
         print(f"✅ Weights cached to {cached_weights_path}")
     else:
         print(f"✅ Using cached weights from {cached_weights_path}")
+
+    # Update metadata
+    metadata = load_weights_metadata()
+    file_size_mb = len(content) / (1024 * 1024)
+    metadata[model_name] = {
+        "path": str(cached_weights_path),
+        "original_name": weights_file.name,
+        "file_hash": file_hash,
+        "file_size_mb": file_size_mb,
+        "timestamp": _now_iso(),
+        "model_name": model_name
+    }
+    save_weights_metadata(metadata)
 
     return str(cached_weights_path)
 
