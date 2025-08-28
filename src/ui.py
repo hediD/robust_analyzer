@@ -1125,12 +1125,12 @@ def create_composite_image(
             if incorrect_mask.any():
                 ax.scatter(
                     azimuth_rad[incorrect_mask], elevation[incorrect_mask],
-                    c="lightcoral", s=30, alpha=0.6, label=f"Incorrect (Top-{topk_value})",
+                    c="lightcoral", s=30, alpha=0.6, label=f"Incorrect",
                 )
             if correct_mask.any():
                 ax.scatter(
                     azimuth_rad[correct_mask], elevation[correct_mask],
-                    c="lightblue", s=30, alpha=0.6, label=f"Correct (Top-{topk_value})",
+                    c="lightblue", s=30, alpha=0.6, label=f"Correct",
                 )
 
             hi = image_info["position_idx"]
