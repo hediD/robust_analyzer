@@ -919,7 +919,7 @@ def create_interactive_polar_plot(
             customdata=np.where(current_incorrect)[0],
         ))
 
-    title_text = f"Camera Position Analysis (Top-{topk_value})<br>Class: {target_class[:50]}..."
+    title_text = f"Azimuth-Elevation"
     if current_highlighted_index is not None:
         title_text += f"<br>🎯 Currently displaying position {current_highlighted_index}"
     elif selected_indices:
@@ -1593,7 +1593,7 @@ def visualize_results(results: Dict, config: Dict):
                 label = id_to_class.get(cls_id, f"class {cls_id}")
                 st.write(f"{rank+1}. {label[:30]}... — {cnt} ({pct:.1f}%)")
 
-        st.subheader("🎯 Camera Position Heatmap")
+        st.subheader("🎯 Camera Position")
         topk = st.session_state.get("topk_value", 1)
         labels_correct = utils.get_labels_correct(logits2d, config["target_class"], topk=topk)
 
@@ -1809,7 +1809,7 @@ def visualize_results(results: Dict, config: Dict):
             utils.visualize_positions_polar(
                 cams2d.numpy(),
                 labels_correct.numpy(),
-                title=f"Camera Position Analysis (Top-{topk}) - Target: {config['target_class'][:30]}...",
+                title=f"Azimuth-Elevation Heatmap",
             )
             polar_fig = plt.gcf()
             col1, col2, col3 = st.columns([1, 2, 1])
@@ -1821,7 +1821,7 @@ def visualize_results(results: Dict, config: Dict):
             utils.visualize_positions_with_distributions(
                 cams2d.numpy(),
                 labels_correct.numpy(),
-                title=f"Distribution Analysis (Top-{topk}) - Target: {config['target_class'][:30]}...",
+                title=f"Analysis of 3D Spherical Distribution of Model Classification",
                 mode="distributions",
                 show_distance=False
             )
@@ -1966,7 +1966,7 @@ def download_results(results: Dict, plot_data: Optional[Dict]) -> None:
                     utils.visualize_positions_polar(
                         plot_data["camera_positions"],
                         plot_data["labels_correct"],
-                        title=f"Camera Position Analysis (Top-{plot_data['topk']}) - Target: {plot_data['target_class'][:30]}...",
+                        title=f"Azimuth-Elevation Heatmap",
                     )
                     polar_fig = plt.gcf()
 
@@ -1979,7 +1979,7 @@ def download_results(results: Dict, plot_data: Optional[Dict]) -> None:
                     utils.visualize_positions_with_distributions(
                         plot_data["camera_positions"],
                         plot_data["labels_correct"],
-                        title=f"Distribution Analysis (Top-{plot_data['topk']}) - Target: {plot_data['target_class'][:30]}...",
+                        title=f"Analysis of 3D Spherical Distribution of Model Classification",
                         mode="distributions",
                         show_distance=False
                     )
@@ -3014,4 +3014,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(
