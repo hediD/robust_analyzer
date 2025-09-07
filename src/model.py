@@ -133,6 +133,8 @@ class Model(nn.Module):
         self.meshes = self.__class__._mesh
         self.texture_image = self.__class__._texture_image
 
+        self.fov = 60.0
+
         # ------ BOUNDING BOX PROPERTIES ------
         self._calculate_bbox_properties(min_max_proportion)
 
@@ -405,13 +407,16 @@ class Model(nn.Module):
         self.bbox_center = (self.bbox_min + self.bbox_max) / 2.0
         self.bbox_size = (self.bbox_max - self.bbox_min).max()
 
-        # Min and max distances are derived from bounding box size
-        self.min_distance = self.bbox_size / (2.0 * min_max_proportion[1])
-        self.max_distance = self.bbox_size / (2.0 * min_max_proportion[0])
+        # Min and max distances are derived from bounding box size and FOV
+        fov_rad = self.fov * (np.pi / 180.0)
+        tan_half_fov = np.tan(fov_rad / 2.0)
+
+        self.min_distance = self.bbox_size / (2.0 * min_max_proportion[1] * tan_half_fov)
+        self.max_distance = self.bbox_size / (2.0 * min_max_proportion[0] * tan_half_fov)
 
     # ------ CAMERA POSITION METHODS ------
 
-    def _get_random_camera_coords(self, fov: torch.Tensor = torch.tensor(60.0)) -> torch.Tensor:
+    def _get_random_camera_coords(self) -> torch.Tensor:
         """
         Generate random camera coordinates based on a spherical distribution.
 
@@ -422,7 +427,7 @@ class Model(nn.Module):
             Tensor of camera coordinates with shape (batch_size, 3)
         """
         # Compute radius from bounding box size and FOV
-        r = self.bbox_size.cpu() / (2.0 * np.random.uniform(0.5, 0.7)) / torch.tan(fov * (torch.pi / 180.0) / 2)
+        r = self.bbox_size.cpu() / (2.0 * np.random.uniform(0.5, 0.7)) / torch.tan(torch.tensor(self.fov * (torch.pi / 180.0) / 2))
 
         # Random spherical angles: azimuth and elevation
         azimuth = 2 * np.pi * np.random.rand(self.batch_size)
@@ -457,7 +462,7 @@ class Model(nn.Module):
 
         camera_vectors = position - self.bbox_center
         distances = torch.norm(camera_vectors, dim=-1, keepdim=True)
-        normalized_vectors = camera_vectors / (distances + 1e-9)  # avoid division by zero
+        normalized_vectors = camera_vectors / (distances + 1e-6)
 
         clamped_distances = torch.clamp(distances, min_distance, max_distance)
         return self.bbox_center + normalized_vectors * clamped_distances
@@ -524,7 +529,6 @@ class Model(nn.Module):
             cluster_id: torch.tensor(np.where(flattened_clusters == cluster_id)[0])
             for cluster_id in range(1, nb_clusters + 1)
         }
-
         cluster_colors = torch.tensor(centroids_values[1:], dtype=torch.float32, device=self.device)
         self.clusters_arr = clusters_arr
         return per_cluster_indices, cluster_colors
@@ -616,7 +620,7 @@ class Model(nn.Module):
         """
         H = W = self.raster_settings.image_size
         aspect_ratio = W / H
-        fov_rad = torch.tensor(60.0 * np.pi / 180.0)
+        fov_rad = torch.tensor(self.fov * np.pi / 180.0)
 
         # Create normalized device coordinates
         y, x = torch.meshgrid(
