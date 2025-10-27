@@ -66,12 +66,14 @@ class RobustnessAnalyzer:
         self.final_camera_coords = []
         self.camera_positions = []
 
-        # Constants
-        self.num_classes = 1000  # ImageNet classes
-
         # Setup
         self.raster_settings = raster_settings
         self._setup_model()
+
+        # Get number of classes from the loaded model
+        self.num_classes = self._get_num_classes_from_model()
+        print(f"📊 Model has {self.num_classes} output classes")
+
         self._setup_target()
         self.loss_fn = nn.CrossEntropyLoss()
 
@@ -98,9 +100,36 @@ class RobustnessAnalyzer:
         )
         self.model.eval()
 
+    def _get_num_classes_from_model(self) -> int:
+        """Get the number of output classes from the loaded model."""
+        ml_model = self.model.ml_model
+
+        # Check different possible classifier attribute names
+        if hasattr(ml_model, 'classifier'):
+            classifier = ml_model.classifier
+            if hasattr(classifier, 'out_features'):
+                return classifier.out_features
+            elif hasattr(classifier, 'weight'):
+                return classifier.weight.shape[0]
+            elif isinstance(classifier, nn.Sequential):
+                # For ResNet-style sequential classifiers
+                for layer in reversed(classifier):
+                    if isinstance(layer, nn.Linear):
+                        return layer.out_features
+        elif hasattr(ml_model, 'head'):
+            head = ml_model.head
+            if hasattr(head, 'out_features'):
+                return head.out_features
+            elif hasattr(head, 'weight'):
+                return head.weight.shape[0]
+
+        # Default to 1000 if we can't determine
+        print("⚠️  Could not determine number of classes from model, defaulting to 1000")
+        return 1000
+
     def _setup_target(self) -> None:
         """Setup target tensor for optimization."""
-        target = get_target_label(self.target_class)
+        target = get_target_label(self.target_class, num_classes=self.num_classes, device=self.device)
         self.target = target.expand(
             self.batch_size,
             len(self.envmap_paths) or 1,

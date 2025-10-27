@@ -104,7 +104,7 @@ class Model(nn.Module):
             nb_clusters (int): Number of color clusters for texture optimization
             positive_z (bool): If True, constrain camera to positive z coordinates
             model_name (str): Name of the classification model to use
-            custom_weights_path (str, optional): Path to custom weights file
+            custom_weights_path (str, optional): Path to custom weights file (number of classes auto-detected)
         """
         super().__init__()
         self.batch_size = batch_size
@@ -238,6 +238,10 @@ class Model(nn.Module):
         if self.model_name not in MODEL_CONFIGS:
             raise ValueError(f"Unknown model: {self.model_name}. Available models: {list(MODEL_CONFIGS.keys())}")
 
+        print(f"\n🔧 Setting up classification model:")
+        print(f"   Model: {self.model_name}")
+        print(f"   Custom weights: {'Yes' if custom_weights_path else 'No'}")
+
         # Create cache key based on model parameters
         cache_key = (self.model_name, custom_weights_path, str(self.device))
 
@@ -246,6 +250,7 @@ class Model(nn.Module):
             self.__class__._cached_model_key == cache_key and
             self.__class__._cached_model is not None):
 
+            print(f"   Using cached model")
             # Reuse cached model and configuration
             self.ml_model = self.__class__._cached_model
             self.model_config = self.__class__._cached_model_config
@@ -256,19 +261,36 @@ class Model(nn.Module):
 
         config = MODEL_CONFIGS[self.model_name]
 
-
         if custom_weights_path is None:
             print(f"🤖 Loading {config['description']} from {config['model_name']}...")
-            # Load pre-trained model
+            # Load pre-trained model with default 1000 classes
             ml_model = config["model_class"].from_pretrained(
                 config["model_name"],
-                torch_dtype=torch.float32  # Ensure consistent dtype
+                torch_dtype=torch.float32
             ).to(self.device).eval()
         else:
-            # Load model architecture without pre-trained weights, then load custom weights
+            # Load custom weights - auto-detect number of classes and create architecture accordingly
             print(f"🔧 Loading custom weights from {custom_weights_path}")
-            model_config = AutoConfig.from_pretrained(config["model_name"])
-            ml_model = config["model_class"](model_config).to(self.device).eval()
+
+            # Step 1: Load weights file and detect number of classes
+            detected_classes = self._detect_num_classes_from_weights(custom_weights_path)
+
+            # Step 2: Create model with detected number of classes (or default if not detected)
+            if detected_classes is not None:
+                print(f"🔍 Auto-detected {detected_classes} classes from weights file")
+                print(f"🔄 Creating model architecture for {detected_classes} classes...")
+                model_config = AutoConfig.from_pretrained(config["model_name"])
+                model_config.num_labels = detected_classes
+
+                ml_model = config["model_class"](model_config).to(self.device).eval()
+                print(f"   ✅ Model created with {detected_classes} output classes")
+            else:
+                # Could not detect, use default
+                print(f"⚠️  Could not auto-detect classes, using default (1000)")
+                model_config = AutoConfig.from_pretrained(config["model_name"])
+                ml_model = config["model_class"](model_config).to(self.device).eval()
+
+            # Step 3: Load the weights into the model
             self.ml_model = ml_model
             self._load_custom_weights(custom_weights_path)
 
@@ -291,8 +313,47 @@ class Model(nn.Module):
 
         print(f"✅ {config['description']} loaded successfully!")
 
+    def _detect_num_classes_from_weights(self, weights_path: str) -> Optional[int]:
+        """
+        Detect the number of output classes from a weights file.
+
+        Returns:
+            Number of classes if detected, None otherwise
+        """
+        try:
+            # Load weights file
+            if weights_path.endswith('.safetensors'):
+                try:
+                    from safetensors.torch import load_file
+                    state_dict = load_file(weights_path)
+                except ImportError:
+                    print("⚠️  safetensors library not available")
+                    return None
+            else:
+                state_dict = torch.load(weights_path, map_location='cpu', weights_only=False)
+
+            # Handle different state dict formats
+            if isinstance(state_dict, dict):
+                if 'state_dict' in state_dict:
+                    state_dict = state_dict['state_dict']
+                elif 'model' in state_dict:
+                    state_dict = state_dict['model']
+
+            # Look for classifier weight in state dict
+            for key in state_dict.keys():
+                # Check for common classifier layer names
+                if 'classifier.weight' in key or 'classifier.1.weight' in key or 'head.weight' in key:
+                    num_classes = state_dict[key].shape[0]
+                    return num_classes
+
+            return None
+
+        except Exception as e:
+            print(f"⚠️  Could not detect classes from weights: {str(e)}")
+            return None
+
     def _load_custom_weights(self, weights_path: str):
-        """Load custom weights into the model."""
+        """Load custom weights into the model (architecture already configured)."""
         try:
             # Load weights
             if weights_path.endswith('.safetensors'):
@@ -302,7 +363,7 @@ class Model(nn.Module):
                 except ImportError:
                     raise ImportError("safetensors library required for .safetensors files")
             else:
-                state_dict = torch.load(weights_path, map_location=self.device)
+                state_dict = torch.load(weights_path, map_location=self.device, weights_only=False)
 
             # Handle different state dict formats
             if isinstance(state_dict, dict):
@@ -311,20 +372,21 @@ class Model(nn.Module):
                 elif 'model' in state_dict:
                     state_dict = state_dict['model']
 
-            # Try to load the state dict
+            # Load the state dict (model architecture already matches)
             try:
                 self.ml_model.load_state_dict(state_dict, strict=True)
-                print(f"✅ Successfully loaded custom weights from {weights_path}")
+                print(f"✅ Successfully loaded custom weights")
             except RuntimeError as e:
                 # Try loading with strict=False for partial matches
+                print(f"⚠️  Strict loading failed, trying with strict=False...")
                 missing_keys, unexpected_keys = self.ml_model.load_state_dict(state_dict, strict=False)
 
                 if missing_keys:
-                    print(f"⚠️ Missing keys in custom weights: {missing_keys[:5]}...")
+                    print(f"⚠️  Missing keys: {missing_keys[:5]}...")
                 if unexpected_keys:
-                    print(f"⚠️ Unexpected keys in custom weights: {unexpected_keys[:5]}...")
+                    print(f"⚠️  Unexpected keys: {unexpected_keys[:5]}...")
 
-                print(f"✅ Loaded custom weights with some mismatches from {weights_path}")
+                print(f"✅ Loaded custom weights (with some mismatches)")
 
         except Exception as e:
             print(f"❌ Error loading custom weights: {str(e)}")

@@ -64,7 +64,7 @@ def show_pred(logits: torch.Tensor, topk: int = 3):
 
     # Create formatted string of predictions with truncation
     str_ = "\n".join([
-        f"{(id_to_class[top_labels[i]][:27] + '...') if len(id_to_class[top_labels[i]]) > 30 else id_to_class[top_labels[i]]}:{top_probas[i]:.2f}"
+        f"{(get_target(top_labels[i])[:27] + '...') if len(get_target(top_labels[i])) > 30 else get_target(top_labels[i])}:{top_probas[i]:.2f}"
         for i in range(topk)
     ])
     return str_
@@ -93,6 +93,13 @@ def show_img(img: np.ndarray):
 # Class and Label Utilities
 # ==========================
 def get_idx(class_label: str):
+    # Handle numeric class labels for custom models (e.g., "0", "1", "2")
+    try:
+        return int(class_label)
+    except ValueError:
+        pass
+
+    # Handle ImageNet class names
     class_idx = class_to_id.get(class_label)
     if class_idx is None:
         raise ValueError(f"Class label '{class_label}' not found in id_to_class.")
@@ -102,9 +109,11 @@ def get_target_idx(class_label: str):
     return get_idx(class_label)
 
 def get_target(class_idx: int):
+    # Try ImageNet lookup first
     class_label = id_to_class.get(class_idx)
     if class_label is None:
-        raise ValueError(f"Class index '{class_idx}' not found in id_to_class.")
+        # For custom models, return a simple "Class N" label
+        return f"Class {class_idx}"
     return class_label
 
 def get_targets(batched_logits: torch.Tensor):
@@ -116,11 +125,27 @@ def get_targets(batched_logits: torch.Tensor):
 def substr_target_indices(substr: str):
     return [(i, label) for i, label in id_to_class.items() if substr in label]
 
-def get_target_label(class_label: str, device: str = "cuda"):
-    # Directly index the dictionary to get the class index
-    class_idx = get_idx(class_label)
+def get_target_label(class_label: str, num_classes: int = 1000, device: str = "cuda"):
+    # Check if class_label is a numeric string (for custom models)
+    try:
+        class_idx = int(class_label)
+        # Validate the index is in range
+        if class_idx < 0 or class_idx >= num_classes:
+            print(f"⚠️  Warning: Class index {class_idx} is out of range for {num_classes} classes.")
+            print(f"   Defaulting to class 0.")
+            class_idx = 0
+    except ValueError:
+        # Not a numeric string, treat as ImageNet class name
+        class_idx = get_idx(class_label)
 
-    target = ch.zeros((1, 1000), device=device)
+        # Handle custom models with fewer classes than ImageNet-1000
+        if class_idx >= num_classes:
+            print(f"⚠️  Warning: Target class '{class_label}' has ImageNet index {class_idx}, "
+                  f"but model only has {num_classes} classes.")
+            print(f"   Defaulting to class 0. For custom models, consider specifying target as class index (0-{num_classes-1}).")
+            class_idx = 0
+
+    target = ch.zeros((1, num_classes), device=device)
     target[0, class_idx] = 1  # Use advanced indexing for clarity
     return target
 
@@ -329,7 +354,7 @@ def analyze_logits_detailed(logits: torch.Tensor, target_class: str = None, top_
     top_probs = softmax_probs[range(softmax_probs.size(0)), top_indices]
 
     stats = [
-        (id_to_class[idx], count, top_probs[top_indices == idx].mean().item())
+        (get_target(idx), count, top_probs[top_indices == idx].mean().item())
         for idx, count in zip(class_indices.tolist(), counts.tolist())
     ]
 
@@ -370,6 +395,7 @@ def compute_spherical_coordinates(positions: np.ndarray, shift_azimuth: bool = T
         azimuth = ((azimuth + 90) % 360) - 180
     return azimuth, elevation, norm
 
+cartesian_to_spherical = compute_spherical_coordinates
 
 def spherical_to_cartesian(azimuth: np.ndarray, elevation: np.ndarray, distance: np.ndarray) -> np.ndarray:
     """
@@ -837,11 +863,14 @@ def create_logits_comparison_table(all_results: dict, target_class: str = None):
     """
 
     for type_, results in all_results.items():
+        # Infer num_classes from the shape of the logits
+        num_classes = results["initial_logits"][0].shape[-1]
+
         initial_analysis = analyze_logits_detailed(
-            np.concatenate(results["initial_logits"]).reshape(-1, 1000), target_class
+            np.concatenate(results["initial_logits"]).reshape(-1, num_classes), target_class
         )
         final_analysis = analyze_logits_detailed(
-            np.concatenate(results["final_logits"]).reshape(-1, 1000), target_class
+            np.concatenate(results["final_logits"]).reshape(-1, num_classes), target_class
         )
 
         html_table += f"""
@@ -964,3 +993,87 @@ def get_labels_correct(logits, true_class_name, topk=1):
     true_idx = int(get_idx(true_class_name))  # shape: (batch_size, 1)
     labels_correct = (topk_preds == true_idx).any(dim=1)  # shape: (batch_size,), bools
     return labels_correct
+
+
+def simulate_distance_change(image, current_distance, target_distance):
+    """
+    Simulate moving the camera further/closer by scaling image resolution.
+
+    Args:
+        image: numpy array or PIL Image
+        current_distance: current camera distance (r in spherical coords)
+        target_distance: desired camera distance
+
+    Returns:
+        Modified image as numpy array with scaled resolution
+    """
+    if isinstance(image, np.ndarray):
+        pil_image = Image.fromarray(image)
+    else:
+        pil_image = image
+
+    width, height = pil_image.size
+
+    # Distance ratio: moving further = smaller image (lower resolution)
+    distance_ratio = target_distance / current_distance
+
+    # Scale inversely with distance (further → smaller)
+    scale_factor = 1.0 / distance_ratio
+    new_width = max(1, int(width * scale_factor))
+    new_height = max(1, int(height * scale_factor))
+
+    resized = pil_image.resize((new_width, new_height), Image.LANCZOS)
+    return np.array(resized)
+
+def process_images_with_distance_variations(images, spherical_coords, distance_multipliers=[1.5, 2.0, 2.5], default_resolution=(224, 224), random_multipliers=False):
+    """
+    Create variations of images at different simulated distances.
+
+    Args:
+        images: list of image arrays
+        spherical_coords: numpy array of spherical coordinates (N, 3)
+        distance_multipliers: list of factors to multiply distance by
+        default_resolution: tuple (height, width) for reference resolution (default: (224, 224))
+
+    Returns:
+        augmented_images: list of all images (original + variations)
+        augmented_positions: numpy array of spherical coordinates (N_total, 3) [azimuth, elevation, r]
+        augmented_labels: list of tuples (label_type, multiplier, total_resolution)
+    """
+    augmented_images = []
+    augmented_positions = []
+    augmented_labels = []
+
+    for idx in tqdm(range(len(images))):
+        image = images[idx]
+        sph_coord = spherical_coords[idx]
+
+        # Unpack spherical coordinates
+        azimuth, elevation, current_r = float(sph_coord[0]), float(sph_coord[1]), float(sph_coord[2])
+
+        # Add original
+        orig_resolution = image.shape[:2] if len(image.shape) >= 2 else (image.shape[0], 1)
+        orig_total_res = int(np.prod(orig_resolution))  # Total pixels: width * height
+        augmented_images.append(image)
+        augmented_positions.append([azimuth, elevation, current_r])
+        augmented_labels.append(('original', 1.0, orig_total_res))
+
+        # Create variations at different distances
+        for mult in distance_multipliers:
+            mult = np.random.uniform(distance_multipliers[0], distance_multipliers[-1])
+            new_r = current_r * mult
+            modified_image = simulate_distance_change(image, current_r, new_r)
+
+            # Calculate total resolution for the modified image
+            new_resolution = modified_image.shape[:2] if len(modified_image.shape) >= 2 else (modified_image.shape[0], 1)
+            total_res = int(np.prod(new_resolution))  # Total pixels: width * height
+
+            augmented_images.append(modified_image)
+
+            # Store spherical position directly
+            augmented_positions.append([azimuth, elevation, new_r])
+            augmented_labels.append(('augmented', mult, total_res))
+
+    augmented_positions = np.array(augmented_positions)
+    return augmented_images, augmented_positions, augmented_labels
+

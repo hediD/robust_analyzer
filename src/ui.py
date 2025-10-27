@@ -78,13 +78,15 @@ def _expand_for_envmaps(
     envmap_paths: Optional[Sequence[str]],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Expand logits and camera positions to account for environment maps."""
+    # Infer num_classes from logits shape
+    num_classes = logits.shape[-1]
     n_env = _get_num_envmaps(envmap_paths)
     if n_env > 1:
         cams = cam_positions_stack.unsqueeze(2).expand(-1, -1, n_env, -1)
-        logits_2d = logits.reshape(-1, 1000)
+        logits_2d = logits.reshape(-1, num_classes)
         cameras_2d = cams.reshape(-1, 3)
     else:
-        logits_2d = logits.reshape(-1, 1000)
+        logits_2d = logits.reshape(-1, num_classes)
         cameras_2d = cam_positions_stack.reshape(-1, 3)
     return logits_2d, cameras_2d
 
@@ -146,9 +148,40 @@ def get_cached_imagenet_labels() -> Tuple[List[Tuple[int, str]], Dict[int, str]]
     return st.session_state["imagenet_labels_cache"]
 
 
-def create_target_class_selector() -> str:
+def get_class_label(class_idx: int, num_classes: int = 1000) -> str:
+    """
+    Get class label for a given index.
+    For ImageNet (1000 classes), use actual labels.
+    For custom models, use generic 'class_N' format.
+    """
+    if num_classes == 1000:
+        _, id_to_class = get_cached_imagenet_labels()
+        return id_to_class.get(class_idx, f"class_{class_idx}")
+    else:
+        return f"class_{class_idx}"
+
+
+def create_target_class_selector(num_classes: int = 1000) -> str:
     st.sidebar.subheader("🎯 Target Class Selection")
 
+    # For custom models with non-ImageNet classes, show simple numeric selection
+    if num_classes != 1000:
+        st.sidebar.info(f"📊 Custom model with {num_classes} classes detected")
+        st.sidebar.write("Select target class by index:")
+
+        selected_idx = st.sidebar.selectbox(
+            "🔢 Target Class Index:",
+            options=list(range(num_classes)),
+            index=0,
+            format_func=lambda x: f"Class {x}",
+            help=f"Select target class index (0 to {num_classes-1})",
+        )
+
+        st.sidebar.success(f"✅ Selected: Class {selected_idx}")
+        # Return the index as a string so it can be used throughout the system
+        return str(selected_idx)
+
+    # For ImageNet-1000 models, show full label selection
     class_options, id_to_class = get_cached_imagenet_labels()
     if not class_options:
         st.sidebar.warning("⚠️ Could not load ImageNet labels. Using text input.")
@@ -168,10 +201,10 @@ def create_target_class_selector() -> str:
             break
 
     selected_display = st.sidebar.selectbox(
-        "🔍 Search & Select ImageNet Class:",
+        "🔍 Search & Select Class:",
         display_options,
         index=default_idx,
-        help="Type to search through 1000 ImageNet classes, then select",
+        help="Type to search through ImageNet-1000 classes, then select",
     )
 
     if selected_display:
@@ -188,9 +221,7 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
     st.sidebar.header("📋 Configuration")
     st.sidebar.subheader("Model Parameters")
 
-    target_class = create_target_class_selector()
-
-    # Model selection
+    # Model selection FIRST (before target class)
     model_options = list(MODEL_CONFIGS.keys())
     model_display_names = [MODEL_CONFIGS[key]["description"] for key in model_options]
 
@@ -206,7 +237,7 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
 
     st.sidebar.success(f"✅ Selected: {MODEL_CONFIGS[selected_model]['description']}")
 
-    # Custom weights upload
+    # Custom weights upload - determine this BEFORE target class selector
     custom_weights_path = None
     with st.sidebar.expander("🔧 Custom Model Weights", expanded=False):
         st.write("**Upload custom pre-trained weights (optional)**")
@@ -310,6 +341,36 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
             else:
                 st.info("💡 Using default pre-trained weights")
 
+    # Detect num_classes from custom weights if available
+    num_classes = 1000  # Default to ImageNet
+    if custom_weights_path:
+        try:
+            # Load weights to detect num_classes
+            if custom_weights_path.endswith('.safetensors'):
+                from safetensors.torch import load_file
+                state_dict = load_file(custom_weights_path)
+            else:
+                state_dict = torch.load(custom_weights_path, map_location='cpu', weights_only=False)
+
+            # Handle nested dicts
+            if isinstance(state_dict, dict):
+                if 'state_dict' in state_dict:
+                    state_dict = state_dict['state_dict']
+                elif 'model' in state_dict:
+                    state_dict = state_dict['model']
+
+            # Look for classifier weight to detect num_classes
+            for key in state_dict.keys():
+                if 'classifier.weight' in key or 'classifier.1.weight' in key or 'head.weight' in key:
+                    num_classes = state_dict[key].shape[0]
+                    break
+        except Exception as e:
+            st.sidebar.warning(f"⚠️ Could not detect classes from weights: {str(e)}")
+            num_classes = 1000
+
+    # NOW create target class selector with knowledge of num_classes
+    target_class = create_target_class_selector(num_classes)
+
     batch_size = st.sidebar.number_input(
         "Batch Size",
         min_value=1,
@@ -411,6 +472,7 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
     )
     st.session_state["include_heatmap_global"] = include_heatmap
 
+
     return {
         "target_class": target_class,
         "model_name": selected_model,
@@ -427,6 +489,7 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
         "targeted": bool(targeted),
         "include_heatmap": include_heatmap,
         "min_max_proportion": min_max_proportion,
+        "num_classes": int(num_classes),  # ADD THIS LINE
     }
 
 
@@ -1005,8 +1068,10 @@ def render_image_at_position(
                 target_class_ranking = int((sorted_indices == target_idx).nonzero(as_tuple=True)[0].item()) + 1
                 target_class_confidence = float(torch.softmax(pred_logits, dim=0)[target_idx].item())
 
-            _, id_to_class = get_cached_imagenet_labels()
-            pred_class = id_to_class.get(pred_class_idx, f"class {pred_class_idx}")
+            # Get config to determine num_classes
+            config = st.session_state.get("config", {})
+            num_classes = config.get("num_classes", 1000)
+            pred_class = get_class_label(pred_class_idx, num_classes)
 
             camera_pos = scene_params["camera"][batch_idx:batch_idx + 1]
             azimuth, elevation, distance = utils.compute_spherical_coordinates(camera_pos.cpu().numpy())
@@ -1644,7 +1709,8 @@ def visualize_results(results: Dict, config: Dict):
                     filtered_cams = cams_stack
 
                 # Reshape both to 2D
-                logits2d = filtered_logits.reshape(-1, 1000)  # [runs*batch, classes]
+                num_classes = filtered_logits.shape[-1]  # Infer from shape
+                logits2d = filtered_logits.reshape(-1, num_classes)  # [runs*batch, classes]
                 cams2d = filtered_cams.reshape(-1, 3)  # [runs*batch, 3]
                 env_filter_idx = env_idx
         else:
@@ -1670,13 +1736,18 @@ def visualize_results(results: Dict, config: Dict):
             values, counts = np.unique(preds_top1, return_counts=True)
             order = np.argsort(-counts)
             top_n = min(5, len(order))
-            _, id_to_class = get_cached_imagenet_labels()
+
+            # Get num_classes from config
+            config = st.session_state.get("config", {})
+            num_classes = config.get("num_classes", 1000)
             for rank in range(top_n):
                 cls_id = int(values[order[rank]])
                 cnt = int(counts[order[rank]])
                 pct = (cnt / total_positions) * 100.0
-                label = id_to_class.get(cls_id, f"class {cls_id}")
-                st.write(f"{rank+1}. {label[:30]}... — {cnt} ({pct:.1f}%)")
+                label = get_class_label(cls_id, num_classes)
+                # Only truncate ImageNet labels (they're long), show full generic class names
+                display_label = label[:30] + "..." if num_classes == 1000 and len(label) > 30 else label
+                st.write(f"{rank+1}. {display_label} — {cnt} ({pct:.1f}%)")
 
         with st.expander("📊 Environment Statistics", expanded=False):
             # Show environment breakdown if multiple environments
@@ -1684,13 +1755,14 @@ def visualize_results(results: Dict, config: Dict):
                 st.subheader("📈 Results by Environment")
 
                 # Split results by environment
-                logits_full = logits_stack.reshape(-1, n_envmaps, 1000)
+                num_classes = logits_stack.shape[-1]  # Infer from shape
+                logits_full = logits_stack.reshape(-1, n_envmaps, num_classes)
 
                 env_stats = []
                 topk = st.session_state.get("topk_value", 1)
                 for i in range(n_envmaps):
                     env_logits = logits_full[:, i, :]
-                    env_logits_flat = env_logits.reshape(-1, 1000)
+                    env_logits_flat = env_logits.reshape(-1, num_classes)
 
                     labels_correct_env = utils.get_labels_correct(env_logits_flat, config["target_class"], topk=topk)
                     accuracy = (labels_correct_env.sum() / len(labels_correct_env) * 100).item()
@@ -1860,13 +1932,17 @@ def visualize_results(results: Dict, config: Dict):
                 confs = target_probs[selected_indices]
                 st.caption(f"**Confidence range:** {confs.min():.3f} - {confs.max():.3f} (avg: {confs.mean():.3f})")
                 with st.expander("🔍 Preview selected positions", expanded=False):
-                    _, id_to_class = get_cached_imagenet_labels()
+                    # Get num_classes from config
+                    config = st.session_state.get("config", {})
+                    num_classes = config.get("num_classes", 1000)
                     for i, pos_idx in enumerate(selected_indices):
                         conf = target_probs[pos_idx]
                         pred_idx = int(torch.argmax(logits2d[pos_idx]).item())
-                        pred_class = id_to_class.get(pred_idx, f"class {pred_idx}")
+                        pred_class = get_class_label(pred_idx, num_classes)
                         status = "✅" if pred_idx == target_idx else "❌"
-                        st.write(f"{i+1}. **Position {pos_idx}:** {status} {conf:.3f} confidence → {pred_class[:25]}...")
+                        # Only truncate ImageNet labels (they're long), show full generic class names
+                        display_class = pred_class[:25] + "..." if num_classes == 1000 and len(pred_class) > 25 else pred_class
+                        st.write(f"{i+1}. **Position {pos_idx}:** {status} {conf:.3f} confidence → {display_class}")
 
             if st.button("🎨 Render Selected Positions", type="primary", disabled=len(selected_indices) == 0):
                 if len(selected_indices) > 0:
