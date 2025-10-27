@@ -63,14 +63,23 @@ def _imagenet_labels_path() -> Optional[Path]:
     return None
 
 
+def _get_num_envmaps(envmap_paths: Optional[Sequence[str]]) -> int:
+    """Get the number of environment maps from the paths."""
+    if not envmap_paths:
+        return 1
+    # Filter for actual HDR/EXR files
+    valid_paths = [p for p in envmap_paths if p.lower().endswith(('.hdr', '.exr'))]
+    return len(valid_paths) if valid_paths else 1
+
+
 def _expand_for_envmaps(
     logits: torch.Tensor,
     cam_positions_stack: torch.Tensor,
     envmap_paths: Optional[Sequence[str]],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Expand logits and camera positions to account for environment maps."""
-    if envmap_paths:
-        n_env = len(envmap_paths)
+    n_env = _get_num_envmaps(envmap_paths)
+    if n_env > 1:
         cams = cam_positions_stack.unsqueeze(2).expand(-1, -1, n_env, -1)
         logits_2d = logits.reshape(-1, 1000)
         cameras_2d = cams.reshape(-1, 3)
@@ -305,7 +314,7 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
         "Batch Size",
         min_value=1,
         max_value=4,
-        value=2,
+        value=4,
         step=1,
         help="Number of viewpoints to optimize in parallel",
     )
@@ -331,7 +340,7 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
         "Adversarial Optimization Steps",
         min_value=1,
         max_value=100,
-        value=5,
+        value=1,
         step=1,
         help="Number of optimization steps per adversarial run",
     )
@@ -945,7 +954,12 @@ def render_image_at_position(
     envmap_idx: int = 0,
 ) -> Optional[Dict]:
     try:
-        total_envmaps = len(results.get("envmap_paths", [])) or 1
+        # Get actual number of environments from envmap_paths
+        envmap_paths = results.get("envmap_paths", [])
+        total_envmaps = _get_num_envmaps(envmap_paths)
+
+        # Load stored logits for later use
+        stored_logits = torch.stack(results["final_logits"])
 
         # Structure: (num_runs * batch_size * n_envmaps)
         positions_per_run = robust_analyzer.batch_size * total_envmaps
@@ -974,7 +988,6 @@ def render_image_at_position(
             if image_np.max() <= 1.0:
                 image_np = (image_np * 255).astype(np.uint8)
 
-            stored_logits = torch.stack(results["final_logits"])
             if len(stored_logits.shape) == 4:  # [runs, batch, env, classes]
                 pred_logits = stored_logits[run_idx, batch_idx, env_idx]
             else:  # [runs, batch, classes]
@@ -1365,7 +1378,6 @@ def download_all_images_package(
         return buf.getvalue()
 
 
-# Carousel
 def create_image_carousel(rendered_images: Sequence[Dict]) -> None:
     if not rendered_images:
         st.info("No images to display")
@@ -1391,6 +1403,14 @@ def create_image_carousel(rendered_images: Sequence[Dict]) -> None:
             st.rerun()
 
     st.markdown("---")
+
+    if current.get("env_idx") is not None and "results" in st.session_state:
+        results = st.session_state["results"]
+        envmap_paths = results.get("envmap_paths", [])
+        if envmap_paths and current["env_idx"] < len(envmap_paths):
+            env_name = Path(envmap_paths[current["env_idx"]]).name
+            st.caption(f"🌍 **Environment:** {env_name}")
+
     d1, d2, _, d4, _ = st.columns([1, 2, 0.5, 2, 1])
 
     include_heatmap = st.session_state.get("include_heatmap_global", True)
@@ -1403,7 +1423,11 @@ def create_image_carousel(rendered_images: Sequence[Dict]) -> None:
 
                 logits = torch.stack(results["final_logits"])
                 cameras = torch.stack([x["camera"] for x in results["final_scene_params"]])
-                logits2d, cams2d = _expand_for_envmaps(logits, cameras, results.get("envmap_paths"))
+
+                # Get envmap_paths from results
+                envmap_paths = results.get("envmap_paths", [])
+
+                logits2d, cams2d = _expand_for_envmaps(logits, cameras, envmap_paths)
 
                 topk = st.session_state.get("topk_value", 1)
                 try:
@@ -1456,7 +1480,11 @@ def create_image_carousel(rendered_images: Sequence[Dict]) -> None:
 
                         logits = torch.stack(results["final_logits"])
                         cameras = torch.stack([x["camera"] for x in results["final_scene_params"]])
-                        logits2d, cams2d = _expand_for_envmaps(logits, cameras, results.get("envmap_paths"))
+
+                        # Get envmap_paths from results
+                        envmap_paths = results.get("envmap_paths", [])
+
+                        logits2d, cams2d = _expand_for_envmaps(logits, cameras, envmap_paths)
 
                         topk = st.session_state.get("topk_value", 1)
                         try:
@@ -1486,88 +1514,85 @@ def create_image_carousel(rendered_images: Sequence[Dict]) -> None:
 
                                     metadata = {
                                         "position_idx": image_info["position_idx"],
-                                        "azimuth": float(image_info["azimuth"]),
-                                        "elevation": float(image_info["elevation"]),
-                                        "distance": float(image_info["distance"]),
-                                        "prediction": image_info["prediction"],
-                                        "confidence": float(image_info["confidence"]),
-                                        "class_idx": int(image_info["class_idx"]),
-                                        "run_idx": image_info["run_idx"],
-                                        "batch_idx": image_info["batch_idx"],
-                                        "env_idx": image_info["env_idx"],
-                                        "target_class_ranking": image_info.get("target_class_ranking"),
-                                        "target_class_confidence": image_info.get("target_class_confidence"),
+                                        "prediction": image_info.get("prediction", "N/A"),
+                                        "confidence": image_info.get("confidence", 0),
+                                        "azimuth": image_info.get("azimuth", 0),
+                                        "elevation": image_info.get("elevation", 0),
+                                        "distance": image_info.get("distance", 0),
+                                        "env_idx": image_info.get("env_idx", 0),
                                     }
-                                    zipf.writestr(f"position_{image_info['position_idx']:03d}_metadata.json",
-                                                json.dumps(metadata, indent=2))
 
                         zbuf.seek(0)
                         st.session_state[cache_key] = zbuf.getvalue()
-                except Exception as e:
-                    st.error(f"❌ Error creating images: {str(e)}")
-                    st.code(traceback.format_exc())
-                    st.session_state[cache_key] = None
 
-            if st.session_state.get(cache_key):
-                file_suffix = "composite" if include_heatmap else "render"
-                image_type = "composite images" if include_heatmap else "rendered images"
+                except Exception as e:
+                    st.error(f"❌ Error preparing download: {str(e)}")
+
+            if cache_key in st.session_state:
                 st.download_button(
-                    label=f"📥 Download {image_type.title()}",
+                    label="📦 Download All Images (ZIP)",
                     data=st.session_state[cache_key],
-                    file_name=f"robustness_all_images_{len(rendered_images)}_positions_{file_suffix}.zip",
+                    file_name="robustness_positions_batch.zip",
                     mime="application/zip",
-                    key=f"dl_btn_all_{len(rendered_images)}_{include_heatmap}",
+                    key=f"dl_btn_batch_{cache_key}",
                     use_container_width=True
                 )
-            else:
-                st.button("📥 Download Rendered Images", disabled=True, help="Error preparing download", use_container_width=True)
         else:
-            st.button("📥 Download Rendered Images", disabled=True, help="Analysis data not available", use_container_width=True)
+            st.button("📦 Download All Images (ZIP)", disabled=True, help="Analysis data not available", use_container_width=True)
 
-    st.info("💡 **Tip:** Use the Previous/Next buttons to navigate, or download composite PNG images directly")
+    st.markdown("---")
+    col_img, col_info = st.columns([2, 1])
 
-    c1, c2 = st.columns([0.8, 1.2])
-    with c1:
-        # Convert numpy array to PIL Image to avoid Streamlit caching issues
-        image_array = current["image"].copy().astype(np.uint8)
-        st.image(
-            image_array,
-            caption=f"Position {current['position_idx']}",
-            use_container_width=True
+    with col_img:
+        render_img = Image.fromarray(current["image"])
+        st.image(render_img, use_container_width=True)
+
+    with col_info:
+        st.write(""); st.write("")
+        st.write("**Prediction Info:**")
+        st.write(f"🎯 **Class:** {current['prediction']}")
+        st.write(f"📊 **Confidence:** {current['confidence']:.3f}")
+        if current.get("target_class_ranking"):
+            st.write(f"🏆 **Target Ranking:** #{current['target_class_ranking']}")
+        if current.get("target_class_confidence"):
+            st.write(f"🎪 **Target Confidence:** {current['target_class_confidence']:.3f}")
+
+        st.write(""); st.write("")
+        st.write("**Camera Position:**")
+        st.write(f"🧭 **Azimuth:** {current['azimuth']:.2f}°")
+        st.write(f"📈 **Elevation:** {current['elevation']:.2f}°")
+        st.write(f"📏 **Distance:** {current['distance']:.3f}")
+
+        st.write(""); st.write("")
+        st.write("**Metadata:**")
+        st.write(f"📍 **Position Index:** {current['position_idx']}")
+        st.write(f"🏃 **Run:** {current['run_idx']}")
+        st.write(f"🖼️ **Batch:** {current['batch_idx']}")
+
+    st.markdown("---")
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        include_heatmap = st.checkbox(
+            "Include Heatmap Overlay",
+            value=st.session_state.get("include_heatmap_global", True),
+            help="Show heatmap overlay on top of rendered images"
         )
-    with c2:
-        st.write("**Position Information:**")
-        st.write(f"• **Position Index:** {current['position_idx']}")
-        st.write(f"• **Azimuth:** {current['azimuth']:.1f}°")
-        st.write(f"• **Elevation:** {current['elevation']:.1f}°")
-        st.write(f"• **Distance:** {current['distance']:.2f}")
+        st.session_state["include_heatmap_global"] = include_heatmap
+    with col_b:
+        st.write("")
+        if st.button("🔄 Rerender All", help="Re-render all selected images"):
+            st.session_state["rendered_images"] = []
+            st.session_state["image_cache_key"] = None
+            st.rerun()
+    with col_c:
+        st.write("")
+        if st.button("Clear Selection", help="Clear selected positions and start over"):
+            st.session_state["selected_positions"] = []
+            st.session_state["rendered_images"] = []
+            st.session_state["trigger_render"] = False
+            st.rerun()
 
-        st.write("**Prediction Information:**")
-        st.write(f"• **Predicted Class:** {current['prediction'][:40]}...")
-        st.write(f"• **Confidence:** {current['confidence']:.3f}")
-
-        if "target_class" in st.session_state:
-            target_idx = _get_idx_safe(st.session_state.get("target_class", ""))
-            status = "✅ Correct" if current["class_idx"] == target_idx else "❌ Incorrect"
-            st.write(f"• **Status:** {status}")
-
-            if current.get("target_class_ranking") is not None:
-                ranking = current["target_class_ranking"]
-                target_confidence = current.get("target_class_confidence", 0.0)
-
-                if ranking % 10 == 1 and ranking % 100 != 11:
-                    suffix = "st"
-                elif ranking % 10 == 2 and ranking % 100 != 12:
-                    suffix = "nd"
-                elif ranking % 10 == 3 and ranking % 100 != 13:
-                    suffix = "rd"
-                else:
-                    suffix = "th"
-
-                st.write(f"• **Target Class Ranking:** {ranking}{suffix} place (confidence: {target_confidence:.3f})")
-
-
-# Results Visualization
 def visualize_results(results: Dict, config: Dict):
     st.header("📊 Results Visualization")
 
@@ -1575,7 +1600,67 @@ def visualize_results(results: Dict, config: Dict):
         logits_stack = torch.stack(results["final_logits"])
         cams_stack = torch.stack([x["camera"] for x in results["final_scene_params"]])
 
-        logits2d, cams2d = _expand_for_envmaps(logits_stack, cams_stack, results.get("envmap_paths"))
+        # Get environment information from results
+        envmap_paths = results.get("envmap_paths", [])
+        n_envmaps = _get_num_envmaps(envmap_paths)
+
+        # Debug: Show shapes
+        if st.checkbox("🐛 Show Debug Info", value=False, key="debug_shapes"):
+            st.write(f"**logits_stack shape:** {logits_stack.shape}")
+            st.write(f"**cams_stack shape:** {cams_stack.shape}")
+            st.write(f"**Number of environments:** {n_envmaps}")
+            st.write(f"**envmap_paths:** {envmap_paths}")
+
+        st.subheader("🌍 Environment Selection")
+
+        if n_envmaps > 1:
+            env_options = ["All Environments"] + [f"Environment {i+1}: {Path(envmap_paths[i]).name}" for i in range(n_envmaps)]
+            selected_env = st.selectbox(
+                "Select Environment to Visualize",
+                options=range(len(env_options)),
+                format_func=lambda x: env_options[x],
+                index=0,
+                help=f"Choose to view all environments together or filter by specific environment (Total: {n_envmaps})"
+            )
+
+            if selected_env == 0:  # All environments
+                st.info(f"📊 Showing results from **all {n_envmaps} environments** combined")
+                logits2d, cams2d = _expand_for_envmaps(logits_stack, cams_stack, envmap_paths)
+                env_filter_idx = None
+            else:  # Specific environment
+                env_idx = selected_env - 1
+                st.success(f"✅ Filtered to **{Path(envmap_paths[env_idx]).name}**")
+
+                # First expand cameras for all environments, then filter
+                # Expand cameras to match environment dimension
+                cams_expanded = cams_stack.unsqueeze(2).expand(-1, -1, n_envmaps, -1)
+
+                # Extract only the selected environment's data
+                if len(logits_stack.shape) == 4:  # [runs, batch, env, classes]
+                    filtered_logits = logits_stack[:, :, env_idx, :]  # [runs, batch, classes]
+                    filtered_cams = cams_expanded[:, :, env_idx, :]  # [runs, batch, 3]
+                else:
+                    filtered_logits = logits_stack
+                    filtered_cams = cams_stack
+
+                # Reshape both to 2D
+                logits2d = filtered_logits.reshape(-1, 1000)  # [runs*batch, classes]
+                cams2d = filtered_cams.reshape(-1, 3)  # [runs*batch, 3]
+                env_filter_idx = env_idx
+        else:
+            st.info(f"📊 Using **single environment**: {Path(envmap_paths[0]).name if envmap_paths else 'No environment map'}")
+            logits2d, cams2d = _expand_for_envmaps(logits_stack, cams_stack, envmap_paths)
+            env_filter_idx = None
+
+        # Store selected environment in session state for rendering
+        st.session_state["selected_env_idx"] = env_filter_idx if env_filter_idx is not None else 0
+
+        # Debug: Show processed shapes
+        if st.session_state.get("debug_shapes", False):
+            st.write(f"**After processing:**")
+            st.write(f"- logits2d shape: {logits2d.shape}")
+            st.write(f"- cams2d shape: {cams2d.shape}")
+            st.write(f"- env_filter_idx: {env_filter_idx}")
 
         total_positions = len(logits2d)
         assert len(cams2d) == total_positions, f"Mismatch: {len(cams2d)} camera positions vs {len(logits2d)} logit entries"
@@ -1592,6 +1677,35 @@ def visualize_results(results: Dict, config: Dict):
                 pct = (cnt / total_positions) * 100.0
                 label = id_to_class.get(cls_id, f"class {cls_id}")
                 st.write(f"{rank+1}. {label[:30]}... — {cnt} ({pct:.1f}%)")
+
+        with st.expander("📊 Environment Statistics", expanded=False):
+            # Show environment breakdown if multiple environments
+            if n_envmaps > 1 and env_filter_idx is None:  # Only when viewing all environments
+                st.subheader("📈 Results by Environment")
+
+                # Split results by environment
+                logits_full = logits_stack.reshape(-1, n_envmaps, 1000)
+
+                env_stats = []
+                topk = st.session_state.get("topk_value", 1)
+                for i in range(n_envmaps):
+                    env_logits = logits_full[:, i, :]
+                    env_logits_flat = env_logits.reshape(-1, 1000)
+
+                    labels_correct_env = utils.get_labels_correct(env_logits_flat, config["target_class"], topk=topk)
+                    accuracy = (labels_correct_env.sum() / len(labels_correct_env) * 100).item()
+
+                    env_name = Path(envmap_paths[i]).name
+                    env_stats.append({
+                        "Environment": env_name,
+                        "Accuracy": f"{accuracy:.1f}%",
+                        "Correct": f"{int(labels_correct_env.sum())}/{len(labels_correct_env)}"
+                    })
+
+                import pandas as pd
+                st.dataframe(pd.DataFrame(env_stats), use_container_width=True)
+            else:
+                st.info("ℹ️ Switch to 'All Environments' above to see per-environment statistics")
 
         st.subheader("🎯 Camera Position")
         topk = st.session_state.get("topk_value", 1)
@@ -1777,11 +1891,26 @@ def visualize_results(results: Dict, config: Dict):
 
             if valid_positions:
                 st.session_state["target_class"] = config["target_class"]
-                cache_key = f"{sorted(valid_positions)}_{id(robust_analyzer)}"
+                # Get selected environment index
+                selected_env_idx = st.session_state.get("selected_env_idx", 0)
+                cache_key = f"{sorted(valid_positions)}_{selected_env_idx}_{id(robust_analyzer)}"
 
                 if st.session_state.get("image_cache_key") != cache_key:
                     with st.status("🎨 Rendering selected images...", expanded=True) as status:
-                        rendered_images = render_multiple_images(robust_analyzer, results, valid_positions)
+                        # Pass environment index to render function
+                        rendered_images = []
+                        progress_bar_render = st.progress(0)
+                        for i, pos_idx in enumerate(valid_positions):
+                            progress_bar_render.progress((i + 1) / len(valid_positions))
+                            image_info = render_image_at_position(
+                                robust_analyzer,
+                                results,
+                                pos_idx,
+                                envmap_idx=selected_env_idx
+                            )
+                            if image_info:
+                                rendered_images.append(image_info)
+
                         st.session_state["rendered_images"] = rendered_images
                         st.session_state["image_cache_key"] = cache_key
                         st.session_state["carousel_index"] = 0
@@ -1823,7 +1952,7 @@ def visualize_results(results: Dict, config: Dict):
                 labels_correct.numpy(),
                 title=f"Analysis of 3D Spherical Distribution of Model Classification",
                 mode="distributions",
-                show_distance=False
+                show_distance=True
             )
             dist_fig = plt.gcf()
             col1, col2, col3 = st.columns([1, 2, 1])
@@ -1842,7 +1971,6 @@ def visualize_results(results: Dict, config: Dict):
         st.error(f"❌ Error in processing results: {str(e)}")
         st.code(traceback.format_exc())
         return None
-
 
 # Analysis
 def run_analysis(
@@ -1911,6 +2039,10 @@ def run_analysis(
             lr=config["learning_rate"],
             progress_callback=progress_callback,
         )
+
+        # Add envmap_paths to results so we can properly detect number of environments
+        results["envmap_paths"] = envmap_paths
+
         progress_bar.progress(1.0)
         status_text.success(
             f"✅ Analysis completed successfully! Processed {config['num_runs']} runs "
@@ -2033,7 +2165,11 @@ def download_results(results: Dict, plot_data: Optional[Dict]) -> None:
 
             logits_stack = torch.stack(results["final_logits"])
             cams_stack = torch.stack([x["camera"] for x in results["final_scene_params"]])
-            logits2d, cams2d = _expand_for_envmaps(logits_stack, cams_stack, results.get("envmap_paths"))
+
+            # Get envmap_paths from results
+            envmap_paths = results.get("envmap_paths", [])
+
+            logits2d, cams2d = _expand_for_envmaps(logits_stack, cams_stack, envmap_paths)
 
             total_positions = len(cams2d)
 
@@ -3014,4 +3150,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main(
+    main()
