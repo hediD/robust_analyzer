@@ -31,7 +31,7 @@ from transformers import (
 import imageio.v3 as iio
 import time
 
-Image.MAX_IMAGE_PIXELS = None  # Ignore warning about Atlas texture can be very high resolution, will be downscaled
+Image.MAX_IMAGE_PIXELS = None  # Ignore warning about Atlas texture as it could have high resolution
 TEXTURE_MAX_IMAGE_PIXELS = 40_000_000  # limit it texture to 40M pixels, downscale to that if needed
 
 from model_configs import MODEL_CONFIGS

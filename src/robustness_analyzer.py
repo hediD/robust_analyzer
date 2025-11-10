@@ -40,7 +40,8 @@ class RobustnessAnalyzer:
         raster_settings: Optional[Dict] = {},
         model_name: str = "vit-large-patch16-224",
         custom_weights_path: Optional[str] = None,
-        min_max_proportion: Tuple[float, float] = (0.3, 0.8)
+        min_max_proportion: Tuple[float, float] = (0.3, 0.8),
+        custom_labels: Optional[Dict[int, str]] = None
     ):
         self.obj_path = obj_path
         self.texture_path = texture_path
@@ -53,6 +54,7 @@ class RobustnessAnalyzer:
         self.model_name = model_name
         self.custom_weights_path = custom_weights_path
         self.min_max_proportion = min_max_proportion
+        self.custom_labels = custom_labels
 
         # Default optimization settings if none provided
         self.nb_clusters = nb_clusters
@@ -201,6 +203,14 @@ class RobustnessAnalyzer:
                     run_avg_probabilities = []
                     run_losses = []
 
+                    # Initialize variables to None to detect if they were never assigned
+                    logits = None
+                    loss = None
+                    logits_flat = None
+                    target_flat = None
+                    successful_iterations = 0
+                    oom_count = 0
+
                     assert num_iterations > 0, "num_iterations must be greater than 0"
                     if num_iterations == 0:
                         logits = self.model(return_render=False, with_grad=False).detach().cpu().clone()
@@ -257,9 +267,9 @@ class RobustnessAnalyzer:
 
                             self._optimizer_step()
 
-                            # Analyze logits
+                            # Analyze logits (pass custom labels if available)
                             class_name, class_count, avg_prob = analyze_logits(
-                                logits_flat, self.target_class
+                                logits_flat, self.target_class, custom_labels=self.custom_labels
                             )
 
                             # Store current iteration's loss and average probability
@@ -281,21 +291,67 @@ class RobustnessAnalyzer:
                             self._current_results['loss'].append(loss_)
                             self._current_results['avg_probability'].append(avg_prob)
 
+                            # Mark successful iteration
+                            successful_iterations += 1
+
                         except RuntimeError as iter_err:
                             torch.cuda.empty_cache()
                             # handle OOM by reducing batch size and reinitializing the model
                             if "out of memory" in str(iter_err).lower():
+                                oom_count += 1
+                                pbar.write(f"⚠️  GPU OOM error in iteration {i} (OOM #{oom_count})")
+
                                 # if batch size is 1, we cannot reduce further
                                 if self.batch_size == 1:
-                                    raise Exception("Batch size is 1, cannot reduce further, reduce image size or number of environments")
+                                    raise Exception(
+                                        f"🚨 GPU Out of Memory Error!\n\n"
+                                        f"Cannot reduce batch size below 1.\n\n"
+                                        f"💡 Suggestions:\n"
+                                        f"  • Reduce image size in Rendering Settings\n"
+                                        f"  • Use fewer environment maps\n"
+                                        f"  • Restart the Streamlit app to clear GPU memory\n"
+                                        f"  • Use a GPU with more VRAM"
+                                    )
+
                                 self.batch_size = self.batch_size // 2
-                                pbar.write(f"GPU OOM error in iteration {i}, reducing batch size to {self.batch_size} and retrying...")
+                                pbar.write(f"   Reducing batch size to {self.batch_size} and retrying...")
                                 self._setup_model()  # Reinitialize with new batch size
                                 self._setup_target()  # Update the target tensor with new batch size
                                 self.model.reset_cache() # remove cached mesh and texture to adjust to new batch size
+
+                                # If we've had too many OOM errors, raise a more helpful error
+                                if oom_count >= 3:
+                                    raise Exception(
+                                        f"🚨 Persistent GPU Out of Memory Errors!\n\n"
+                                        f"Attempted to reduce batch size {oom_count} times but still encountering OOM.\n\n"
+                                        f"💡 Suggestions:\n"
+                                        f"  • Reduce image size significantly (try 256 or 128)\n"
+                                        f"  • Use only 1 environment map\n"
+                                        f"  • Restart the Streamlit app completely to clear GPU memory\n"
+                                        f"  • Close other GPU-intensive applications\n"
+                                        f"  • Consider using a GPU with more VRAM"
+                                    )
                             else:
-                                pbar.write(f"Error in iteration {i}: {iter_err}")
+                                pbar.write(f"❌ Error in iteration {i}: {iter_err}")
                             continue
+
+                    # Check if any iterations were successful
+                    if logits is None or successful_iterations == 0:
+                        error_msg = (
+                            f"🚨 All iterations failed for run {run + 1}!\n\n"
+                            f"No successful iterations completed.\n"
+                        )
+                        if oom_count > 0:
+                            error_msg += (
+                                f"\nEncountered {oom_count} GPU Out of Memory error(s).\n\n"
+                                f"💡 Suggestions:\n"
+                                f"  • Restart the Streamlit app to clear GPU memory\n"
+                                f"  • Reduce image size significantly (try 256 or 128)\n"
+                                f"  • Use fewer environment maps (try just 1)\n"
+                                f"  • Reduce batch size in the configuration\n"
+                                f"  • Close other applications using GPU memory"
+                            )
+                        raise Exception(error_msg)
 
                     # Store run-level results
                     self._current_results['loss'].append(run_losses)
@@ -309,14 +365,29 @@ class RobustnessAnalyzer:
                     if self.optimize_kwargs.get("texture", False):
                         self._current_results['final_texture'].append(to_numpy(self.model._fill_texture()).copy())
 
-                except Exception as run_err:
-                    raise run_err
-                    pbar.write(f"Error in run {run}: {run_err}")
-                    continue
+                    # free gpu memory (inside try block to ensure variables exist)
+                    if logits is not None:
+                        del logits
+                    if loss is not None:
+                        del loss
+                    if logits_flat is not None:
+                        del logits_flat
+                    if target_flat is not None:
+                        del target_flat
+                    torch.cuda.empty_cache()
 
-                # free gpu memory
-                del logits, loss, logits_flat, target_flat
-                torch.cuda.empty_cache()
+                except Exception as run_err:
+                    # Clean up any allocated variables before raising
+                    if logits is not None:
+                        del logits
+                    if loss is not None:
+                        del loss
+                    if logits_flat is not None:
+                        del logits_flat
+                    if target_flat is not None:
+                        del target_flat
+                    torch.cuda.empty_cache()
+                    raise run_err
 
         return self._current_results
 

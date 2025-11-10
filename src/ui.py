@@ -11,6 +11,7 @@ import hashlib
 import tempfile
 import zipfile
 import traceback
+import gc
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -148,12 +149,141 @@ def get_cached_imagenet_labels() -> Tuple[List[Tuple[int, str]], Dict[int, str]]
     return st.session_state["imagenet_labels_cache"]
 
 
-def get_class_label(class_idx: int, num_classes: int = 1000) -> str:
+def load_custom_labels_metadata() -> Dict:
+    """Load custom class labels metadata from cache."""
+    cache_dir = get_cache_dir()
+    metadata_file = cache_dir / "custom_labels_metadata.json"
+    if metadata_file.exists():
+        try:
+            with open(metadata_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading custom labels metadata: {e}")
+    return {}
+
+
+def save_custom_labels_metadata(metadata: Dict):
+    """Save custom class labels metadata to cache."""
+    try:
+        cache_dir = get_cache_dir()
+        metadata_file = cache_dir / "custom_labels_metadata.json"
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+    except Exception as e:
+        print(f"Error saving custom labels metadata: {e}")
+
+
+def get_cached_custom_labels_for_model(model_name: str) -> Optional[Dict[int, str]]:
+    """Get cached custom labels for a specific model."""
+    metadata = load_custom_labels_metadata()
+    if model_name in metadata:
+        # Verify the file still exists
+        labels_info = metadata[model_name]
+        labels_path = Path(labels_info["path"])
+        if labels_path.exists():
+            try:
+                with open(labels_path, 'r') as f:
+                    labels = json.load(f)
+                # Convert string keys to int keys if necessary
+                return {int(k): v for k, v in labels.items()}
+            except Exception as e:
+                print(f"Error loading custom labels: {e}")
+                return None
+        else:
+            # Clean up metadata for missing file
+            del metadata[model_name]
+            save_custom_labels_metadata(metadata)
+    return None
+
+
+def remove_cached_custom_labels_for_model(model_name: str) -> bool:
+    """Remove cached custom labels for a specific model."""
+    metadata = load_custom_labels_metadata()
+    if model_name in metadata:
+        labels_info = metadata[model_name]
+        labels_path = Path(labels_info["path"])
+
+        # Remove the file if it exists
+        if labels_path.exists():
+            try:
+                labels_path.unlink()
+            except Exception as e:
+                print(f"Error removing labels file: {e}")
+                return False
+
+        # Remove from metadata
+        del metadata[model_name]
+        save_custom_labels_metadata(metadata)
+        return True
+    return False
+
+
+def cache_custom_labels_file(labels_file, model_name: str) -> str:
+    """
+    Cache uploaded custom labels JSON file for reuse.
+
+    Args:
+        labels_file: Streamlit uploaded file object
+        model_name: Name of the model architecture
+
+    Returns:
+        Path to cached labels file
+    """
+    cache_dir = get_cache_dir()
+    labels_cache_dir = cache_dir / "custom_labels"
+    labels_cache_dir.mkdir(exist_ok=True)
+
+    # Create hash of file content for caching
+    content = labels_file.read()
+    labels_file.seek(0)  # Reset file pointer
+
+    file_hash = hashlib.md5(content).hexdigest()
+    cached_labels_path = labels_cache_dir / f"{model_name}_{file_hash}.json"
+
+    # Validate JSON format
+    try:
+        labels_data = json.loads(content)
+        # Ensure it's a dict with numeric keys (or string numeric keys)
+        test_dict = {int(k): v for k, v in labels_data.items()}
+    except Exception as e:
+        raise ValueError(f"Invalid JSON format for class labels: {str(e)}")
+
+    # Save if not already cached
+    if not cached_labels_path.exists():
+        with open(cached_labels_path, "wb") as f:
+            f.write(content)
+        print(f"✅ Custom labels cached to {cached_labels_path}")
+    else:
+        print(f"✅ Using cached labels from {cached_labels_path}")
+
+    # Update metadata
+    metadata = load_custom_labels_metadata()
+    file_size_kb = len(content) / 1024
+    metadata[model_name] = {
+        "path": str(cached_labels_path),
+        "original_name": labels_file.name,
+        "file_hash": file_hash,
+        "file_size_kb": file_size_kb,
+        "timestamp": _now_iso(),
+        "model_name": model_name,
+        "num_labels": len(test_dict)
+    }
+    save_custom_labels_metadata(metadata)
+
+    return str(cached_labels_path)
+
+
+def get_class_label(class_idx: int, num_classes: int = 1000, custom_labels: Optional[Dict[int, str]] = None) -> str:
     """
     Get class label for a given index.
     For ImageNet (1000 classes), use actual labels.
-    For custom models, use generic 'class_N' format.
+    For custom models, use custom labels if provided, otherwise generic 'class_N' format.
     """
+    # First check if custom labels are provided
+    if custom_labels is not None and class_idx in custom_labels:
+        return custom_labels[class_idx]
+
+    # Fall back to ImageNet labels for 1000-class models
     if num_classes == 1000:
         _, id_to_class = get_cached_imagenet_labels()
         return id_to_class.get(class_idx, f"class_{class_idx}")
@@ -161,23 +291,31 @@ def get_class_label(class_idx: int, num_classes: int = 1000) -> str:
         return f"class_{class_idx}"
 
 
-def create_target_class_selector(num_classes: int = 1000) -> str:
+def create_target_class_selector(num_classes: int = 1000, custom_labels: Optional[Dict[int, str]] = None) -> str:
     st.sidebar.subheader("🎯 Target Class Selection")
 
     # For custom models with non-ImageNet classes, show simple numeric selection
     if num_classes != 1000:
         st.sidebar.info(f"📊 Custom model with {num_classes} classes detected")
-        st.sidebar.write("Select target class by index:")
+
+        # Use custom labels for display if available
+        if custom_labels:
+            st.sidebar.success(f"🏷️ Using {len(custom_labels)} custom class labels")
+            format_func = lambda x: f"{x}: {custom_labels.get(x, f'Class {x}')}"
+        else:
+            st.sidebar.write("Select target class by index:")
+            format_func = lambda x: f"Class {x}"
 
         selected_idx = st.sidebar.selectbox(
             "🔢 Target Class Index:",
             options=list(range(num_classes)),
             index=0,
-            format_func=lambda x: f"Class {x}",
+            format_func=format_func,
             help=f"Select target class index (0 to {num_classes-1})",
         )
 
-        st.sidebar.success(f"✅ Selected: Class {selected_idx}")
+        display_label = custom_labels.get(selected_idx, f"Class {selected_idx}") if custom_labels else f"Class {selected_idx}"
+        st.sidebar.success(f"✅ Selected: {display_label}")
         # Return the index as a string so it can be used throughout the system
         return str(selected_idx)
 
@@ -228,7 +366,7 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
     selected_model_display = st.sidebar.selectbox(
         "🤖 Classification Model:",
         model_display_names,
-        index=0,  # Default to first model (ViT-L/16)
+        index=1,  # Default to first model (ViT-L/16)
         help="Select the neural network model to use for classification"
     )
 
@@ -368,14 +506,119 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
             st.sidebar.warning(f"⚠️ Could not detect classes from weights: {str(e)}")
             num_classes = 1000
 
-    # NOW create target class selector with knowledge of num_classes
-    target_class = create_target_class_selector(num_classes)
+    # Custom class labels upload (for non-ImageNet models)
+    custom_labels = None
+    if num_classes != 1000:
+        with st.sidebar.expander("🏷️ Custom Class Labels (Optional)", expanded=False):
+            st.write("**Upload JSON file with class names**")
+            st.write("Expected format: `{\"0\": \"class_name_0\", \"1\": \"class_name_1\", ...}`")
+
+            # Check for cached labels for current model
+            cached_labels = get_cached_custom_labels_for_model(selected_model)
+
+            if cached_labels:
+                metadata = load_custom_labels_metadata()
+                labels_info = metadata.get(selected_model, {})
+
+                st.success(f"📦 **Cached labels found for {MODEL_CONFIGS[selected_model]['description']}**")
+
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.write(f"**File:** {labels_info.get('original_name', 'Unknown')}")
+                    st.write(f"**Labels:** {labels_info.get('num_labels', len(cached_labels))}")
+                    if 'timestamp' in labels_info:
+                        cached_time = datetime.fromisoformat(labels_info['timestamp'].strip('"'))
+                        st.write(f"**Cached:** {cached_time.strftime('%Y-%m-%d %H:%M')}")
+
+                with col2:
+                    if st.button("❌", help="Remove cached labels", key="remove_cached_labels"):
+                        if remove_cached_custom_labels_for_model(selected_model):
+                            st.success("✅ Cached labels removed")
+                            st.rerun()
+                        else:
+                            st.error("❌ Error removing labels")
+
+                use_cached_labels = st.checkbox(
+                    "Use cached labels",
+                    value=True,
+                    help="Use the cached labels for this model"
+                )
+
+                if use_cached_labels:
+                    custom_labels = cached_labels
+                    st.info("💡 Using cached labels")
+                else:
+                    st.info("💡 Using generic class names")
+
+                # Option to upload new labels
+                with st.expander("📤 Upload new labels", expanded=False):
+                    upload_new_labels = st.checkbox(
+                        "Upload new labels (will replace cached)",
+                        value=False,
+                        help="Upload new labels to replace the current cached ones"
+                    )
+
+                    if upload_new_labels:
+                        labels_file = st.file_uploader(
+                            "Upload class labels JSON",
+                            type=["json"],
+                            help="JSON file mapping class indices to names",
+                            key="new_labels_upload"
+                        )
+
+                        if labels_file:
+                            try:
+                                # Remove old cached labels first
+                                remove_cached_custom_labels_for_model(selected_model)
+
+                                # Cache the new labels file
+                                labels_path = cache_custom_labels_file(labels_file, selected_model)
+                                custom_labels = get_cached_custom_labels_for_model(selected_model)
+                                st.success(f"✅ New labels cached: {labels_file.name}")
+                                st.info(f"📊 {len(custom_labels)} labels loaded")
+                                st.rerun()  # Refresh to show new cached labels
+                            except Exception as e:
+                                st.error(f"❌ Error processing labels: {str(e)}")
+                                custom_labels = None
+            else:
+                # No cached labels - show upload interface
+                use_custom_labels = st.checkbox(
+                    "Use custom labels",
+                    value=False,
+                    help="Upload a JSON file with class names"
+                )
+
+                if use_custom_labels:
+                    labels_file = st.file_uploader(
+                        "Upload class labels JSON",
+                        type=["json"],
+                        help="JSON file mapping class indices to names: {\"0\": \"class_name\", ...}",
+                        key="labels_upload"
+                    )
+
+                    if labels_file:
+                        try:
+                            # Cache the labels file
+                            labels_path = cache_custom_labels_file(labels_file, selected_model)
+                            custom_labels = get_cached_custom_labels_for_model(selected_model)
+                            st.success(f"✅ Labels cached: {labels_file.name}")
+                            st.info(f"📊 {len(custom_labels)} labels loaded")
+                        except Exception as e:
+                            st.error(f"❌ Error processing labels: {str(e)}")
+                            custom_labels = None
+                    else:
+                        st.info("💡 Upload a JSON file to use custom labels")
+                else:
+                    st.info("💡 Using generic class names")
+
+    # NOW create target class selector with knowledge of num_classes and custom_labels
+    target_class = create_target_class_selector(num_classes, custom_labels)
 
     batch_size = st.sidebar.number_input(
         "Batch Size",
         min_value=1,
-        max_value=4,
-        value=4,
+        max_value=8,
+        value=1,
         step=1,
         help="Number of viewpoints to optimize in parallel",
     )
@@ -489,7 +732,8 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
         "targeted": bool(targeted),
         "include_heatmap": include_heatmap,
         "min_max_proportion": min_max_proportion,
-        "num_classes": int(num_classes),  # ADD THIS LINE
+        "num_classes": int(num_classes),
+        "custom_labels": custom_labels,
     }
 
 
@@ -866,18 +1110,19 @@ def create_interactive_polar_plot(
     topk_value: int,
     selected_indices: Optional[Sequence[int]] = None,
     current_highlighted_index: Optional[int] = None,
+    num_classes: int = 1000,
+    custom_labels: Optional[Dict[int, str]] = None,
 ) -> go.Figure:
     azimuth, elevation, _ = utils.compute_spherical_coordinates(camera_positions)
     azimuth_rad = np.radians(azimuth)
 
-    _, id_to_class = get_cached_imagenet_labels()
     preds_top1 = _pred_top1(logits)
     pred_probs = _softmax_max_probs(logits)
 
     # Hover text
     hover_text: List[str] = []
     for i in range(len(camera_positions)):
-        pred_class = id_to_class.get(int(preds_top1[i]), f"class {preds_top1[i]}")
+        pred_class = get_class_label(int(preds_top1[i]), num_classes, custom_labels)
         status = "✅ Correct" if labels_correct[i] else "❌ Incorrect"
         if current_highlighted_index is not None and i == current_highlighted_index:
             selection_status = "🎯 CURRENTLY DISPLAYED"
@@ -1071,7 +1316,8 @@ def render_image_at_position(
             # Get config to determine num_classes
             config = st.session_state.get("config", {})
             num_classes = config.get("num_classes", 1000)
-            pred_class = get_class_label(pred_class_idx, num_classes)
+            custom_labels = config.get("custom_labels")
+            pred_class = get_class_label(pred_class_idx, num_classes, custom_labels)
 
             camera_pos = scene_params["camera"][batch_idx:batch_idx + 1]
             azimuth, elevation, distance = utils.compute_spherical_coordinates(camera_pos.cpu().numpy())
@@ -1145,6 +1391,8 @@ def create_individual_heatmap(
         topk_value,
         selected_indices=None,
         current_highlighted_index=highlighted_index,
+        num_classes=config.get("num_classes", 1000),
+        custom_labels=config.get("custom_labels"),
     )
 
     azimuth, elevation, _ = utils.compute_spherical_coordinates(camera_positions)
@@ -1422,6 +1670,8 @@ def download_all_images_package(
             st.session_state.get("topk_value", 1),
             selected_indices=all_positions,
             current_highlighted_index=None,
+            num_classes=config.get("num_classes", 1000),
+            custom_labels=config.get("custom_labels"),
         )
         overall_fig.update_layout(
             title=f"All Rendered Positions Overview<br>Target: {config['target_class'][:30]}...<br>{len(rendered_images)} positions analyzed",
@@ -1740,11 +1990,12 @@ def visualize_results(results: Dict, config: Dict):
             # Get num_classes from config
             config = st.session_state.get("config", {})
             num_classes = config.get("num_classes", 1000)
+            custom_labels = config.get("custom_labels")
             for rank in range(top_n):
                 cls_id = int(values[order[rank]])
                 cnt = int(counts[order[rank]])
                 pct = (cnt / total_positions) * 100.0
-                label = get_class_label(cls_id, num_classes)
+                label = get_class_label(cls_id, num_classes, custom_labels)
                 # Only truncate ImageNet labels (they're long), show full generic class names
                 display_label = label[:30] + "..." if num_classes == 1000 and len(label) > 30 else label
                 st.write(f"{rank+1}. {display_label} — {cnt} ({pct:.1f}%)")
@@ -1810,6 +2061,8 @@ def visualize_results(results: Dict, config: Dict):
                 topk,
                 selected_indices=combined_selected_indices,
                 current_highlighted_index=current_highlighted_index,
+                num_classes=config.get("num_classes", 1000),
+                custom_labels=config.get("custom_labels"),
             )
 
             event = st.plotly_chart(fig, use_container_width=True, on_select="rerun", key="polar_plot")
@@ -1935,10 +2188,11 @@ def visualize_results(results: Dict, config: Dict):
                     # Get num_classes from config
                     config = st.session_state.get("config", {})
                     num_classes = config.get("num_classes", 1000)
+                    custom_labels = config.get("custom_labels")
                     for i, pos_idx in enumerate(selected_indices):
                         conf = target_probs[pos_idx]
                         pred_idx = int(torch.argmax(logits2d[pos_idx]).item())
-                        pred_class = get_class_label(pred_idx, num_classes)
+                        pred_class = get_class_label(pred_idx, num_classes, custom_labels)
                         status = "✅" if pred_idx == target_idx else "❌"
                         # Only truncate ImageNet labels (they're long), show full generic class names
                         display_class = pred_class[:25] + "..." if num_classes == 1000 and len(pred_class) > 25 else pred_class
@@ -2074,6 +2328,7 @@ def run_analysis(
         "model_name": config["model_name"],
         "custom_weights_path": config["custom_weights_path"],
         "min_max_proportion": config["min_max_proportion"],
+        "custom_labels": config.get("custom_labels"),
     }
 
     with st.spinner("Initializing robustness analyzer..."):
@@ -2126,7 +2381,50 @@ def run_analysis(
         )
         return robust_analyzer, results
     except Exception as e:
-        st.error(f"❌ Error during analysis: {str(e)}")
+        error_message = str(e)
+
+        # Check if it's an OOM-related error
+        is_oom_error = (
+            "out of memory" in error_message.lower() or
+            "oom" in error_message.lower() or
+            "gpu" in error_message.lower()
+        )
+
+        if is_oom_error:
+            st.error("🚨 **GPU Out of Memory Error!**")
+            st.markdown(error_message)
+
+            st.warning("### 🔄 Action Required")
+            st.markdown("""
+            The analysis failed due to insufficient GPU memory.
+
+            **Recommended: Restart the Streamlit App**
+
+            To clear all GPU memory, you need to restart the Streamlit server:
+
+            1. Press `Ctrl+C` in your terminal where Streamlit is running
+            2. Run `streamlit run src/ui.py` again
+
+            **Alternative: Adjust Settings and Retry**
+
+            You can also try adjusting these settings before running the analysis again:
+            - Reduce the **Batch Size** in the sidebar
+            - Reduce the **Image Size** in Rendering Settings (try 256 or 128)
+            - Use fewer environment maps
+            - Close other applications using GPU memory
+            """)
+
+            if st.button("🧹 Clear Session & Try Again", help="Clear session state and try with adjusted settings"):
+                # Clear session state
+                for key in list(st.session_state.keys()):
+                    if key not in ["files_processed", "file_paths", "using_cached_files", "cache_info"]:
+                        del st.session_state[key]
+                st.success("✅ Session cleared! Adjust your settings and try again.")
+                st.rerun()
+        else:
+            st.error(f"❌ Error during analysis: {error_message}")
+            st.code(traceback.format_exc())
+
         return None, None
 
 
@@ -3195,6 +3493,34 @@ def main() -> None:
                 st.session_state["config"] = config
 
     if st.session_state.get("results") is not None:
+        # Check if target class has changed since analysis was run
+        stored_config = st.session_state.get("config", {})
+        current_target = config.get("target_class")
+        stored_target = stored_config.get("target_class")
+
+        if current_target != stored_target and stored_target is not None:
+            st.warning(
+                f"⚠️ **Target Class Changed!** The current target class (`{current_target}`) differs from "
+                f"the one used during analysis (`{stored_target}`). This may cause errors or inconsistent results."
+            )
+
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                if st.button("🔄 Restart Analysis", type="primary", help="Clear results and restart with new target class"):
+                    # Clear all analysis-related session state
+                    st.session_state.pop("results", None)
+                    st.session_state.pop("config", None)
+                    st.session_state.pop("robust_analyzer", None)
+                    st.session_state.pop("rendered_images", None)
+                    st.session_state.pop("selected_positions", None)
+                    st.session_state.pop("image_cache_key", None)
+                    st.session_state.pop("carousel_index", None)
+                    st.session_state.pop("trigger_render", None)
+                    st.success("✅ Session cleared! Please run the analysis again with the new target class.")
+                    st.rerun()
+            with col2:
+                st.info("💡 **Tip:** You can either restart the analysis with the new target class, or change the target class back to the original one used during analysis.")
+
         plot_data = visualize_results(st.session_state["results"], st.session_state.get("config", config))
         download_results(st.session_state["results"], plot_data)
 

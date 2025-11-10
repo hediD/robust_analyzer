@@ -6,13 +6,30 @@ import torchvision.transforms.functional as F
 from PIL import Image
 import pandas as pd
 from matplotlib.colors import TwoSlopeNorm, Normalize, LinearSegmentedColormap
-from typing import List, Optional
+from typing import List, Optional, Dict
 import torch
 ch = torch
 
-with open('../data/imagenet1000_clsidx_to_labels.json', 'r+') as f:
-    id_to_class = eval(f.read())
-    class_to_id = {v: k for k, v in id_to_class.items()}
+# Load ImageNet labels (will be used as default fallback)
+try:
+    with open('../data/imagenet1000_clsidx_to_labels.json', 'r+') as f:
+        id_to_class = eval(f.read())
+        class_to_id = {v: k for k, v in id_to_class.items()}
+except:
+    id_to_class = {}
+    class_to_id = {}
+
+# Global custom labels storage (will be set dynamically)
+_custom_class_labels: Optional[Dict[int, str]] = None
+
+def set_custom_class_labels(custom_labels: Optional[Dict[int, str]]) -> None:
+    """Set custom class labels for the session."""
+    global _custom_class_labels
+    _custom_class_labels = custom_labels
+
+def get_custom_class_labels() -> Optional[Dict[int, str]]:
+    """Get current custom class labels."""
+    return _custom_class_labels
 
 # ==========================
 # Image Processing Utilities
@@ -109,7 +126,12 @@ def get_target_idx(class_label: str):
     return get_idx(class_label)
 
 def get_target(class_idx: int):
-    # Try ImageNet lookup first
+    # Try custom labels first if set
+    custom_labels = get_custom_class_labels()
+    if custom_labels is not None and class_idx in custom_labels:
+        return custom_labels[class_idx]
+
+    # Try ImageNet lookup
     class_label = id_to_class.get(class_idx)
     if class_label is None:
         # For custom models, return a simple "Class N" label
@@ -253,17 +275,23 @@ def look_at_rotation(camera_position: torch.Tensor, target_position: torch.Tenso
 # ==========================
 # Logits Analysis Utilities
 # ==========================
-def analyze_logits(logits: torch.Tensor, target_class: str = None, max_length: int = 15):
+def analyze_logits(logits: torch.Tensor, target_class: str = None, max_length: int = 15, custom_labels: Optional[Dict[int, str]] = None):
     """
     Analyze the logits to find the most common class, its count, percentage,
     and the average probability of that class across all elements.
 
     Args:
         logits (ch.Tensor): A tensor of shape (batch_size, num_classes).
+        target_class (str): Optional target class name
+        max_length (int): Maximum length for truncating class names
+        custom_labels (Dict): Optional custom class labels mapping
 
     Returns:
-        tuple: (most_common_class, count, percentage, average_probability)
+        tuple: (most_common_class, count, average_probability)
     """
+    # Set custom labels if provided
+    if custom_labels is not None:
+        set_custom_class_labels(custom_labels)
 
     # Get the most likely classes for each batch
     predictions = logits.argmax(1)
