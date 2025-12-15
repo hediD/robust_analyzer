@@ -950,6 +950,10 @@ def save_zip_package(zip_file, temp_dir: str) -> Tuple[str, Optional[str], List[
             envmap_paths.extend([p for p in cands if ("env" in p.lower() or "hdri" in p.lower()) and p not in texture_paths])
 
     texture_path = texture_paths[0] if texture_paths else None
+
+    # Sort envmap paths to ensure deterministic order (0->N-1)
+    envmap_paths.sort()
+
     return obj_path, texture_path, envmap_paths, temp_dir
 
 
@@ -999,6 +1003,9 @@ def save_individual_files(
             with open(env_path, "wb") as f:
                 f.write(env_file.read())
             envmap_paths.append(env_path)
+
+    # Sort envmap paths to ensure deterministic order (0->N-1)
+    envmap_paths.sort()
 
     return obj_path, texture_path, envmap_paths, temp_dir
 
@@ -1067,7 +1074,10 @@ def save_files_to_cache(upload_type, *files):
             req = [cached.get("obj_path"), cached.get("texture_path")] + cached.get("envmap_paths", [])
             if all((not p) or Path(p).exists() for p in req):
                 st.info(f"📦 Using cached files (hash: {cache_key[:8]}...)")
-                return cached["obj_path"], cached["texture_path"], cached["envmap_paths"], str(upload_cache)
+                # Sort envmap paths to ensure deterministic order (0->N-1)
+                cached_envmaps = cached.get("envmap_paths", [])
+                cached_envmaps.sort()
+                return cached["obj_path"], cached["texture_path"], cached_envmaps, str(upload_cache)
         except Exception:
             pass
 
