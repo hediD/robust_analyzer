@@ -28,11 +28,30 @@ from plotly.subplots import make_subplots  # noqa: F401
 from model import Model, MODEL_CONFIGS
 from robustness_analyzer import RobustnessAnalyzer
 import utils
+from image_selection import handle_image_selection
+from visualization import (
+    create_interactive_polar_plot,
+    render_image_at_position,
+    render_multiple_images,
+    create_individual_heatmap,
+    create_composite_image,
+    download_single_image_package,
+    download_all_images_package,
+    create_image_carousel,
+    visualize_results,
+)
+from texture_atlas import (
+    visualize_textures,
+    create_texture_atlas,
+    handle_texture_atlas,
+    create_texture_atlas_from_zip,
+)
 
 from PIL import ImageDraw, ImageFont, Image
 import matplotlib.pyplot as plt
 import subprocess
 import sys
+import base64
 
 # Constants
 APP_TITLE = "🎯 3D Adversarial Robustness Analyzer"
@@ -357,6 +376,17 @@ def create_target_class_selector(num_classes: int = 1000, custom_labels: Optiona
 # Sidebar Config
 def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
     st.sidebar.header("📋 Configuration")
+
+    # Mode selector - controls which sidebar elements are shown
+    sidebar_mode = st.sidebar.radio(
+        "Mode",
+        options=["🎯 Robustness Analysis", "🖼️ Image Selection"],
+        horizontal=True,
+        help="Select the mode to show relevant configuration options"
+    )
+    st.session_state["sidebar_mode"] = sidebar_mode
+    is_robustness_mode = sidebar_mode == "🎯 Robustness Analysis"
+
     st.sidebar.subheader("Model Parameters")
 
     # Model selection FIRST (before target class)
@@ -366,7 +396,7 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
     selected_model_display = st.sidebar.selectbox(
         "🤖 Classification Model:",
         model_display_names,
-        index=1,  # Default to first model (ViT-L/16)
+        index=2,  # Default to nth model from drop down menu
         help="Select the neural network model to use for classification"
     )
 
@@ -413,15 +443,16 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
             else:
                 st.info("💡 Using default pre-trained weights")
 
-            # Option to upload new weights
-            with st.expander("📤 Upload new weights", expanded=False):
-                upload_new_weights = st.checkbox(
-                    "Upload new weights (will replace cached)",
-                    value=False,
-                    help="Upload new weights to replace the current cached ones"
+            # Option to use different weights
+            with st.expander("🔄 Use different weights", expanded=False):
+                new_weights_source = st.radio(
+                    "New weights source",
+                    options=["📤 Upload file", "📁 Local path"],
+                    horizontal=True,
+                    key="cached_weights_source_mode"
                 )
 
-                if upload_new_weights:
+                if new_weights_source == "📤 Upload file":
                     weights_file = st.file_uploader(
                         "Upload model weights",
                         type=["pth", "pt", "bin", "safetensors"],
@@ -446,6 +477,28 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
                         except Exception as e:
                             st.error(f"❌ Error processing weights: {str(e)}")
                             custom_weights_path = None
+                else:  # Local path
+                    local_weights_input = st.text_input(
+                        "Weights file path",
+                        value="",
+                        placeholder="/path/to/model_weights.pth",
+                        help="Absolute path to weights file (.pth, .pt, .bin, .safetensors)",
+                        key="cached_local_weights_path"
+                    )
+
+                    if local_weights_input:
+                        local_weights_path = Path(local_weights_input)
+                        if not local_weights_path.exists():
+                            st.error(f"❌ File not found: {local_weights_input}")
+                        elif local_weights_path.suffix.lower() not in ['.pth', '.pt', '.bin', '.safetensors']:
+                            st.error(f"❌ Unsupported format: {local_weights_path.suffix}")
+                        else:
+                            file_size = local_weights_path.stat().st_size / (1024 * 1024)  # MB
+                            st.success(f"✅ Weights found: {local_weights_path.name}")
+                            st.info(f"📊 File size: {file_size:.1f} MB")
+                            custom_weights_path = str(local_weights_path)
+                    else:
+                        st.info("👆 Enter the path to your weights file")
         else:
             # No cached weights - show upload interface
             use_custom_weights = st.checkbox(
@@ -455,27 +508,58 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
             )
 
             if use_custom_weights:
-                weights_file = st.file_uploader(
-                    "Upload model weights",
-                    type=["pth", "pt", "bin", "safetensors"],
-                    help="Supported formats: .pth, .pt, .bin, .safetensors"
+                weights_source = st.radio(
+                    "Weights source",
+                    options=["📤 Upload file", "📁 Local path"],
+                    horizontal=True,
+                    key="weights_source_mode"
                 )
 
-                if weights_file:
-                    try:
-                        # Cache the weights file
-                        custom_weights_path = cache_weights_file(weights_file, selected_model)
-                        st.success(f"✅ Weights cached: {weights_file.name}")
+                if weights_source == "📤 Upload file":
+                    weights_file = st.file_uploader(
+                        "Upload model weights",
+                        type=["pth", "pt", "bin", "safetensors"],
+                        help="Supported formats: .pth, .pt, .bin, .safetensors"
+                    )
 
-                        # Show file info
-                        file_size = len(weights_file.getvalue()) / (1024 * 1024)  # MB
-                        st.info(f"📊 File size: {file_size:.1f} MB")
+                    if weights_file:
+                        try:
+                            # Cache the weights file
+                            custom_weights_path = cache_weights_file(weights_file, selected_model)
+                            st.success(f"✅ Weights cached: {weights_file.name}")
 
-                    except Exception as e:
-                        st.error(f"❌ Error processing weights: {str(e)}")
-                        custom_weights_path = None
-                else:
-                    st.info("💡 Upload a weights file to use custom model")
+                            # Show file info
+                            file_size = len(weights_file.getvalue()) / (1024 * 1024)  # MB
+                            st.info(f"📊 File size: {file_size:.1f} MB")
+
+                        except Exception as e:
+                            st.error(f"❌ Error processing weights: {str(e)}")
+                            custom_weights_path = None
+                    else:
+                        st.info("💡 Upload a weights file to use custom model")
+
+                else:  # Local path
+                    weights_path_input = st.text_input(
+                        "Weights file path",
+                        value="",
+                        placeholder="/path/to/model_weights.pth",
+                        help="Absolute path to weights file (.pth, .pt, .bin, .safetensors)",
+                        key="local_weights_path"
+                    )
+
+                    if weights_path_input:
+                        weights_path = Path(weights_path_input)
+                        if not weights_path.exists():
+                            st.error(f"❌ File not found: {weights_path_input}")
+                        elif weights_path.suffix.lower() not in ['.pth', '.pt', '.bin', '.safetensors']:
+                            st.error(f"❌ Unsupported format: {weights_path.suffix}")
+                        else:
+                            file_size = weights_path.stat().st_size / (1024 * 1024)  # MB
+                            st.success(f"✅ Weights found: {weights_path.name}")
+                            st.info(f"📊 File size: {file_size:.1f} MB")
+                            custom_weights_path = str(weights_path)
+                    else:
+                        st.info("👆 Enter the path to your weights file")
             else:
                 st.info("💡 Using default pre-trained weights")
 
@@ -498,9 +582,13 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
                     state_dict = state_dict['model']
 
             # Look for classifier weight to detect num_classes
+            # Check for different model architectures:
+            # - ResNet/torchvision: 'fc.weight'
+            # - Transformers/ViT: 'classifier.weight', 'head.weight'
             for key in state_dict.keys():
-                if 'classifier.weight' in key or 'classifier.1.weight' in key or 'head.weight' in key:
+                if 'fc.weight' in key or 'classifier.weight' in key or 'classifier.1.weight' in key or 'head.weight' in key:
                     num_classes = state_dict[key].shape[0]
+                    st.sidebar.info(f"✅ Detected {num_classes} classes from weights (key: {key})")
                     break
         except Exception as e:
             st.sidebar.warning(f"⚠️ Could not detect classes from weights: {str(e)}")
@@ -509,7 +597,7 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
     # Custom class labels upload (for non-ImageNet models)
     custom_labels = None
     if num_classes != 1000:
-        with st.sidebar.expander("🏷️ Custom Class Labels (Optional)", expanded=False):
+        with st.sidebar.expander("🏷️ Custom Class Labels (Optional)", expanded=True):
             st.write("**Upload JSON file with class names**")
             st.write("Expected format: `{\"0\": \"class_name_0\", \"1\": \"class_name_1\", ...}`")
 
@@ -611,110 +699,135 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
                 else:
                     st.info("💡 Using generic class names")
 
-    # NOW create target class selector with knowledge of num_classes and custom_labels
-    target_class = create_target_class_selector(num_classes, custom_labels)
+    # Robustness-specific parameters - only shown in Robustness Analysis mode
+    if is_robustness_mode:
+        # NOW create target class selector with knowledge of num_classes and custom_labels
+        target_class = create_target_class_selector(num_classes, custom_labels)
 
-    batch_size = st.sidebar.number_input(
-        "Batch Size",
-        min_value=1,
-        max_value=8,
-        value=1,
-        step=1,
-        help="Number of viewpoints to optimize in parallel",
-    )
+        batch_size = st.sidebar.number_input(
+            "Batch Size",
+            min_value=1,
+            max_value=8,
+            value=1,
+            step=1,
+            help="Number of viewpoints to optimize in parallel",
+        )
 
-    st.sidebar.subheader("Optimization Parameters")
-    params_to_optimize = st.sidebar.multiselect(
-        "Parameters to Optimize",
-        options=["camera"],
-        default=["camera"],
-        help="Select which parameters to optimize during adversarial attack",
-    )
+        st.sidebar.subheader("Optimization Parameters")
+        params_to_optimize = st.sidebar.multiselect(
+            "Parameters to Optimize",
+            options=["camera"],
+            default=["camera"],
+            help="Select which parameters to optimize during adversarial attack",
+        )
 
-    num_runs = st.sidebar.number_input(
-        "Number of Runs",
-        min_value=1,
-        max_value=20_000,
-        value=1,
-        step=1,
-        help="Total number of optimization runs",
-    )
+        num_runs = st.sidebar.number_input(
+            "Number of Runs",
+            min_value=1,
+            max_value=20_000,
+            value=1,
+            step=1,
+            help="Total number of optimization runs",
+        )
 
-    num_iterations = st.sidebar.number_input(
-        "Adversarial Optimization Steps",
-        min_value=1,
-        max_value=100,
-        value=1,
-        step=1,
-        help="Number of optimization steps per adversarial run",
-    )
+        num_iterations = st.sidebar.number_input(
+            "Adversarial Optimization Steps",
+            min_value=1,
+            max_value=100,
+            value=1,
+            step=1,
+            help="Number of optimization steps per adversarial run",
+        )
 
-    learning_rate = st.sidebar.select_slider(
-        "Learning Rate",
-        options=[1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2],
-        value=5e-3,
-        format_func=lambda x: f"{x:.1e}",
-    )
+        learning_rate = st.sidebar.select_slider(
+            "Learning Rate",
+            options=[1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2],
+            value=5e-3,
+            format_func=lambda x: f"{x:.1e}",
+        )
 
-    targeted = st.sidebar.checkbox(
-        "Targeted Attack",
-        value=False,
-        help="Whether this is a targeted adversarial attack",
-    )
+        targeted = st.sidebar.checkbox(
+            "Targeted Attack",
+            value=False,
+            help="Whether this is a targeted adversarial attack",
+        )
 
-    st.text("")
+        st.text("")
 
-    with st.sidebar.expander("Camera Constraints", expanded=True):
-        positive_z = st.checkbox(
-            "Positive Z",
+        with st.sidebar.expander("Camera Constraints", expanded=True):
+            positive_z = st.checkbox(
+                "Positive Z",
+                value=True,
+                help="Constrain camera to positive elevation (z > 0)",
+            )
+
+            min_max_proportion = st.slider(
+                "Object proportion in image range",
+                min_value=0.05,
+                max_value=0.8,
+                value=(0.3, 0.8),
+                step=0.1,
+                help="Camera distance range as proportion of bounding box size (min, max)",
+            )
+            st.caption(f"💡 object size proportion in image ({min_max_proportion[0]:.1f}x to {min_max_proportion[1]:.1f}x).")
+
+        with st.sidebar.expander("Rendering Settings", expanded=False):
+            st.write("**Rendering Paramters**")
+            image_size = st.select_slider(
+                "Image Size",
+                options=[224, 256, 320, 384, 448, 512],
+                value=448,
+                help="Resolution of rendered images (image_size x image_size)",
+            )
+            bin_size = st.slider(
+                "Bin Size",
+                min_value=16,
+                max_value=64,
+                value=32,
+                help="Spatial partitioning for rasterization - larger values use less memory but may be slower",
+            )
+            max_faces_per_bin = st.number_input(
+                "Max Faces per Bin",
+                min_value=10000,
+                max_value=200000,
+                value=100000,
+                step=10000,
+                help="Maximum faces per spatial bin - increase for complex meshes, decrease to save memory",
+            )
+            st.info("💡 **Tip:** Use smaller bin sizes and fewer faces per bin if you encounter GPU memory issues.")
+
+        st.sidebar.subheader("Download Settings")
+        include_heatmap = st.sidebar.checkbox(
+            "📊 Include heatmap in downloads",
             value=True,
-            help="Constrain camera to positive elevation (z > 0)",
+            help="When checked: downloads include rendered image + heatmap composite. When unchecked: downloads only the rendered images with separate metadata files.",
+            key="global_include_heatmap"
         )
+        st.session_state["include_heatmap_global"] = include_heatmap
+    else:
+        # Default values for non-robustness mode (Image Selection mode)
+        target_class = ""
+        batch_size = 1
+        params_to_optimize = ["camera"]
+        num_runs = 1
+        num_iterations = 1
+        learning_rate = 5e-3
+        targeted = False
+        positive_z = True
+        min_max_proportion = (0.3, 0.8)
+        image_size = 448
+        bin_size = 32
+        max_faces_per_bin = 100000
+        include_heatmap = True
 
-        min_max_proportion = st.slider(
-            "Object proportion in image range",
-            min_value=0.05,
-            max_value=0.8,
-            value=(0.3, 0.8),
-            step=0.1,
-            help="Camera distance range as proportion of bounding box size (min, max)",
-        )
-        st.caption(f"💡 object size proportion in image ({min_max_proportion[0]:.1f}x to {min_max_proportion[1]:.1f}x).")
-
-    with st.sidebar.expander("Rendering Settings", expanded=False):
-        st.write("**Rendering Paramters**")
-        image_size = st.select_slider(
-            "Image Size",
-            options=[224, 256, 320, 384, 448, 512],
-            value=448,
-            help="Resolution of rendered images (image_size x image_size)",
-        )
-        bin_size = st.slider(
-            "Bin Size",
-            min_value=16,
-            max_value=64,
-            value=32,
-            help="Spatial partitioning for rasterization - larger values use less memory but may be slower",
-        )
-        max_faces_per_bin = st.number_input(
-            "Max Faces per Bin",
-            min_value=10000,
-            max_value=200000,
-            value=100000,
-            step=10000,
-            help="Maximum faces per spatial bin - increase for complex meshes, decrease to save memory",
-        )
-        st.info("💡 **Tip:** Use smaller bin sizes and fewer faces per bin if you encounter GPU memory issues.")
-
-    st.sidebar.subheader("Download Settings")
-    include_heatmap = st.sidebar.checkbox(
-        "📊 Include heatmap in downloads",
-        value=True,
-        help="When checked: downloads include rendered image + heatmap composite. When unchecked: downloads only the rendered images with separate metadata files.",
-        key="global_include_heatmap"
-    )
-    st.session_state["include_heatmap_global"] = include_heatmap
-
+    # Store model config in session state for image selection panel
+    st.session_state["model_config"] = {
+        "model_name": selected_model,
+        "custom_weights_path": custom_weights_path,
+        "num_classes": int(num_classes),
+        "custom_labels": custom_labels,  # Store custom labels for image selection
+    }
+    st.session_state["model_name"] = selected_model
 
     return {
         "target_class": target_class,
@@ -737,23 +850,124 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
     }
 
 
-# File Uploads & Cache
+# Image Selection Functions
 def handle_file_uploads():
     st.header("📁 File Uploads")
-    tab1, tab2 = st.tabs(["🎯 Robustness Analysis Files", "🔧 Texture Atlas Creator"])
+    tab1, tab2, tab3 = st.tabs(["🎯 Robustness Analysis Files", "🔧 Texture Atlas Creator", "🖼️ Image Selection"])
 
     with tab1:
         st.subheader("📦 3D Files for Robustness Analysis")
+
+        # Help expander with documentation
+        with st.expander("📖 How to Use Robustness Analysis", expanded=False):
+            st.markdown("""
+### Overview
+
+**Robustness Analysis** tests how well a classifier recognizes your 3D object from different viewpoints and camera distances. It helps identify adversarial viewpoints where the model fails.
+
+### File Requirements
+
+| File Type | Format | Required | Description |
+|-----------|--------|----------|-------------|
+| 3D Mesh | `.obj` | ✅ Yes | Wavefront OBJ format mesh |
+| Materials | `.mtl` | ⚠️ Optional | Material definitions |
+| Textures | `.png`, `.jpg` | ⚠️ Optional | Texture images (referenced in MTL or single override) |
+| Environment Maps | `.hdr`, `.exr`, `.png`, `.jpg` | ✅ Yes | background environments |
+
+### Input Modes
+
+**📦 ZIP Package Mode:**
+- Upload a single ZIP file containing all your 3D assets
+- Best for: Sharing complete models, archiving setups
+```
+model.zip/
+├── model.obj           # 3D mesh
+├── model.mtl           # Materials (optional)
+└── textures/           # Texture folder (optional)
+    ├── diffuse.png
+    └── normal.png
+```
+
+**📤 Individual Files Mode:**
+- Upload OBJ, MTL, textures, and environment maps separately via file uploader
+- Single texture option overrides all MTL materials
+- Best for: Quick testing, mixing and matching assets
+
+**📁 Local Path Mode:**
+- Specify absolute paths to files on the server filesystem
+- No file upload needed - directly reference existing files
+- Best for: Large files, repeated testing, server-side assets
+- Required inputs:
+  - **OBJ path**: `/path/to/model.obj`
+  - **Environment maps directory**: `/path/to/envmaps/` (directory with .hdr, .exr, .png, .jpg files)
+- Optional inputs:
+  - **MTL path**: `/path/to/model.mtl`
+  - **Textures directory**: `/path/to/textures/`
+
+### Custom Model Weights
+
+You can use your own fine-tuned model weights instead of pre-trained ImageNet weights:
+- **Upload file**: Upload `.pth`, `.pt`, `.bin`, or `.safetensors` files
+- **Local path**: Specify absolute path to weights file on the server
+- The system auto-detects the number of output classes from the weights
+- Cached weights persist across sessions
+
+### Custom Class Labels
+
+Upload a JSON file to use custom class names instead of generic indices:
+```json
+{"0": "class_a", "1": "class_b", "2": "class_c"}
+```
+- Labels are cached and persist across sessions
+- Auto-matched to detected number of classes in weights
+
+### Configuration Options (Sidebar)
+
+| Parameter | Description | Typical Values |
+|-----------|-------------|----------------|
+| **Target Class** | Class index to test | 0 to num_classes-1 |
+| **Theta/Phi Points** | Angular resolution of sweep | 10-50 |
+| **Min/Max Distance** | Camera distance range (proportional to object size) | 1.5-10x |
+| **Optimization Samples** | Samples for finding worst-case | 50-200 |
+
+### Workflow Steps
+
+1. **Select input mode** (ZIP, Individual files, or Local path)
+2. **Provide 3D files** - upload or specify paths
+3. **Configure** analysis parameters in sidebar
+4. **Optionally** load custom weights and/or class labels
+5. **Adjust** rendering settings if needed (expand panel)
+6. **Run Analysis** - generates viewpoint confidence map
+7. **Review** polar heatmap showing confidence by angle
+8. **Download** results as JSON
+
+### Understanding Results
+
+- **Polar Heatmap**: Shows classifier confidence by viewing angle (theta/phi)
+- **Red zones**: Low confidence (adversarial viewpoints)
+- **Green zones**: High confidence (robust viewpoints)
+- **Statistics**: Min/max/mean confidence across all viewpoints
+
+### Tips
+
+- **Local paths** are faster for large files and repeated testing
+- Use high-quality `.hdr` environment maps for realistic lighting
+- More theta/phi points = finer angular resolution (but slower)
+- Multiple environment maps test lighting robustness
+- Check "worst-case" viewpoints for model vulnerabilities
+- Custom weights enable testing domain-specific classifiers
+            """)
+
         st.info("💡 Upload your 3D object files and environment maps for adversarial robustness testing")
 
         mode = st.radio(
             "Input source",
-            options=["ZIP package", "Individual files"],
+            options=["📦 ZIP package", "📤 Individual files", "📁 Local path"],
             horizontal=True,
             key="robustness_input_mode",
         )
 
-        if mode == "ZIP package":
+        if mode == "📦 ZIP package":
             st.subheader("Upload Complete 3D Package")
             st.info("💡 Upload a ZIP file containing .obj, .mtl, and all texture files")
             zip_file = st.file_uploader(
@@ -766,7 +980,118 @@ def handle_file_uploads():
                 st.success(f"✅ Uploaded package: {zip_file.name}")
                 return "zip", zip_file, None, None, None
 
-        else:  # Individual files
+        elif mode == "📁 Local path":
+            st.subheader("Specify Local File Paths")
+            st.info("💡 Enter absolute paths to files on the server filesystem")
+
+            col_obj, col_env = st.columns(2)
+
+            with col_obj:
+                st.markdown("**3D Object Files**")
+                obj_path = st.text_input(
+                    "OBJ file path",
+                    value="",
+                    placeholder="/path/to/model.obj",
+                    help="Absolute path to the .obj mesh file",
+                    key="local_obj_path"
+                )
+                mtl_path = st.text_input(
+                    "MTL file path (optional)",
+                    value="",
+                    placeholder="/path/to/model.mtl",
+                    help="Absolute path to the .mtl material file",
+                    key="local_mtl_path"
+                )
+                texture_dir = st.text_input(
+                    "Textures directory (optional)",
+                    value="",
+                    placeholder="/path/to/textures/",
+                    help="Directory containing texture files referenced in MTL",
+                    key="local_texture_dir"
+                )
+
+            with col_env:
+                st.markdown("**Environment Maps**")
+                env_dir = st.text_input(
+                    "Environment maps directory",
+                    value="",
+                    placeholder="/path/to/envmaps/",
+                    help="Directory containing environment map files (.hdr, .exr, .png, .jpg)",
+                    key="local_env_dir"
+                )
+
+            # Validate paths
+            if obj_path:
+                obj_file_path = Path(obj_path)
+                if not obj_file_path.exists():
+                    st.error(f"❌ OBJ file not found: {obj_path}")
+                elif not obj_file_path.suffix.lower() == '.obj':
+                    st.error(f"❌ File is not an OBJ: {obj_path}")
+                else:
+                    st.success(f"✅ OBJ: {obj_file_path.name}")
+
+                    # Validate MTL if provided
+                    mtl_file_path = None
+                    if mtl_path:
+                        mtl_file_path = Path(mtl_path)
+                        if not mtl_file_path.exists():
+                            st.warning(f"⚠️ MTL file not found: {mtl_path}")
+                            mtl_file_path = None
+                        else:
+                            st.success(f"✅ MTL: {mtl_file_path.name}")
+
+                    # Validate texture directory if provided
+                    texture_files_list = []
+                    if texture_dir:
+                        texture_dir_path = Path(texture_dir)
+                        if not texture_dir_path.exists():
+                            st.warning(f"⚠️ Texture directory not found: {texture_dir}")
+                        elif not texture_dir_path.is_dir():
+                            st.warning(f"⚠️ Not a directory: {texture_dir}")
+                        else:
+                            # Find texture files
+                            for ext in ['*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tga']:
+                                texture_files_list.extend(texture_dir_path.glob(ext))
+                                texture_files_list.extend(texture_dir_path.glob(ext.upper()))
+                            if texture_files_list:
+                                st.success(f"✅ Found {len(texture_files_list)} texture(s)")
+                            else:
+                                st.info("💡 No texture files found in directory")
+
+                    # Validate environment maps directory
+                    env_files_list = []
+                    if env_dir:
+                        env_dir_path = Path(env_dir)
+                        if not env_dir_path.exists():
+                            st.error(f"❌ Environment maps directory not found: {env_dir}")
+                        elif not env_dir_path.is_dir():
+                            st.error(f"❌ Not a directory: {env_dir}")
+                        else:
+                            # Find environment map files
+                            for ext in ['*.hdr', '*.exr', '*.png', '*.jpg', '*.jpeg']:
+                                env_files_list.extend(env_dir_path.glob(ext))
+                                env_files_list.extend(env_dir_path.glob(ext.upper()))
+                            if env_files_list:
+                                st.success(f"✅ Found {len(env_files_list)} environment map(s)")
+                                for env_f in sorted(env_files_list)[:5]:  # Show first 5
+                                    st.text(f"  • {env_f.name}")
+                                if len(env_files_list) > 5:
+                                    st.text(f"  ... and {len(env_files_list) - 5} more")
+                            else:
+                                st.error("❌ No environment map files found in directory")
+
+                    # Return local paths if valid
+                    if obj_file_path.exists() and env_files_list:
+                        return "local_path", {
+                            "obj_path": str(obj_file_path),
+                            "mtl_path": str(mtl_file_path) if mtl_file_path else None,
+                            "texture_paths": [str(t) for t in texture_files_list],
+                            "env_paths": [str(e) for e in sorted(env_files_list)],
+                        }, None, None, None
+            else:
+                st.info("👆 Enter the path to your OBJ file to get started")
+
+        else:  # Individual files (📤 Individual files)
             col1, col2, col3 = st.columns(3)
 
             with col1:
@@ -831,6 +1156,9 @@ def handle_file_uploads():
 
     with tab2:
         handle_texture_atlas()
+
+    with tab3:
+        handle_image_selection()
 
     return "individual", None, None, None, None
 
@@ -1112,1207 +1440,6 @@ def save_files_to_cache(upload_type, *files):
 
 
 # Visualization
-def create_interactive_polar_plot(
-    camera_positions: np.ndarray,
-    labels_correct: np.ndarray,
-    logits: torch.Tensor,
-    target_class: str,
-    topk_value: int,
-    selected_indices: Optional[Sequence[int]] = None,
-    current_highlighted_index: Optional[int] = None,
-    num_classes: int = 1000,
-    custom_labels: Optional[Dict[int, str]] = None,
-) -> go.Figure:
-    azimuth, elevation, _ = utils.compute_spherical_coordinates(camera_positions)
-    azimuth_rad = np.radians(azimuth)
-
-    preds_top1 = _pred_top1(logits)
-    pred_probs = _softmax_max_probs(logits)
-
-    # Hover text
-    hover_text: List[str] = []
-    for i in range(len(camera_positions)):
-        pred_class = get_class_label(int(preds_top1[i]), num_classes, custom_labels)
-        status = "✅ Correct" if labels_correct[i] else "❌ Incorrect"
-        if current_highlighted_index is not None and i == current_highlighted_index:
-            selection_status = "🎯 CURRENTLY DISPLAYED"
-        elif selected_indices is not None and i in selected_indices:
-            selection_status = "📍 RENDERED"
-        else:
-            selection_status = ""
-        hover_text.append(
-            "Position {i}<br>"
-            "Azimuth: {az:.1f}°<br>"
-            "Elevation: {el:.1f}°<br>"
-            "Prediction: {pc:.30}...<br>"
-            "Confidence: {p:.3f}<br>"
-            "Status: {st}<br>"
-            "{sel}<br>"
-            "Click to view rendered image".format(
-                i=i, az=azimuth[i], el=elevation[i], pc=pred_class, p=pred_probs[i], st=status, sel=selection_status
-            )
-        )
-
-    fig = go.Figure()
-
-    # Masks
-    selected_mask = np.isin(np.arange(len(camera_positions)), selected_indices) if selected_indices else np.zeros(len(camera_positions), dtype=bool)
-    current_mask = (np.arange(len(camera_positions)) == current_highlighted_index) if current_highlighted_index is not None else np.zeros(len(camera_positions), dtype=bool)
-    unselected_mask = ~selected_mask
-    selected_not_current_mask = selected_mask & ~current_mask
-    correct_mask = labels_correct.astype(bool)
-    incorrect_mask = ~correct_mask
-
-    # Unselected correct
-    unselected_correct = correct_mask & unselected_mask
-    if unselected_correct.any():
-        fig.add_trace(go.Scatterpolar(
-            r=elevation[unselected_correct],
-            theta=azimuth[unselected_correct],
-            mode="markers",
-            marker=dict(size=6, color="lightblue", opacity=0.4, line=dict(width=1, color="darkblue")),
-            name=f"Correct (Top-{topk_value})",
-            hovertext=[hover_text[i] for i in np.where(unselected_correct)[0]],
-            hoverinfo="text",
-            customdata=np.where(unselected_correct)[0],
-        ))
-
-    # Unselected incorrect
-    unselected_incorrect = incorrect_mask & unselected_mask
-    if unselected_incorrect.any():
-        fig.add_trace(go.Scatterpolar(
-            r=elevation[unselected_incorrect],
-            theta=azimuth[unselected_incorrect],
-            mode="markers",
-            marker=dict(size=6, color="lightcoral", opacity=0.4, line=dict(width=1, color="darkred")),
-            name=f"Incorrect (Top-{topk_value})",
-            hovertext=[hover_text[i] for i in np.where(unselected_incorrect)[0]],
-            hoverinfo="text",
-            customdata=np.where(unselected_incorrect)[0],
-        ))
-
-    # Selected correct (not current)
-    selected_correct_not_current = correct_mask & selected_not_current_mask
-    if selected_correct_not_current.any():
-        fig.add_trace(go.Scatterpolar(
-            r=elevation[selected_correct_not_current],
-            theta=azimuth[selected_correct_not_current],
-            mode="markers",
-            marker=dict(size=7, color="darkblue", opacity=0.8, line=dict(width=2, color="navy")),
-            name="📍 Selected Correct",
-            hovertext=[hover_text[i] for i in np.where(selected_correct_not_current)[0]],
-            hoverinfo="text",
-            customdata=np.where(selected_correct_not_current)[0],
-        ))
-
-    # Selected incorrect (not current)
-    selected_incorrect_not_current = incorrect_mask & selected_not_current_mask
-    if selected_incorrect_not_current.any():
-        fig.add_trace(go.Scatterpolar(
-            r=elevation[selected_incorrect_not_current],
-            theta=azimuth[selected_incorrect_not_current],
-            mode="markers",
-            marker=dict(size=7, color="darkred", opacity=0.8, line=dict(width=2, color="maroon")),
-            name="📍 Selected Incorrect",
-            hovertext=[hover_text[i] for i in np.where(selected_incorrect_not_current)[0]],
-            hoverinfo="text",
-            customdata=np.where(selected_incorrect_not_current)[0],
-        ))
-
-    # Current
-    current_correct = correct_mask & current_mask
-    if current_correct.any():
-        fig.add_trace(go.Scatterpolar(
-            r=elevation[current_correct],
-            theta=azimuth[current_correct],
-            mode="markers",
-            marker=dict(size=14, color="darkblue", opacity=1.0, line=dict(width=4, color="navy")),
-            name="🎯 Currently Displayed Correct",
-            hovertext=[hover_text[i] for i in np.where(current_correct)[0]],
-            hoverinfo="text",
-            customdata=np.where(current_correct)[0],
-        ))
-
-    current_incorrect = incorrect_mask & current_mask
-    if current_incorrect.any():
-        fig.add_trace(go.Scatterpolar(
-            r=elevation[current_incorrect],
-            theta=azimuth[current_incorrect],
-            mode="markers",
-            marker=dict(size=14, color="darkred", opacity=1.0, line=dict(width=4, color="maroon")),
-            name="🎯 Currently Displayed Incorrect",
-            hovertext=[hover_text[i] for i in np.where(current_incorrect)[0]],
-            hoverinfo="text",
-            customdata=np.where(current_incorrect)[0],
-        ))
-
-    title_text = f"Azimuth-Elevation"
-    if current_highlighted_index is not None:
-        title_text += f"<br>🎯 Currently displaying position {current_highlighted_index}"
-    elif selected_indices:
-        title_text += f"<br>📍 {len(selected_indices)} positions selected"
-
-    fig.update_layout(
-        polar=dict(
-            radialaxis=dict(visible=True, range=[0, 90], ticksuffix="°", title="Elevation"),
-            angularaxis=dict(ticksuffix="°", rotation=90, direction="clockwise"),
-        ),
-        title=title_text,
-        showlegend=True,
-        height=600,
-        font=dict(size=12),
-    )
-    return fig
-
-
-def render_image_at_position(
-    robust_analyzer: RobustnessAnalyzer,
-    results: Dict,
-    position_idx: int,
-    envmap_idx: int = 0,
-) -> Optional[Dict]:
-    try:
-        # Get actual number of environments from envmap_paths
-        envmap_paths = results.get("envmap_paths", [])
-        total_envmaps = _get_num_envmaps(envmap_paths)
-
-        # Load stored logits for later use
-        stored_logits = torch.stack(results["final_logits"])
-
-        # Structure: (num_runs * batch_size * n_envmaps)
-        positions_per_run = robust_analyzer.batch_size * total_envmaps
-        run_idx = position_idx // positions_per_run
-        remaining = position_idx % positions_per_run
-        batch_idx = remaining // total_envmaps
-        env_idx = remaining % total_envmaps
-
-        run_idx = min(run_idx, len(results["final_scene_params"]) - 1)
-        batch_idx = min(batch_idx, robust_analyzer.batch_size - 1)
-        env_idx = min(env_idx, total_envmaps - 1)
-
-        # Update model with scene parameters
-        scene_params = results["final_scene_params"][run_idx]
-        robust_analyzer.model.update_scene_params(scene_params)
-
-        with torch.no_grad():
-            render_images = robust_analyzer.model.render(with_grad=False)
-
-            if len(render_images.shape) == 5:  # [batch, env, H, W, C]
-                image = render_images[batch_idx, env_idx]
-            else:  # [batch, H, W, C]
-                image = render_images[batch_idx]
-
-            image_np = utils.to_numpy(image)
-            if image_np.max() <= 1.0:
-                image_np = (image_np * 255).astype(np.uint8)
-
-            if len(stored_logits.shape) == 4:  # [runs, batch, env, classes]
-                pred_logits = stored_logits[run_idx, batch_idx, env_idx]
-            else:  # [runs, batch, classes]
-                pred_logits = stored_logits[run_idx, batch_idx]
-
-            pred_class_idx = int(pred_logits.argmax().item())
-            pred_prob = float(torch.softmax(pred_logits, dim=0)[pred_class_idx].item())
-
-            # Calculate target class ranking
-            target_class_ranking = None
-            target_class_confidence = None
-            if st.session_state.get("target_class"):
-                target_idx = _get_idx_safe(st.session_state["target_class"])
-                sorted_indices = torch.argsort(pred_logits, descending=True)
-                target_class_ranking = int((sorted_indices == target_idx).nonzero(as_tuple=True)[0].item()) + 1
-                target_class_confidence = float(torch.softmax(pred_logits, dim=0)[target_idx].item())
-
-            # Get config to determine num_classes
-            config = st.session_state.get("config", {})
-            num_classes = config.get("num_classes", 1000)
-            custom_labels = config.get("custom_labels")
-            pred_class = get_class_label(pred_class_idx, num_classes, custom_labels)
-
-            camera_pos = scene_params["camera"][batch_idx:batch_idx + 1]
-            azimuth, elevation, distance = utils.compute_spherical_coordinates(camera_pos.cpu().numpy())
-
-            return {
-                "image": image_np,
-                "prediction": pred_class,
-                "confidence": pred_prob,
-                "class_idx": pred_class_idx,
-                "azimuth": float(azimuth[0]),
-                "elevation": float(elevation[0]),
-                "distance": float(distance[0]),
-                "position_idx": position_idx,
-                "run_idx": run_idx,
-                "batch_idx": batch_idx,
-                "env_idx": env_idx,
-                "target_class_ranking": target_class_ranking,
-                "target_class_confidence": target_class_confidence,
-            }
-
-    except Exception as e:
-        st.error(f"Error rendering image at position {position_idx}: {str(e)}")
-    return None
-
-
-def render_multiple_images(
-    robust_analyzer: RobustnessAnalyzer,
-    results: Dict,
-    position_indices: Sequence[int],
-) -> List[Dict]:
-    if not position_indices:
-        return []
-
-    rendered_images: List[Dict] = []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-
-    for i, position_idx in enumerate(position_indices):
-        progress_bar.progress((i + 1) / len(position_indices))
-        status_text.info(f"🎨 Rendering image {i + 1}/{len(position_indices)} (Position {position_idx})...")
-        try:
-            image_info = render_image_at_position(robust_analyzer, results, position_idx)
-            if image_info:
-                rendered_images.append(image_info)
-            else:
-                st.warning(f"⚠️ Failed to render image at position {position_idx}")
-        except Exception as e:
-            st.error(f"❌ Error rendering position {position_idx}: {str(e)}")
-
-    progress_bar.empty()
-    status_text.empty()
-    return rendered_images
-
-
-# Composite Image Creation
-def create_individual_heatmap(
-    camera_positions: np.ndarray,
-    labels_correct: np.ndarray,
-    logits: torch.Tensor,
-    target_class: str,
-    topk_value: int,
-    highlighted_index: int,
-    config: Dict,
-    image_info: Optional[Dict] = None,
-) -> go.Figure:
-    fig = create_interactive_polar_plot(
-        camera_positions,
-        labels_correct,
-        logits,
-        target_class,
-        topk_value,
-        selected_indices=None,
-        current_highlighted_index=highlighted_index,
-        num_classes=config.get("num_classes", 1000),
-        custom_labels=config.get("custom_labels"),
-    )
-
-    azimuth, elevation, _ = utils.compute_spherical_coordinates(camera_positions)
-    title_parts = [f"Azimuth: {azimuth[highlighted_index]:.1f}°, Elevation: {elevation[highlighted_index]:.1f}°"]
-
-    if image_info:
-        title_parts.append(f"Predicted: {image_info['prediction'][:25]}...")
-        title_parts.append(f"Confidence: {image_info['confidence']:.3f}")
-    title_parts.append(f"Target: {target_class[:30]}...")
-
-    fig.update_layout(title="<br>".join(title_parts), height=500, width=500)
-    return fig
-
-
-def create_composite_image(
-    image_info: Dict,
-    camera_positions: np.ndarray,
-    labels_correct: np.ndarray,
-    logits: torch.Tensor,
-    config: Dict,
-) -> Image.Image:
-    rendered_img = Image.fromarray(image_info["image"])
-
-    topk_value = st.session_state.get("topk_value", 1)
-    heatmap_img: Optional[Image.Image] = None
-
-    # Try Plotly export first
-    try:
-        fig = create_individual_heatmap(
-            camera_positions,
-            labels_correct,
-            logits,
-            config["target_class"],
-            topk_value,
-            image_info["position_idx"],
-            config,
-            image_info,
-        )
-        heatmap_bytes = fig.to_image(format="png", width=500, height=500, scale=2)
-        heatmap_img = Image.open(io.BytesIO(heatmap_bytes))
-        print("✅ Plotly heatmap created successfully")
-
-    except Exception as e:
-        # Silent fallback to matplotlib when Plotly fails
-        heatmap_img = None
-        try:
-            fig = plt.figure(figsize=(5, 5))
-            ax = fig.add_subplot(111, projection="polar")
-
-            azimuth, elevation, _ = utils.compute_spherical_coordinates(camera_positions)
-            azimuth_rad = np.radians(azimuth)
-
-            correct_mask = labels_correct.astype(bool)
-            incorrect_mask = ~correct_mask
-
-            if incorrect_mask.any():
-                ax.scatter(
-                    azimuth_rad[incorrect_mask], elevation[incorrect_mask],
-                    c="lightcoral", s=30, alpha=0.6, label=f"Incorrect",
-                )
-            if correct_mask.any():
-                ax.scatter(
-                    azimuth_rad[correct_mask], elevation[correct_mask],
-                    c="lightblue", s=30, alpha=0.6, label=f"Correct",
-                )
-
-            hi = image_info["position_idx"]
-            highlighted_azimuth = azimuth_rad[hi]
-            highlighted_elevation = elevation[hi]
-            is_correct = bool(labels_correct[hi])
-            color, edge_color = ("darkblue", "navy") if is_correct else ("darkred", "maroon")
-
-            ax.scatter(highlighted_azimuth, highlighted_elevation, c=color, s=150, alpha=1.0, edgecolors=edge_color, linewidth=3)
-            ax.set_ylim(0, 90)
-            ax.set_theta_direction(-1)
-            ax.set_theta_zero_location("N")
-
-            title_lines = [
-                f'Azimuth: {azimuth[hi]:.1f}°, Elevation: {elevation[hi]:.1f}°',
-                f'Predicted: {image_info["prediction"][:25]}... (Conf: {image_info["confidence"]:.3f})',
-            ]
-            ax.set_title("\n".join(title_lines), pad=20, fontsize=9)
-            ax.legend(loc="upper left", bbox_to_anchor=(0, 1), fontsize="small")
-
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
-            buf.seek(0)
-            heatmap_img = Image.open(buf)
-            plt.close(fig)
-
-        except Exception as e2:
-            # Last resort placeholder
-            heatmap_img = Image.new("RGB", (500, 500), color="lightgray")
-            draw = ImageDraw.Draw(heatmap_img)
-
-            # Find a usable font
-            font = None
-            for fp in [
-                "C:/Windows/Fonts/arial.ttf",
-                "/System/Library/Fonts/Arial.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                "arial.ttf",
-            ]:
-                try:
-                    font = ImageFont.truetype(fp, 14)
-                    break
-                except Exception:
-                    continue
-            if font is None:
-                font = ImageFont.load_default()
-
-            azimuth, elevation, _ = utils.compute_spherical_coordinates(camera_positions)
-            msg = (
-                "Heatmap unavailable\n(Plotting libraries unavailable)\n\n"
-                f"Position: {image_info['position_idx']}\n"
-                f"Azimuth: {azimuth[image_info['position_idx']]:.1f}°\n"
-                f"Elevation: {elevation[image_info['position_idx']]:.1f}°\n"
-                f"Predicted: {image_info['prediction'][:20]}...\n"
-                f"Confidence: {image_info['confidence']:.3f}"
-            )
-            bbox = draw.textbbox((0, 0), msg, font=font)
-            x = (500 - (bbox[2] - bbox[0])) // 2
-            y = (500 - (bbox[3] - bbox[1])) // 2
-            draw.text((x, y), msg, fill="black", font=font, align="center")
-
-    # Standardize sizes and compose
-    rendered_size = (400, 400)
-    heatmap_size = (400, 400)
-
-    rendered_img = rendered_img.resize(rendered_size, Image.Resampling.LANCZOS)
-    heatmap_img = heatmap_img.resize(heatmap_size, Image.Resampling.LANCZOS)
-
-    margin = 20
-    total_w = rendered_size[0] + heatmap_size[0] + 3 * margin
-    total_h = max(rendered_size[1], heatmap_size[1]) + 2 * margin
-
-    composite = Image.new("RGB", (total_w, total_h), color="white")
-    composite.paste(rendered_img, (margin, margin))
-    composite.paste(heatmap_img, (margin + rendered_size[0] + margin, margin))
-
-    draw = ImageDraw.Draw(composite)
-    label = None
-    for fp in [
-        "C:/Windows/Fonts/arial.ttf",
-        "/System/Library/Fonts/Arial.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "arial.ttf",
-    ]:
-        try:
-            label = ImageFont.truetype(fp, 14)
-            break
-        except Exception:
-            continue
-    if label is None:
-        try:
-            label = ImageFont.load_default()
-        except Exception:
-            label = None
-
-    label_y = margin + max(rendered_size[1], heatmap_size[1]) + 5
-    if label:
-        r_text, h_text = "Rendered Image", "Map"
-        r_w = draw.textbbox((0, 0), r_text, font=label)[2]
-        h_w = draw.textbbox((0, 0), h_text, font=label)[2]
-        r_x = margin + (rendered_size[0] - r_w) // 2
-        h_x = margin + rendered_size[0] + margin + (heatmap_size[0] - h_w) // 2
-        draw.text((r_x, label_y), r_text, fill="black", font=label)
-        draw.text((h_x, label_y), h_text, fill="black", font=label)
-
-    return composite
-
-
-# Downloads
-def download_single_image_package(
-    image_info: Dict,
-    camera_positions: np.ndarray,
-    labels_correct: np.ndarray,
-    logits: torch.Tensor,
-    config: Dict,
-) -> bytes:
-    with tempfile.TemporaryDirectory() as temp_dir:
-        pkg_dir = Path(temp_dir) / f"robustness_image_{image_info['position_idx']}"
-        pkg_dir.mkdir(exist_ok=True)
-
-        composite_img = create_composite_image(image_info, camera_positions, labels_correct, logits, config)
-        composite_path = pkg_dir / f"position_{image_info['position_idx']}_analysis.png"
-        composite_img.save(composite_path, format="PNG", dpi=(300, 300))
-
-        json_metadata = {
-            "position_idx": image_info["position_idx"],
-            "azimuth": float(image_info["azimuth"]),
-            "elevation": float(image_info["elevation"]),
-            "distance": float(image_info["distance"]),
-            "prediction": image_info["prediction"],
-            "confidence": float(image_info["confidence"]),
-            "class_idx": int(image_info["class_idx"]),
-            "run_idx": image_info["run_idx"],
-            "batch_idx": image_info["batch_idx"],
-            "env_idx": image_info["env_idx"],
-            "target_class": config.get("target_class", ""),
-            "is_correct": image_info["class_idx"] == _get_idx_safe(config.get("target_class", "")),
-            "analysis_config": {
-                "batch_size": config.get("batch_size"),
-                "params_to_optimize": config.get("params_to_optimize"),
-                "num_runs": config.get("num_runs"),
-                "num_iterations": config.get("num_iterations"),
-                "learning_rate": config.get("learning_rate"),
-                "image_size": config.get("image_size"),
-            },
-            "timestamp": _now_iso(),
-        }
-        (pkg_dir / f"position_{image_info['position_idx']}_metadata.json").write_text(json.dumps(json_metadata, indent=2))
-
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for fp in pkg_dir.rglob("*"):
-                if fp.is_file():
-                    zipf.write(fp, fp.relative_to(pkg_dir))
-        buf.seek(0)
-        return buf.getvalue()
-
-
-def download_all_images_package(
-    rendered_images: Sequence[Dict],
-    camera_positions: np.ndarray,
-    labels_correct: np.ndarray,
-    logits: torch.Tensor,
-    config: Dict,
-) -> bytes:
-    with tempfile.TemporaryDirectory() as temp_dir:
-        pkg_dir = Path(temp_dir) / "robustness_analysis_all_images"
-        pkg_dir.mkdir(exist_ok=True)
-
-        summary = {
-            "total_images": len(rendered_images),
-            "target_class": config.get("target_class", ""),
-            "analysis_config": {
-                "batch_size": config.get("batch_size"),
-                "params_to_optimize": config.get("params_to_optimize"),
-                "num_runs": config.get("num_runs"),
-                "num_iterations": config.get("num_iterations"),
-                "learning_rate": config.get("learning_rate"),
-                "image_size": config.get("image_size"),
-            },
-            "images": [],
-            "timestamp": _now_iso(),
-        }
-
-        target_idx = _get_idx_safe(config.get("target_class", ""))
-
-        for image_info in rendered_images:
-            composite_img = create_composite_image(image_info, camera_positions, labels_correct, logits, config)
-            out_path = pkg_dir / f"position_{image_info['position_idx']:03d}_analysis.png"
-            composite_img.save(out_path, format="PNG", dpi=(300, 300))
-            summary["images"].append({
-                "position_idx": image_info["position_idx"],
-                "azimuth": float(image_info["azimuth"]),
-                "elevation": float(image_info["elevation"]),
-                "distance": float(image_info["distance"]),
-                "prediction": image_info["prediction"],
-                "confidence": float(image_info["confidence"]),
-                "is_correct": (image_info["class_idx"] == target_idx),
-                "filename": out_path.name,
-            })
-
-        (pkg_dir / "analysis_summary.json").write_text(json.dumps(summary, indent=2))
-
-        # Overall heatmap with all positions highlighted
-        all_positions = [img["position_idx"] for img in rendered_images]
-        overall_fig = create_interactive_polar_plot(
-            camera_positions,
-            labels_correct,
-            logits,
-            config["target_class"],
-            st.session_state.get("topk_value", 1),
-            selected_indices=all_positions,
-            current_highlighted_index=None,
-            num_classes=config.get("num_classes", 1000),
-            custom_labels=config.get("custom_labels"),
-        )
-        overall_fig.update_layout(
-            title=f"All Rendered Positions Overview<br>Target: {config['target_class'][:30]}...<br>{len(rendered_images)} positions analyzed",
-            height=800,
-            width=800,
-        )
-
-        try:
-            overall_fig.write_image(str(pkg_dir / "overview_heatmap.png"), width=800, height=800, scale=2)
-        except Exception:
-            overall_fig.write_html(str(pkg_dir / "overview_heatmap.html"))
-
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for fp in pkg_dir.rglob("*"):
-                if fp.is_file():
-                    zipf.write(fp, fp.relative_to(pkg_dir))
-        buf.seek(0)
-        return buf.getvalue()
-
-
-def create_image_carousel(rendered_images: Sequence[Dict]) -> None:
-    if not rendered_images:
-        st.info("No images to display")
-        return
-
-    st.session_state.setdefault("carousel_index", 0)
-    if st.session_state["carousel_index"] >= len(rendered_images):
-        st.session_state["carousel_index"] = 0
-
-    idx = st.session_state["carousel_index"]
-    current = rendered_images[idx]
-
-    col_prev, col_info, col_next = st.columns([1, 2, 1])
-    with col_prev:
-        if st.button("◀️ Previous", key=f"prev_image_{len(rendered_images)}", use_container_width=True):
-            st.session_state["carousel_index"] = (idx - 1) % len(rendered_images)
-            st.rerun()
-    with col_info:
-        st.markdown(f"<div style='text-align: center'><h4>Image {idx + 1} of {len(rendered_images)}</h4></div>", unsafe_allow_html=True)
-    with col_next:
-        if st.button("Next ▶️", key=f"next_image_{len(rendered_images)}", use_container_width=True):
-            st.session_state["carousel_index"] = (idx + 1) % len(rendered_images)
-            st.rerun()
-
-    st.markdown("---")
-
-    if current.get("env_idx") is not None and "results" in st.session_state:
-        results = st.session_state["results"]
-        envmap_paths = results.get("envmap_paths", [])
-        if envmap_paths and current["env_idx"] < len(envmap_paths):
-            env_name = Path(envmap_paths[current["env_idx"]]).name
-            st.caption(f"🌍 **Environment:** {env_name}")
-
-    d1, d2, _, d4, _ = st.columns([1, 2, 0.5, 2, 1])
-
-    include_heatmap = st.session_state.get("include_heatmap_global", True)
-
-    with d2:
-        if ("results" in st.session_state and "config" in st.session_state):
-            try:
-                results = st.session_state["results"]
-                config = st.session_state["config"]
-
-                logits = torch.stack(results["final_logits"])
-                cameras = torch.stack([x["camera"] for x in results["final_scene_params"]])
-
-                # Get envmap_paths from results
-                envmap_paths = results.get("envmap_paths", [])
-
-                logits2d, cams2d = _expand_for_envmaps(logits, cameras, envmap_paths)
-
-                topk = st.session_state.get("topk_value", 1)
-                try:
-                    labels_correct = utils.get_labels_correct(logits2d, config["target_class"], topk=topk)
-                except Exception as e:
-                    st.error(f"Error getting labels: {str(e)}")
-                    # Create a fallback labels_correct array (assume all incorrect)
-                    labels_correct = torch.zeros(len(logits2d), dtype=torch.bool)
-
-                if include_heatmap:
-                    composite = create_composite_image(
-                        current, cams2d.numpy(), labels_correct.numpy(), logits2d, config
-                    )
-                    buf = io.BytesIO()
-                    composite.save(buf, format="PNG", dpi=(300, 300))
-                    buf.seek(0)
-                    file_name = f"robustness_position_{current['position_idx']}_analysis.png"
-                    button_label = "📥 Download Current Image"
-                else:
-                    rendered_img = Image.fromarray(current["image"])
-                    buf = io.BytesIO()
-                    rendered_img.save(buf, format="PNG", dpi=(300, 300))
-                    buf.seek(0)
-                    file_name = f"robustness_position_{current['position_idx']}_rendered.png"
-                    button_label = "📥 Download Current Image"
-
-                st.download_button(
-                    label=button_label,
-                    data=buf.getvalue(),
-                    file_name=file_name,
-                    mime="image/png",
-                    key=f"dl_btn_single_{idx}_{include_heatmap}",
-                    use_container_width=True
-                )
-            except Exception as e:
-                st.error(f"❌ Error creating image: {str(e)}")
-                st.code(traceback.format_exc())
-        else:
-            st.button("📥 Download Current Image", disabled=True, help="Analysis data not available", use_container_width=True)
-
-    with d4:
-        if ("results" in st.session_state and "config" in st.session_state and rendered_images):
-            cache_key = f"carousel_zip_{len(rendered_images)}_{hash(tuple(img['position_idx'] for img in rendered_images))}_{include_heatmap}"
-
-            if cache_key not in st.session_state:
-                try:
-                    with st.spinner("Preparing download..."):
-                        results = st.session_state["results"]
-                        config = st.session_state["config"]
-
-                        logits = torch.stack(results["final_logits"])
-                        cameras = torch.stack([x["camera"] for x in results["final_scene_params"]])
-
-                        # Get envmap_paths from results
-                        envmap_paths = results.get("envmap_paths", [])
-
-                        logits2d, cams2d = _expand_for_envmaps(logits, cameras, envmap_paths)
-
-                        topk = st.session_state.get("topk_value", 1)
-                        try:
-                            labels_correct = utils.get_labels_correct(logits2d, config["target_class"], topk=topk)
-                        except Exception as e:
-                            st.error(f"Error getting labels: {str(e)}")
-                            # Create a fallback labels_correct array (assume all incorrect)
-                            labels_correct = torch.zeros(len(logits2d), dtype=torch.bool)
-
-                        zbuf = io.BytesIO()
-                        with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zipf:
-                            for image_info in rendered_images:
-                                if include_heatmap:
-                                    composite = create_composite_image(
-                                        image_info, cams2d.numpy(), labels_correct.numpy(), logits2d, config
-                                    )
-                                    ibuf = io.BytesIO()
-                                    composite.save(ibuf, format="PNG", dpi=(300, 300))
-                                    ibuf.seek(0)
-                                    zipf.writestr(f"position_{image_info['position_idx']:03d}_analysis.png", ibuf.getvalue())
-                                else:
-                                    rendered_img = Image.fromarray(image_info["image"])
-                                    ibuf = io.BytesIO()
-                                    rendered_img.save(ibuf, format="PNG", dpi=(300, 300))
-                                    ibuf.seek(0)
-                                    zipf.writestr(f"position_{image_info['position_idx']:03d}_rendered.png", ibuf.getvalue())
-
-                                    metadata = {
-                                        "position_idx": image_info["position_idx"],
-                                        "prediction": image_info.get("prediction", "N/A"),
-                                        "confidence": image_info.get("confidence", 0),
-                                        "azimuth": image_info.get("azimuth", 0),
-                                        "elevation": image_info.get("elevation", 0),
-                                        "distance": image_info.get("distance", 0),
-                                        "env_idx": image_info.get("env_idx", 0),
-                                    }
-
-                        zbuf.seek(0)
-                        st.session_state[cache_key] = zbuf.getvalue()
-
-                except Exception as e:
-                    st.error(f"❌ Error preparing download: {str(e)}")
-
-            if cache_key in st.session_state:
-                st.download_button(
-                    label="📦 Download All Images (ZIP)",
-                    data=st.session_state[cache_key],
-                    file_name="robustness_positions_batch.zip",
-                    mime="application/zip",
-                    key=f"dl_btn_batch_{cache_key}",
-                    use_container_width=True
-                )
-        else:
-            st.button("📦 Download All Images (ZIP)", disabled=True, help="Analysis data not available", use_container_width=True)
-
-    st.markdown("---")
-    col_img, col_info = st.columns([2, 1])
-
-    with col_img:
-        render_img = Image.fromarray(current["image"])
-        st.image(render_img, use_container_width=True)
-
-    with col_info:
-        st.write(""); st.write("")
-        st.write("**Prediction Info:**")
-        st.write(f"🎯 **Class:** {current['prediction']}")
-        st.write(f"📊 **Confidence:** {current['confidence']:.3f}")
-        if current.get("target_class_ranking"):
-            st.write(f"🏆 **Target Ranking:** #{current['target_class_ranking']}")
-        if current.get("target_class_confidence"):
-            st.write(f"🎪 **Target Confidence:** {current['target_class_confidence']:.3f}")
-
-        st.write(""); st.write("")
-        st.write("**Camera Position:**")
-        st.write(f"🧭 **Azimuth:** {current['azimuth']:.2f}°")
-        st.write(f"📈 **Elevation:** {current['elevation']:.2f}°")
-        st.write(f"📏 **Distance:** {current['distance']:.3f}")
-
-        st.write(""); st.write("")
-        st.write("**Metadata:**")
-        st.write(f"📍 **Position Index:** {current['position_idx']}")
-        st.write(f"🏃 **Run:** {current['run_idx']}")
-        st.write(f"🖼️ **Batch:** {current['batch_idx']}")
-
-    st.markdown("---")
-
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        include_heatmap = st.checkbox(
-            "Include Heatmap Overlay",
-            value=st.session_state.get("include_heatmap_global", True),
-            help="Show heatmap overlay on top of rendered images"
-        )
-        st.session_state["include_heatmap_global"] = include_heatmap
-    with col_b:
-        st.write("")
-        if st.button("🔄 Rerender All", help="Re-render all selected images"):
-            st.session_state["rendered_images"] = []
-            st.session_state["image_cache_key"] = None
-            st.rerun()
-    with col_c:
-        st.write("")
-        if st.button("Clear Selection", help="Clear selected positions and start over"):
-            st.session_state["selected_positions"] = []
-            st.session_state["rendered_images"] = []
-            st.session_state["trigger_render"] = False
-            st.rerun()
-
-def visualize_results(results: Dict, config: Dict):
-    st.header("📊 Results Visualization")
-
-    try:
-        logits_stack = torch.stack(results["final_logits"])
-        cams_stack = torch.stack([x["camera"] for x in results["final_scene_params"]])
-
-        # Get environment information from results
-        envmap_paths = results.get("envmap_paths", [])
-        n_envmaps = _get_num_envmaps(envmap_paths)
-
-        # Debug: Show shapes
-        if st.checkbox("🐛 Show Debug Info", value=False, key="debug_shapes"):
-            st.write(f"**logits_stack shape:** {logits_stack.shape}")
-            st.write(f"**cams_stack shape:** {cams_stack.shape}")
-            st.write(f"**Number of environments:** {n_envmaps}")
-            st.write(f"**envmap_paths:** {envmap_paths}")
-
-        st.subheader("🌍 Environment Selection")
-
-        if n_envmaps > 1:
-            env_options = ["All Environments"] + [f"Environment {i+1}: {Path(envmap_paths[i]).name}" for i in range(n_envmaps)]
-            selected_env = st.selectbox(
-                "Select Environment to Visualize",
-                options=range(len(env_options)),
-                format_func=lambda x: env_options[x],
-                index=0,
-                help=f"Choose to view all environments together or filter by specific environment (Total: {n_envmaps})"
-            )
-
-            if selected_env == 0:  # All environments
-                st.info(f"📊 Showing results from **all {n_envmaps} environments** combined")
-                logits2d, cams2d = _expand_for_envmaps(logits_stack, cams_stack, envmap_paths)
-                env_filter_idx = None
-            else:  # Specific environment
-                env_idx = selected_env - 1
-                st.success(f"✅ Filtered to **{Path(envmap_paths[env_idx]).name}**")
-
-                # First expand cameras for all environments, then filter
-                # Expand cameras to match environment dimension
-                cams_expanded = cams_stack.unsqueeze(2).expand(-1, -1, n_envmaps, -1)
-
-                # Extract only the selected environment's data
-                if len(logits_stack.shape) == 4:  # [runs, batch, env, classes]
-                    filtered_logits = logits_stack[:, :, env_idx, :]  # [runs, batch, classes]
-                    filtered_cams = cams_expanded[:, :, env_idx, :]  # [runs, batch, 3]
-                else:
-                    filtered_logits = logits_stack
-                    filtered_cams = cams_stack
-
-                # Reshape both to 2D
-                num_classes = filtered_logits.shape[-1]  # Infer from shape
-                logits2d = filtered_logits.reshape(-1, num_classes)  # [runs*batch, classes]
-                cams2d = filtered_cams.reshape(-1, 3)  # [runs*batch, 3]
-                env_filter_idx = env_idx
-        else:
-            st.info(f"📊 Using **single environment**: {Path(envmap_paths[0]).name if envmap_paths else 'No environment map'}")
-            logits2d, cams2d = _expand_for_envmaps(logits_stack, cams_stack, envmap_paths)
-            env_filter_idx = None
-
-        # Store selected environment in session state for rendering
-        st.session_state["selected_env_idx"] = env_filter_idx if env_filter_idx is not None else 0
-
-        # Debug: Show processed shapes
-        if st.session_state.get("debug_shapes", False):
-            st.write(f"**After processing:**")
-            st.write(f"- logits2d shape: {logits2d.shape}")
-            st.write(f"- cams2d shape: {cams2d.shape}")
-            st.write(f"- env_filter_idx: {env_filter_idx}")
-
-        total_positions = len(logits2d)
-        assert len(cams2d) == total_positions, f"Mismatch: {len(cams2d)} camera positions vs {len(logits2d)} logit entries"
-
-        with st.expander("🏷️ Most Predicted Classes (Top 5)", expanded=False):
-            preds_top1 = _pred_top1(logits2d)
-            values, counts = np.unique(preds_top1, return_counts=True)
-            order = np.argsort(-counts)
-            top_n = min(5, len(order))
-
-            # Get num_classes from config
-            config = st.session_state.get("config", {})
-            num_classes = config.get("num_classes", 1000)
-            custom_labels = config.get("custom_labels")
-            for rank in range(top_n):
-                cls_id = int(values[order[rank]])
-                cnt = int(counts[order[rank]])
-                pct = (cnt / total_positions) * 100.0
-                label = get_class_label(cls_id, num_classes, custom_labels)
-                # Only truncate ImageNet labels (they're long), show full generic class names
-                display_label = label[:30] + "..." if num_classes == 1000 and len(label) > 30 else label
-                st.write(f"{rank+1}. {display_label} — {cnt} ({pct:.1f}%)")
-
-        with st.expander("📊 Environment Statistics", expanded=False):
-            # Show environment breakdown if multiple environments
-            if n_envmaps > 1 and env_filter_idx is None:  # Only when viewing all environments
-                st.subheader("📈 Results by Environment")
-
-                # Split results by environment
-                num_classes = logits_stack.shape[-1]  # Infer from shape
-                logits_full = logits_stack.reshape(-1, n_envmaps, num_classes)
-
-                env_stats = []
-                topk = st.session_state.get("topk_value", 1)
-                for i in range(n_envmaps):
-                    env_logits = logits_full[:, i, :]
-                    env_logits_flat = env_logits.reshape(-1, num_classes)
-
-                    labels_correct_env = utils.get_labels_correct(env_logits_flat, config["target_class"], topk=topk)
-                    accuracy = (labels_correct_env.sum() / len(labels_correct_env) * 100).item()
-
-                    env_name = Path(envmap_paths[i]).name
-                    env_stats.append({
-                        "Environment": env_name,
-                        "Accuracy": f"{accuracy:.1f}%",
-                        "Correct": f"{int(labels_correct_env.sum())}/{len(labels_correct_env)}"
-                    })
-
-                import pandas as pd
-                st.dataframe(pd.DataFrame(env_stats), use_container_width=True)
-            else:
-                st.info("ℹ️ Switch to 'All Environments' above to see per-environment statistics")
-
-        st.subheader("🎯 Camera Position")
-        topk = st.session_state.get("topk_value", 1)
-        labels_correct = utils.get_labels_correct(logits2d, config["target_class"], topk=topk)
-
-        col_plot, col_manual = st.columns([2, 1])
-
-        with col_plot:
-            all_rendered_indices: Optional[List[int]] = None
-            current_highlighted_index: Optional[int] = None
-            selected_not_rendered: Optional[List[int]] = None
-
-            if st.session_state.get("selected_positions"):
-                selected_not_rendered = st.session_state["selected_positions"]
-
-            if st.session_state.get("rendered_images"):
-                rendered_images = st.session_state["rendered_images"]
-                all_rendered_indices = [img["position_idx"] for img in rendered_images]
-                cur_idx = st.session_state.get("carousel_index", 0)
-                if 0 <= cur_idx < len(rendered_images):
-                    current_highlighted_index = rendered_images[cur_idx]["position_idx"]
-
-            combined_selected_indices = selected_not_rendered
-
-            fig = create_interactive_polar_plot(
-                cams2d.numpy(),
-                labels_correct.numpy(),
-                logits2d,
-                config["target_class"],
-                topk,
-                selected_indices=combined_selected_indices,
-                current_highlighted_index=current_highlighted_index,
-                num_classes=config.get("num_classes", 1000),
-                custom_labels=config.get("custom_labels"),
-            )
-
-            event = st.plotly_chart(fig, use_container_width=True, on_select="rerun", key="polar_plot")
-
-            if st.checkbox("🔍 Debug Mode", value=False):
-                st.write("**Event Debug Info:**")
-                st.write(f"Event: {event}")
-
-            # Selection handling
-            if event and isinstance(event, dict):
-                selection = None
-                if "selection" in event and event["selection"]:
-                    if "points" in event["selection"] and event["selection"]["points"]:
-                        selection = event["selection"]["points"]
-                    elif "point_indices" in event["selection"]:
-                        selection = event["selection"]["point_indices"]
-
-                if selection:
-                    try:
-                        sel_positions: List[int] = []
-                        for point in selection:
-                            pos_idx = None
-                            if isinstance(point, dict):
-                                if "customdata" in point:
-                                    pos_idx = int(point["customdata"])
-                                elif "pointIndex" in point:
-                                    pos_idx = int(point["pointIndex"])
-                            elif isinstance(point, (int, float)):
-                                pos_idx = int(point)
-                            if pos_idx is not None:
-                                sel_positions.append(pos_idx)
-
-                        if sel_positions:
-                            st.session_state["selected_positions"] = sel_positions
-                            if len(sel_positions) == 1:
-                                st.success(f"✅ Selected position {sel_positions[0]}")
-                            else:
-                                st.success(f"✅ Selected {len(sel_positions)} positions: {sel_positions}")
-                            st.session_state["trigger_render"] = True
-
-                    except Exception as e:
-                        st.error(f"❌ Error processing selection: {str(e)}")
-
-        with col_manual:
-            topk = int(st.number_input(
-                "Top-K Accuracy Threshold",
-                min_value=1, max_value=5,
-                value=st.session_state.get("topk_value", 1),
-                step=1,
-                help="Consider prediction correct if target class appears in top K predictions",
-            ))
-            st.session_state["topk_value"] = topk
-            labels_correct = utils.get_labels_correct(logits2d, config["target_class"], topk=topk)
-
-            correct_count = int(labels_correct.sum().item())
-            total_positions = len(labels_correct)
-            accuracy = (correct_count / total_positions) * 100
-            st.info(f"📊 **Top-{topk} Accuracy:** {correct_count}/{total_positions} ({accuracy:.1f}%) correct")
-
-            st.write(""); st.write("");
-            st.subheader("🎯 Render Selection")
-            target_idx = _get_idx_safe(config["target_class"])
-            target_probs = torch.softmax(logits2d, dim=1)[:, target_idx].cpu().numpy()
-
-            col_type, col_count = st.columns(2)
-            with col_type:
-                selection_type = st.selectbox(
-                    "Show positions with:",
-                    options=["worst_confidence", "best_confidence", "incorrect_predictions", "correct_predictions"],
-                    format_func=lambda x: {
-                        "worst_confidence": "▼ Lowest confidence (worst)",
-                        "best_confidence": "▲ Highest confidence (best)",
-                        "incorrect_predictions": "❌ Incorrect predictions",
-                        "correct_predictions": "✅ Correct predictions",
-                    }[x],
-                    help="Choose which type of positions to analyze",
-                )
-            with col_count:
-                max_positions = min(20, len(cams2d))
-                num_positions = st.number_input(
-                    "Number of positions",
-                    min_value=1, max_value=max_positions, value=min(5, max_positions), step=1,
-                    help=f"Number of positions to render (max {max_positions})",
-                )
-
-            if selection_type == "worst_confidence":
-                sorted_idx = np.argsort(target_probs)
-                selected_indices = sorted_idx[:num_positions]
-                desc = f"Top {num_positions} positions with lowest confidence in '{config['target_class'][:30]}...'"
-            elif selection_type == "best_confidence":
-                sorted_idx = np.argsort(target_probs)[::-1]
-                selected_indices = sorted_idx[:num_positions]
-                desc = f"Top {num_positions} positions with highest confidence in '{config['target_class'][:30]}...'"
-            elif selection_type == "incorrect_predictions":
-                preds1 = _pred_top1(logits2d)
-                incorrect = np.where(preds1 != target_idx)[0]
-                if len(incorrect) > 0:
-                    confs = target_probs[incorrect]
-                    order = incorrect[np.argsort(confs)]
-                    selected_indices = order[:num_positions]
-                    desc = f"Top {min(num_positions, len(selected_indices))} incorrect predictions (lowest confidence)"
-                else:
-                    selected_indices = np.array([], dtype=int)
-                    desc = "No incorrect predictions found!"
-            else:  # correct_predictions
-                preds1 = _pred_top1(logits2d)
-                correct = np.where(preds1 == target_idx)[0]
-                if len(correct) > 0:
-                    confs = target_probs[correct]
-                    order = correct[np.argsort(confs)[::-1]]
-                    selected_indices = order[:num_positions]
-                    desc = f"Top {min(num_positions, len(selected_indices))} correct predictions (highest confidence)"
-                else:
-                    selected_indices = np.array([], dtype=int)
-                    desc = "No correct predictions found!"
-
-            st.info(f"📋 **Selection:** {desc}")
-
-            if len(selected_indices) > 0:
-                confs = target_probs[selected_indices]
-                st.caption(f"**Confidence range:** {confs.min():.3f} - {confs.max():.3f} (avg: {confs.mean():.3f})")
-                with st.expander("🔍 Preview selected positions", expanded=False):
-                    # Get num_classes from config
-                    config = st.session_state.get("config", {})
-                    num_classes = config.get("num_classes", 1000)
-                    custom_labels = config.get("custom_labels")
-                    for i, pos_idx in enumerate(selected_indices):
-                        conf = target_probs[pos_idx]
-                        pred_idx = int(torch.argmax(logits2d[pos_idx]).item())
-                        pred_class = get_class_label(pred_idx, num_classes, custom_labels)
-                        status = "✅" if pred_idx == target_idx else "❌"
-                        # Only truncate ImageNet labels (they're long), show full generic class names
-                        display_class = pred_class[:25] + "..." if num_classes == 1000 and len(pred_class) > 25 else pred_class
-                        st.write(f"{i+1}. **Position {pos_idx}:** {status} {conf:.3f} confidence → {display_class}")
-
-            if st.button("🎨 Render Selected Positions", type="primary", disabled=len(selected_indices) == 0):
-                if len(selected_indices) > 0:
-                    st.session_state["selected_positions"] = selected_indices.tolist()
-                    st.session_state["trigger_render"] = True
-                    st.success(f"✅ Selected {len(selected_indices)} positions - updating heatmap and rendering...")
-                    st.rerun()
-
-        # Render selected images
-        if (st.session_state.get("trigger_render", False)
-            and st.session_state.get("selected_positions")
-            and st.session_state.get("robust_analyzer")):
-
-            st.subheader("🖼️ Rendered Images")
-            selected_positions = st.session_state["selected_positions"]
-            robust_analyzer = st.session_state["robust_analyzer"]
-
-            valid_positions = [pos for pos in selected_positions if pos < len(cams2d)]
-            if len(valid_positions) != len(selected_positions):
-                invalid = [pos for pos in selected_positions if pos >= len(cams2d)]
-                st.warning(f"⚠️ Removed invalid positions: {invalid}")
-
-            if valid_positions:
-                st.session_state["target_class"] = config["target_class"]
-                # Get selected environment index
-                selected_env_idx = st.session_state.get("selected_env_idx", 0)
-                cache_key = f"{sorted(valid_positions)}_{selected_env_idx}_{id(robust_analyzer)}"
-
-                if st.session_state.get("image_cache_key") != cache_key:
-                    with st.status("🎨 Rendering selected images...", expanded=True) as status:
-                        # Pass environment index to render function
-                        rendered_images = []
-                        progress_bar_render = st.progress(0)
-                        for i, pos_idx in enumerate(valid_positions):
-                            progress_bar_render.progress((i + 1) / len(valid_positions))
-                            image_info = render_image_at_position(
-                                robust_analyzer,
-                                results,
-                                pos_idx,
-                                envmap_idx=selected_env_idx
-                            )
-                            if image_info:
-                                rendered_images.append(image_info)
-
-                        st.session_state["rendered_images"] = rendered_images
-                        st.session_state["image_cache_key"] = cache_key
-                        st.session_state["carousel_index"] = 0
-                        status.update(label=f"✅ Rendered {len(rendered_images)} images!", state="complete")
-                        st.rerun()
-
-                if st.session_state.get("rendered_images"):
-                    create_image_carousel(st.session_state["rendered_images"])
-                else:
-                    st.error("❌ No images were successfully rendered")
-
-            st.session_state["trigger_render"] = False
-
-        elif st.session_state.get("rendered_images") and st.session_state.get("selected_positions"):
-            st.subheader("🖼️ Rendered Images")
-            create_image_carousel(st.session_state["rendered_images"])
-            st.info(f"📦 **Cached:** {len(st.session_state['rendered_images'])} images in memory")
-        else:
-            if not st.session_state.get("robust_analyzer"):
-                st.info("⚠️ No robust analyzer found. Please run the analysis first.")
-            else:
-                st.info("👆 Choose a point (or multiple points) on the polar plot or use the position selection to the right to see the rendered images!")
-
-        with st.expander("📊 Static Polar Plot", expanded=False):
-            utils.visualize_positions_polar(
-                cams2d.numpy(),
-                labels_correct.numpy(),
-                title=f"Azimuth-Elevation Heatmap",
-            )
-            polar_fig = plt.gcf()
-            col1, col2, col3 = st.columns([1, 2, 1])
-            with col2:
-                st.pyplot(polar_fig, use_container_width=True)
-            plt.close()
-
-        with st.expander("📈 Distribution Histograms", expanded=False):
-            utils.visualize_positions_with_distributions(
-                cams2d.numpy(),
-                labels_correct.numpy(),
-                title=f"Analysis of 3D Spherical Distribution of Model Classification",
-                mode="distributions",
-                show_distance=True
-            )
-            dist_fig = plt.gcf()
-            col1, col2, col3 = st.columns([1, 2, 1])
-            with col2:
-                st.pyplot(dist_fig, use_container_width=True)
-            plt.close()
-
-        return {
-            "camera_positions": cams2d.numpy(),
-            "labels_correct": labels_correct.numpy(),
-            "target_class": config["target_class"],
-            "topk": topk,
-        }
-
-    except Exception as e:
-        st.error(f"❌ Error in processing results: {str(e)}")
-        st.code(traceback.format_exc())
-        return None
-
-# Analysis
 def run_analysis(
     obj_path: str,
     texture_path: Optional[str],
@@ -2994,364 +2121,6 @@ def validate_weights_compatibility(weights_path: str, model_name: str) -> Tuple[
     except Exception as e:
         return False, f"Error loading weights: {str(e)}"
 
-def visualize_textures(textures_info: List[Dict], title: str = "Textures", compact: bool = False, show_used_status: bool = False) -> None:
-    """Display texture images in a grid layout."""
-    if not textures_info:
-        st.info("No textures to display")
-        return
-
-    st.subheader(f"🖼️ {title}")
-
-    # Calculate grid layout - more columns if compact
-    num_textures = len(textures_info)
-    cols_per_row = min(4 if compact else 3, num_textures)
-    rows = (num_textures + cols_per_row - 1) // cols_per_row
-
-    for row in range(rows):
-        cols = st.columns(cols_per_row)
-        for col_idx in range(cols_per_row):
-            texture_idx = row * cols_per_row + col_idx
-            if texture_idx < num_textures:
-                with cols[col_idx]:
-                    tex_info = textures_info[texture_idx]
-
-                    # Show usage status if requested
-                    if show_used_status:
-                        status_icon = "✅" if tex_info.get("used_in_atlas", False) else "⚪"
-                        caption = f"{status_icon} {tex_info['name']}\n{tex_info['size']}"
-                    else:
-                        caption = f"{tex_info['name']}\n{tex_info['size']}"
-
-                    st.image(
-                        tex_info["image"],
-                        caption=caption,
-                        use_container_width=True
-                    )
-
-
-def create_texture_atlas(obj_file, mtl_file, texture_files: List = None) -> Optional[Dict]:
-    """
-    Create texture atlas using the make_atlas.py script.
-
-    Returns:
-        Dict with paths to generated files or None if failed
-    """
-    if not obj_file or not mtl_file:
-        st.error("Both OBJ and MTL files are required for atlas creation")
-        return None
-
-    try:
-        # Create temporary directory for processing
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Save uploaded files
-            obj_path = os.path.join(temp_dir, obj_file.name)
-            mtl_path = os.path.join(temp_dir, mtl_file.name)
-
-            with open(obj_path, "wb") as f:
-                f.write(obj_file.read())
-            with open(mtl_path, "wb") as f:
-                f.write(mtl_file.read())
-
-            # Save texture files if provided
-            if texture_files:
-                for tex_file in texture_files:
-                    tex_path = os.path.join(temp_dir, tex_file.name)
-                    with open(tex_path, "wb") as f:
-                        f.write(tex_file.read())
-
-            # Define output paths
-            output_obj = os.path.join(temp_dir, "atlas_combined.obj")
-            output_mtl = os.path.join(temp_dir, "atlas_combined.mtl")
-            output_atlas = os.path.join(temp_dir, "atlas.png")
-
-            # Get the script path relative to current file
-            script_dir = Path(__file__).parent.absolute()
-            atlas_script = script_dir / "make_atlas.py"
-
-            # Call make_atlas.py script
-            cmd = [
-                sys.executable, str(atlas_script),
-                obj_path, mtl_path, output_obj, output_mtl, output_atlas
-            ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True, cwd=temp_dir)
-
-            if result.returncode != 0:
-                st.error(f"Atlas creation failed: {result.stderr}")
-                return None
-
-            # Read generated files into memory
-            atlas_data = {}
-
-            if os.path.exists(output_obj):
-                with open(output_obj, "rb") as f:
-                    atlas_data["obj_content"] = f.read()
-                    atlas_data["obj_name"] = "atlas_combined.obj"
-
-            if os.path.exists(output_mtl):
-                with open(output_mtl, "rb") as f:
-                    atlas_data["mtl_content"] = f.read()
-                    atlas_data["mtl_name"] = "atlas_combined.mtl"
-
-            if os.path.exists(output_atlas):
-                with open(output_atlas, "rb") as f:
-                    atlas_data["atlas_content"] = f.read()
-                    atlas_data["atlas_name"] = "atlas.png"
-                # Also load for preview
-                atlas_data["atlas_image"] = Image.open(output_atlas)
-
-            st.success("✅ Texture atlas created successfully!")
-            return atlas_data
-
-    except Exception as e:
-        st.error(f"Error creating texture atlas: {str(e)}")
-        return None
-
-
-def handle_texture_atlas():
-    """Handle texture atlas creation interface."""
-    st.subheader("🔧 Texture Atlas Creator")
-    st.info("💡 Combine multiple textures from an OBJ/MTL into a single atlas texture")
-
-    mode = st.radio(
-        "Input source",
-        options=["ZIP package", "Individual files"],
-        horizontal=True,
-        key="atlas_input_mode",
-    )
-
-    if mode == "ZIP package":
-        atlas_zip_file = st.file_uploader(
-            "Upload ZIP package (OBJ+MTL at root, textures/ folder included)",
-            type=["zip"],
-            key="atlas_zip_upload",
-            help="ZIP should contain: root: *.obj, *.mtl; and a textures/ folder containing all referenced textures",
-        )
-        if atlas_zip_file:
-            st.success(f"✅ Uploaded package: {atlas_zip_file.name}")
-
-        if atlas_zip_file and st.button("🔧 Create Texture Atlas", type="primary", key="create_atlas_zip_btn"):
-            with st.spinner("Creating texture atlas from ZIP..."):
-                atlas_result = create_texture_atlas_from_zip(atlas_zip_file)
-                if atlas_result:
-                    st.session_state["atlas_result"] = atlas_result
-                    st.rerun()
-
-    else:
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write("**Required Files**")
-            atlas_obj_file = st.file_uploader(
-                "Upload OBJ file",
-                type=["obj"],
-                help="3D mesh file with multiple materials",
-                key="atlas_obj_upload"
-            )
-            atlas_mtl_file = st.file_uploader(
-                "Upload MTL file",
-                type=["mtl"],
-                help="Material file referencing multiple textures",
-                key="atlas_mtl_upload"
-            )
-
-        with col2:
-            st.write("**Texture Files (Optional)**")
-            atlas_texture_files = st.file_uploader(
-                "Upload texture files",
-                type=["png", "jpg", "jpeg", "bmp", "tga"],
-                accept_multiple_files=True,
-                help="Only needed if textures referenced by MTL aren't available",
-                key="atlas_texture_upload"
-            )
-            if atlas_texture_files:
-                st.success(f"✅ Uploaded {len(atlas_texture_files)} texture(s)")
-                for tex_file in atlas_texture_files:
-                    st.text(f"  • {tex_file.name}")
-
-        if atlas_obj_file:
-            st.success(f"✅ OBJ: {atlas_obj_file.name}")
-        if atlas_mtl_file:
-            st.success(f"✅ MTL: {atlas_mtl_file.name}")
-
-        if atlas_obj_file and atlas_mtl_file:
-            if st.button("🔧 Create Texture Atlas", type="primary", key="create_atlas_btn"):
-                with st.spinner("Creating texture atlas..."):
-                    atlas_result = create_texture_atlas(atlas_obj_file, atlas_mtl_file, atlas_texture_files)
-                    if atlas_result:
-                        st.session_state["atlas_result"] = atlas_result
-                        st.rerun()
-
-    # Display results and download options
-    if st.session_state.get("atlas_result"):
-        atlas_result = st.session_state["atlas_result"]
-
-        st.subheader("📥 Download Generated Files")
-
-        # Individual downloads in a row
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-            if "obj_content" in atlas_result:
-                st.download_button(
-                    label="📄 Download Combined OBJ",
-                    data=atlas_result["obj_content"],
-                    file_name=atlas_result["obj_name"],
-                    mime="application/octet-stream",
-                    key="download_atlas_obj"
-                )
-
-        with col2:
-            if "mtl_content" in atlas_result:
-                st.download_button(
-                    label="📄 Download Combined MTL",
-                    data=atlas_result["mtl_content"],
-                    file_name=atlas_result["mtl_name"],
-                    mime="application/octet-stream",
-                    key="download_atlas_mtl"
-                )
-
-        with col3:
-            if "atlas_content" in atlas_result:
-                st.download_button(
-                    label="🖼️ Download Atlas Texture",
-                    data=atlas_result["atlas_content"],
-                    file_name=atlas_result["atlas_name"],
-                    mime="image/png",
-                    key="download_atlas_texture"
-                )
-
-        # Reset button
-        if st.button("🔄 Create Another Atlas", key="reset_atlas"):
-            if "atlas_result" in st.session_state:
-                del st.session_state["atlas_result"]
-            st.rerun()
-
-
-def _collect_original_textures_from_mtl(mtl_path: str) -> List[Dict]:
-    """Parse MTL and load referenced textures for preview."""
-    textures: List[Dict] = []
-    used_texture_names = set()
-
-    try:
-        mtl_dir = os.path.dirname(mtl_path)
-
-        # First pass: collect all referenced texture names
-        with open(mtl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or not line.startswith("map_"):
-                    continue
-                parts = line.split()
-                if len(parts) >= 2:
-                    tex_name = parts[-1]
-                    used_texture_names.add(os.path.basename(tex_name))
-
-        # Second pass: find all texture files and mark which are used
-        texture_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tga', '.tiff', '.gif'}
-
-        # Check MTL directory and parent directory for textures
-        search_dirs = [mtl_dir, os.path.dirname(mtl_dir)]
-        if os.path.exists(os.path.join(os.path.dirname(mtl_dir), "textures")):
-            search_dirs.append(os.path.join(os.path.dirname(mtl_dir), "textures"))
-
-        found_textures = set()
-        for search_dir in search_dirs:
-            if not os.path.exists(search_dir):
-                continue
-            for file in os.listdir(search_dir):
-                if any(file.lower().endswith(ext) for ext in texture_extensions):
-                    tex_path = os.path.join(search_dir, file)
-                    if file not in found_textures and os.path.isfile(tex_path):
-                        found_textures.add(file)
-                        is_used = file in used_texture_names
-                        info = load_texture_for_preview(tex_path, file)
-                        if info:
-                            info["used_in_atlas"] = is_used
-                            textures.append(info)
-
-        # Sort so used textures appear first
-        textures.sort(key=lambda x: (not x.get("used_in_atlas", False), x["name"]))
-
-    except Exception:
-        pass
-    return textures
-
-
-def create_texture_atlas_from_zip(zip_file) -> Optional[Dict]:
-    """
-    Create texture atlas from a ZIP that contains:
-      - root: *.obj, *.mtl
-      - textures/: all images referenced by MTL
-    """
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Extract ZIP
-            data = zip_file.read()
-            with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                zf.extractall(temp_dir)
-
-            # Prefer root-level OBJ/MTL; else fall back to first found recursively
-            root_files = [f for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f))]
-            root_objs = [os.path.join(temp_dir, f) for f in root_files if f.lower().endswith(".obj")]
-            root_mtls = [os.path.join(temp_dir, f) for f in root_files if f.lower().endswith(".mtl")]
-
-            if root_objs and root_mtls:
-                obj_path = root_objs[0]
-                mtl_path = root_mtls[0]
-            else:
-                obj_candidates = glob.glob(os.path.join(temp_dir, "**/*.obj"), recursive=True)
-                mtl_candidates = glob.glob(os.path.join(temp_dir, "**/*.mtl"), recursive=True)
-                if not obj_candidates or not mtl_candidates:
-                    st.error("ZIP must contain an OBJ and MTL (preferably at root).")
-                    return None
-                # Choose shallowest path
-                obj_path = min(obj_candidates, key=lambda p: len(Path(p).parts))
-                mtl_path = min(mtl_candidates, key=lambda p: len(Path(p).parts))
-
-            # Prepare outputs
-            output_obj = os.path.join(temp_dir, "atlas_combined.obj")
-            output_mtl = os.path.join(temp_dir, "atlas_combined.mtl")
-            output_atlas = os.path.join(temp_dir, "atlas.png")
-
-            # Run make_atlas.py
-            script_dir = Path(__file__).parent.absolute()
-            atlas_script = script_dir / "make_atlas.py"
-            cmd = [sys.executable, str(atlas_script), obj_path, mtl_path, output_obj, output_mtl, output_atlas]
-            result = subprocess.run(cmd, capture_output=True, text=True, cwd=temp_dir)
-            if result.returncode != 0:
-                st.error(f"Atlas creation failed: {result.stderr}")
-                return None
-
-            atlas_data: Dict = {}
-
-            if os.path.exists(output_obj):
-                with open(output_obj, "rb") as f:
-                    atlas_data["obj_content"] = f.read()
-                    atlas_data["obj_name"] = "atlas_combined.obj"
-
-            if os.path.exists(output_mtl):
-                with open(output_mtl, "rb") as f:
-                    atlas_data["mtl_content"] = f.read()
-                    atlas_data["mtl_name"] = "atlas_combined.mtl"
-
-            if os.path.exists(output_atlas):
-                with open(output_atlas, "rb") as f:
-                    atlas_data["atlas_content"] = f.read()
-                    atlas_data["atlas_name"] = "atlas.png"
-                atlas_data["atlas_image"] = Image.open(io.BytesIO(atlas_data["atlas_content"]))
-
-            # Load original textures referenced by MTL for preview
-            atlas_data["original_textures"] = _collect_original_textures_from_mtl(mtl_path)
-
-            st.success("✅ Texture atlas created successfully!")
-            return atlas_data
-
-    except Exception as e:
-        st.error(f"Error creating texture atlas from ZIP: {str(e)}")
-        return None
-
-
-# Main App
 def main() -> None:
     setup_page()
 
@@ -3481,6 +2250,54 @@ def main() -> None:
             else:
                 st.warning("⚠️ Please upload at least an OBJ file and environment map(s) to proceed.")
 
+        elif upload_type == "local_path":
+            local_paths = upload_result[1]
+            if local_paths:
+                try:
+                    obj_path = local_paths["obj_path"]
+                    mtl_path = local_paths.get("mtl_path")
+                    texture_paths = local_paths.get("texture_paths", [])
+                    env_paths = local_paths.get("env_paths", [])
+
+                    st.success("✅ Local paths validated successfully!")
+
+                    st.subheader("📋 Local Files")
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        st.write("**3D Object:**")
+                        st.write(f"✅ {Path(obj_path).name}")
+                        if mtl_path:
+                            st.write(f"✅ {Path(mtl_path).name}")
+                    with c2:
+                        st.write("**Textures:**")
+                        if texture_paths:
+                            for tp in texture_paths[:3]:
+                                st.write(f"✅ {Path(tp).name}")
+                            if len(texture_paths) > 3:
+                                st.write(f"... +{len(texture_paths) - 3} more")
+                        else:
+                            st.write("💡 No textures specified")
+                    with c3:
+                        st.write("**Environment Maps:**")
+                        for ep in env_paths[:3]:
+                            st.write(f"✅ {Path(ep).name}")
+                        if len(env_paths) > 3:
+                            st.write(f"... +{len(env_paths) - 3} more")
+
+                    # For local paths, we use files directly without copying to cache
+                    # Determine texture path (first texture or None)
+                    texture_path = texture_paths[0] if texture_paths else None
+
+                    st.session_state["files_processed"] = True
+                    st.session_state["file_paths"] = {
+                        "obj_path": obj_path,
+                        "texture_path": texture_path,
+                        "envmap_paths": env_paths,
+                        "temp_dir": None,  # No temp dir for local paths
+                    }
+                except Exception as e:
+                    st.error(f"❌ Error processing local paths: {str(e)}")
+
     # Show robustness analysis sections
     if st.session_state.get("files_processed", False):
         st.header("🚀 Run Analysis")
@@ -3533,33 +2350,6 @@ def main() -> None:
 
         plot_data = visualize_results(st.session_state["results"], st.session_state.get("config", config))
         download_results(st.session_state["results"], plot_data)
-
-    if not st.session_state.get("files_processed", False):
-        st.header("📖 Example Usage")
-        st.markdown(
-            """
-**Robustness Analysis Workflow:**
-1. Upload your 3D object (.obj file)
-2. Optionally upload a texture image
-3. Upload one or more environment maps
-4. Configure optimization parameters in the sidebar
-5. Expand "Rendering Settings" if needed
-6. Click "Run Robustness Analysis"
-7. View the polar heatmap results
-8. Download results as JSON
-
-**File Requirements:**
-- **OBJ file**: 3D mesh in Wavefront OBJ format
-- **Texture**: PNG/JPG image (optional, will use MTL if not provided)
-- **Environment maps**: HDR/EXR or regular images for lighting
-
-**Texture Atlas Creator:**
-- Upload OBJ and MTL files with multiple materials
-- Automatically combines all textures into a single atlas
-- Downloads combined OBJ, MTL, and atlas texture files
-            """
-        )
-
 
 if __name__ == "__main__":
     main()
