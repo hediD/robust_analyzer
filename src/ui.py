@@ -311,41 +311,44 @@ def get_class_label(class_idx: int, num_classes: int = 1000, custom_labels: Opti
 
 
 def create_target_class_selector(num_classes: int = 1000, custom_labels: Optional[Dict[int, str]] = None) -> str:
-    st.sidebar.subheader("🎯 Target Class Selection")
+    """Create target class selector. Uses st.* (not st.sidebar.*) to work inside expander context."""
+    st.markdown("**🎯 Target Class**")
 
     # For custom models with non-ImageNet classes, show simple numeric selection
     if num_classes != 1000:
-        st.sidebar.info(f"📊 Custom model with {num_classes} classes detected")
+        st.info(f"📊 Custom model with {num_classes} classes detected")
 
         # Use custom labels for display if available
         if custom_labels:
-            st.sidebar.success(f"🏷️ Using {len(custom_labels)} custom class labels")
+            st.success(f"🏷️ Using {len(custom_labels)} custom class labels")
             format_func = lambda x: f"{x}: {custom_labels.get(x, f'Class {x}')}"
         else:
-            st.sidebar.write("Select target class by index:")
+            st.write("Select target class by index:")
             format_func = lambda x: f"Class {x}"
 
-        selected_idx = st.sidebar.selectbox(
+        selected_idx = st.selectbox(
             "🔢 Target Class Index:",
             options=list(range(num_classes)),
             index=0,
             format_func=format_func,
             help=f"Select target class index (0 to {num_classes-1})",
+            key="target_class_selector"
         )
 
         display_label = custom_labels.get(selected_idx, f"Class {selected_idx}") if custom_labels else f"Class {selected_idx}"
-        st.sidebar.success(f"✅ Selected: {display_label}")
+        st.success(f"✅ Selected: {display_label}")
         # Return the index as a string so it can be used throughout the system
         return str(selected_idx)
 
     # For ImageNet-1000 models, show full label selection
     class_options, id_to_class = get_cached_imagenet_labels()
     if not class_options:
-        st.sidebar.warning("⚠️ Could not load ImageNet labels. Using text input.")
-        return st.sidebar.text_input(
+        st.warning("⚠️ Could not load ImageNet labels. Using text input.")
+        return st.text_input(
             "Target Class",
             value=DEFAULT_TARGET_LABEL,
             help="ImageNet class name for the target",
+            key="target_class_text_input"
         )
 
     display_options = [f"{idx}: {label}" for idx, label in class_options]
@@ -357,17 +360,18 @@ def create_target_class_selector(num_classes: int = 1000, custom_labels: Optiona
             default_idx = i
             break
 
-    selected_display = st.sidebar.selectbox(
+    selected_display = st.selectbox(
         "🔍 Search & Select Class:",
         display_options,
         index=default_idx,
         help="Type to search through ImageNet-1000 classes, then select",
+        key="target_class_imagenet_selector"
     )
 
     if selected_display:
         selected_idx = int(selected_display.split(":")[0])
         target_class = id_to_class[selected_idx]
-        st.sidebar.success(f"✅ Selected: {target_class}")
+        st.success(f"✅ Selected: {target_class}")
         return target_class
 
     return DEFAULT_TARGET_LABEL
@@ -376,16 +380,6 @@ def create_target_class_selector(num_classes: int = 1000, custom_labels: Optiona
 # Sidebar Config
 def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
     st.sidebar.header("📋 Configuration")
-
-    # Mode selector - controls which sidebar elements are shown
-    sidebar_mode = st.sidebar.radio(
-        "Mode",
-        options=["🎯 Robustness Analysis", "🖼️ Image Selection"],
-        horizontal=True,
-        help="Select the mode to show relevant configuration options"
-    )
-    st.session_state["sidebar_mode"] = sidebar_mode
-    is_robustness_mode = sidebar_mode == "🎯 Robustness Analysis"
 
     st.sidebar.subheader("Model Parameters")
 
@@ -563,8 +557,12 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
             else:
                 st.info("💡 Using default pre-trained weights")
 
-    # Detect num_classes from custom weights if available
-    num_classes = 1000  # Default to ImageNet
+    # Detect num_classes from custom weights FIRST (before showing UI)
+    detected_num_classes = 1000  # Default to ImageNet
+    detected_from_weights = False
+    detection_key = None
+    detection_error = None
+
     if custom_weights_path:
         try:
             # Load weights to detect num_classes
@@ -587,17 +585,58 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
             # - Transformers/ViT: 'classifier.weight', 'head.weight'
             for key in state_dict.keys():
                 if 'fc.weight' in key or 'classifier.weight' in key or 'classifier.1.weight' in key or 'head.weight' in key:
-                    num_classes = state_dict[key].shape[0]
-                    st.sidebar.info(f"✅ Detected {num_classes} classes from weights (key: {key})")
+                    detected_num_classes = state_dict[key].shape[0]
+                    detected_from_weights = True
+                    detection_key = key
                     break
         except Exception as e:
-            st.sidebar.warning(f"⚠️ Could not detect classes from weights: {str(e)}")
-            num_classes = 1000
+            detection_error = str(e)
+            detected_num_classes = 1000
+
+    # Option to override number of classes (even without custom weights)
+    num_classes_override = None
+    with st.sidebar.expander("🔢 Output Classes", expanded=False):
+        # Show current detected state
+        if detected_from_weights:
+            st.success(f"✅ **Detected {detected_num_classes} classes** from custom weights")
+            st.caption(f"Source: `{detection_key}`")
+        elif custom_weights_path and detection_error:
+            st.warning(f"⚠️ Could not detect classes from weights: {detection_error}")
+            st.info(f"📊 Current: **{detected_num_classes}** classes (default)")
+        else:
+            st.info(f"📊 Current: **{detected_num_classes}** classes (ImageNet default)")
+
+        st.markdown("---")
+        st.write("**Override the number of output classes**")
+        st.write("Use this if you want to train a model with fewer classes than ImageNet-1000.")
+
+        use_custom_num_classes = st.checkbox(
+            "Override number of classes",
+            value=False,
+            help="Check to specify a custom number of output classes"
+        )
+
+        if use_custom_num_classes:
+            num_classes_override = st.number_input(
+                "Number of classes",
+                min_value=2,
+                max_value=10000,
+                value=detected_num_classes if detected_num_classes != 1000 else 10,
+                step=1,
+                help="Number of output classes for the classifier head"
+            )
+            st.info(f"🎯 Model will have {num_classes_override} output classes with randomly initialized classifier")
+
+    # Set final num_classes based on override or detection
+    if num_classes_override is not None:
+        num_classes = num_classes_override
+    else:
+        num_classes = detected_num_classes
 
     # Custom class labels upload (for non-ImageNet models)
     custom_labels = None
     if num_classes != 1000:
-        with st.sidebar.expander("🏷️ Custom Class Labels (Optional)", expanded=True):
+        with st.sidebar.expander("🏷️ Custom Class Labels", expanded=True):
             st.write("**Upload JSON file with class names**")
             st.write("Expected format: `{\"0\": \"class_name_0\", \"1\": \"class_name_1\", ...}`")
 
@@ -699,132 +738,129 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
                 else:
                     st.info("💡 Using generic class names")
 
-    # Robustness-specific parameters - only shown in Robustness Analysis mode
-    if is_robustness_mode:
-        # NOW create target class selector with knowledge of num_classes and custom_labels
+    # Robustness Analysis settings in an expander
+    with st.sidebar.expander("🎯 Robustness Analysis Settings", expanded=True):
+        # Target class selector with knowledge of num_classes and custom_labels
         target_class = create_target_class_selector(num_classes, custom_labels)
 
-        batch_size = st.sidebar.number_input(
+        batch_size = st.number_input(
             "Batch Size",
             min_value=1,
             max_value=8,
             value=1,
             step=1,
             help="Number of viewpoints to optimize in parallel",
+            key="robustness_batch_size"
         )
 
-        st.sidebar.subheader("Optimization Parameters")
-        params_to_optimize = st.sidebar.multiselect(
+        st.subheader("Optimization Parameters")
+        params_to_optimize = st.multiselect(
             "Parameters to Optimize",
             options=["camera"],
             default=["camera"],
             help="Select which parameters to optimize during adversarial attack",
+            key="robustness_params_to_optimize"
         )
 
-        num_runs = st.sidebar.number_input(
+        num_runs = st.number_input(
             "Number of Runs",
             min_value=1,
             max_value=20_000,
             value=1,
             step=1,
             help="Total number of optimization runs",
+            key="robustness_num_runs"
         )
 
-        num_iterations = st.sidebar.number_input(
+        num_iterations = st.number_input(
             "Adversarial Optimization Steps",
             min_value=1,
             max_value=100,
             value=1,
             step=1,
             help="Number of optimization steps per adversarial run",
+            key="robustness_num_iterations"
         )
 
-        learning_rate = st.sidebar.select_slider(
+        learning_rate = st.select_slider(
             "Learning Rate",
             options=[1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2],
             value=5e-3,
             format_func=lambda x: f"{x:.1e}",
+            key="robustness_learning_rate"
         )
 
-        targeted = st.sidebar.checkbox(
+        targeted = st.checkbox(
             "Targeted Attack",
             value=False,
             help="Whether this is a targeted adversarial attack",
+            key="robustness_targeted"
         )
 
-        st.text("")
+        st.markdown("---")
+        st.markdown("**Camera Constraints**")
+        positive_z = st.checkbox(
+            "Positive Z",
+            value=True,
+            help="Constrain camera to positive elevation (z > 0)",
+            key="robustness_positive_z"
+        )
 
-        with st.sidebar.expander("Camera Constraints", expanded=True):
-            positive_z = st.checkbox(
-                "Positive Z",
-                value=True,
-                help="Constrain camera to positive elevation (z > 0)",
-            )
+        min_max_proportion = st.slider(
+            "Object proportion in image range",
+            min_value=0.05,
+            max_value=0.8,
+            value=(0.3, 0.8),
+            step=0.1,
+            help="Camera distance range as proportion of bounding box size (min, max)",
+            key="robustness_min_max_proportion"
+        )
+        st.caption(f"💡 object size proportion in image ({min_max_proportion[0]:.1f}x to {min_max_proportion[1]:.1f}x).")
 
-            min_max_proportion = st.slider(
-                "Object proportion in image range",
-                min_value=0.05,
-                max_value=0.8,
-                value=(0.3, 0.8),
-                step=0.1,
-                help="Camera distance range as proportion of bounding box size (min, max)",
-            )
-            st.caption(f"💡 object size proportion in image ({min_max_proportion[0]:.1f}x to {min_max_proportion[1]:.1f}x).")
+        st.markdown("---")
+        st.markdown("**Rendering Settings**")
+        image_size = st.select_slider(
+            "Image Size",
+            options=[224, 256, 320, 384, 448, 512],
+            value=448,
+            help="Resolution of rendered images (image_size x image_size)",
+            key="robustness_image_size"
+        )
+        bin_size = st.slider(
+            "Bin Size",
+            min_value=16,
+            max_value=64,
+            value=32,
+            help="Spatial partitioning for rasterization - larger values use less memory but may be slower",
+            key="robustness_bin_size"
+        )
+        max_faces_per_bin = st.number_input(
+            "Max Faces per Bin",
+            min_value=10000,
+            max_value=200000,
+            value=100000,
+            step=10000,
+            help="Maximum faces per spatial bin - increase for complex meshes, decrease to save memory",
+            key="robustness_max_faces_per_bin"
+        )
+        st.info("💡 **Tip:** Use smaller bin sizes and fewer faces per bin if you encounter GPU memory issues.")
 
-        with st.sidebar.expander("Rendering Settings", expanded=False):
-            st.write("**Rendering Paramters**")
-            image_size = st.select_slider(
-                "Image Size",
-                options=[224, 256, 320, 384, 448, 512],
-                value=448,
-                help="Resolution of rendered images (image_size x image_size)",
-            )
-            bin_size = st.slider(
-                "Bin Size",
-                min_value=16,
-                max_value=64,
-                value=32,
-                help="Spatial partitioning for rasterization - larger values use less memory but may be slower",
-            )
-            max_faces_per_bin = st.number_input(
-                "Max Faces per Bin",
-                min_value=10000,
-                max_value=200000,
-                value=100000,
-                step=10000,
-                help="Maximum faces per spatial bin - increase for complex meshes, decrease to save memory",
-            )
-            st.info("💡 **Tip:** Use smaller bin sizes and fewer faces per bin if you encounter GPU memory issues.")
-
-        st.sidebar.subheader("Download Settings")
-        include_heatmap = st.sidebar.checkbox(
+        st.markdown("---")
+        st.markdown("**Download Settings**")
+        include_heatmap = st.checkbox(
             "📊 Include heatmap in downloads",
             value=True,
             help="When checked: downloads include rendered image + heatmap composite. When unchecked: downloads only the rendered images with separate metadata files.",
             key="global_include_heatmap"
         )
         st.session_state["include_heatmap_global"] = include_heatmap
-    else:
-        # Default values for non-robustness mode (Image Selection mode)
-        target_class = ""
-        batch_size = 1
-        params_to_optimize = ["camera"]
-        num_runs = 1
-        num_iterations = 1
-        learning_rate = 5e-3
-        targeted = False
-        positive_z = True
-        min_max_proportion = (0.3, 0.8)
-        image_size = 448
-        bin_size = 32
-        max_faces_per_bin = 100000
-        include_heatmap = True
 
     # Store model config in session state for image selection panel
     st.session_state["model_config"] = {
         "model_name": selected_model,
         "custom_weights_path": custom_weights_path,
         "num_classes": int(num_classes),
+        "num_classes_override": num_classes_override,  # User-specified override (even without weights)
         "custom_labels": custom_labels,  # Store custom labels for image selection
     }
     st.session_state["model_name"] = selected_model

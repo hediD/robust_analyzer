@@ -33,10 +33,11 @@ from model import MODEL_CONFIGS
 from trak import (
     compute_trak_scores_simple,
     extract_gradients_from_images,
+    extract_and_project_gradients,
     project_gradients_random,
 )
 
-def load_classification_model_for_images(model_name, custom_weights_path=None, device='cuda'):
+def load_classification_model_for_images(model_name, custom_weights_path=None, device='cuda', num_classes=None):
     """
     Load just the classification model for image selection, without 3D rendering components.
 
@@ -44,6 +45,9 @@ def load_classification_model_for_images(model_name, custom_weights_path=None, d
         model_name: Model architecture name from MODEL_CONFIGS
         custom_weights_path: Path to custom weights file (optional)
         device: Device to use
+        num_classes: Override number of output classes (optional). If provided without
+                    custom_weights_path, creates a model with random classifier weights
+                    for this many classes.
 
     Returns:
         Loaded model ready for inference
@@ -52,21 +56,47 @@ def load_classification_model_for_images(model_name, custom_weights_path=None, d
 
     print(f"Loading model: {model_name}")
     print(f"Custom weights path: {custom_weights_path}")
+    print(f"Num classes override: {num_classes}")
 
     if model_name not in MODEL_CONFIGS:
         raise ValueError(f"Unknown model: {model_name}. Available: {list(MODEL_CONFIGS.keys())}")
 
     config = MODEL_CONFIGS[model_name]
 
-    if custom_weights_path is None:
+    if custom_weights_path is None and num_classes is None:
         # Load pre-trained model with default 1000 classes
         model = config["model_class"].from_pretrained(
             config["model_name"],
             torch_dtype=torch.float32
         ).to(device).eval()
+    elif custom_weights_path is None and num_classes is not None:
+        # No custom weights but override num_classes - load pretrained backbone with new classifier
+        print(f"Creating model with {num_classes} classes (pretrained backbone, random classifier)")
+        model_config = AutoConfig.from_pretrained(config["model_name"])
+        model_config.num_labels = num_classes
+
+        # Load pretrained and modify classifier
+        base_model = config["model_class"].from_pretrained(
+            config["model_name"],
+            torch_dtype=torch.float32
+        )
+
+        # Create model with correct num_classes
+        model = config["model_class"](model_config).to(device).eval()
+
+        # Copy backbone weights (everything except classifier)
+        base_state = base_model.state_dict()
+        model_state = model.state_dict()
+        for key in base_state:
+            if 'classifier' not in key and 'fc' not in key and 'head' not in key:
+                if key in model_state and base_state[key].shape == model_state[key].shape:
+                    model_state[key] = base_state[key]
+        model.load_state_dict(model_state)
+
+        del base_model
+        print(f"✓ Loaded pretrained backbone with new {num_classes}-class classifier")
     else:
-        # Load custom weights - detect number of classes
-        # Try to load and detect num_classes
+        # Load custom weights - detect number of classes if not explicitly provided
         if custom_weights_path.endswith('.safetensors'):
             from safetensors.torch import load_file
             state_dict = load_file(custom_weights_path)
@@ -80,15 +110,16 @@ def load_classification_model_for_images(model_name, custom_weights_path=None, d
             elif 'model' in state_dict:
                 state_dict = state_dict['model']
 
-        # Detect num_classes from classifier head
-        num_classes = None
-        for key in ['classifier.weight', 'classifier.out_proj.weight', 'classifier.1.weight']:
-            if key in state_dict:
-                num_classes = state_dict[key].shape[0]
-                break
-
+        # Only auto-detect num_classes from weights if not explicitly provided
         if num_classes is None:
-            num_classes = 1000  # Default
+            # Detect num_classes from classifier head in weights
+            detected_classes = None
+            for key in ['classifier.weight', 'classifier.out_proj.weight', 'classifier.1.weight']:
+                if key in state_dict:
+                    detected_classes = state_dict[key].shape[0]
+                    break
+            num_classes = detected_classes if detected_classes is not None else 1000
+            print(f"Auto-detected {num_classes} classes from custom weights")
 
         # Create model with correct num_classes
         model_config = AutoConfig.from_pretrained(config["model_name"])
@@ -96,7 +127,11 @@ def load_classification_model_for_images(model_name, custom_weights_path=None, d
         model = config["model_class"](model_config).to(device).eval()
 
         # Load weights
-        if not custom_weights_path.endswith('.safetensors'):
+        if custom_weights_path.endswith('.safetensors'):
+            # For safetensors files, load using safetensors method
+            from safetensors.torch import load_model
+            load_model(model, custom_weights_path, strict=False)
+        else:
             # For .pt/.pth files, handle potential key mismatches
             model_state = model.state_dict()
             # Try direct load
@@ -126,6 +161,7 @@ def train_and_evaluate_subset(
     freeze_backbone: bool = True,
     device: str = "cuda",
     progress_callback=None,
+    num_classes: int = None,
 ) -> Dict:
     """
     Train a model on a subset and evaluate on target data.
@@ -138,7 +174,7 @@ def train_and_evaluate_subset(
     from torch.utils.data import DataLoader, TensorDataset
 
     # Load fresh model
-    model = load_classification_model_for_images(model_name, custom_weights, device)
+    model = load_classification_model_for_images(model_name, custom_weights, device, num_classes=num_classes)
 
     # Set up trainable parameters
     if freeze_backbone:
@@ -201,6 +237,9 @@ def train_and_evaluate_subset(
             correct = 0
             total = 0
 
+            # Use reduction='sum' for correct averaging across variable batch sizes
+            criterion_eval = nn.CrossEntropyLoss(reduction='sum')
+
             with torch.no_grad():
                 for i in range(0, len(target_tensors), batch_size):
                     batch_images = target_tensors[i:i+batch_size].to(device)
@@ -209,15 +248,16 @@ def train_and_evaluate_subset(
                     outputs = model(batch_images)
                     logits = outputs.logits if hasattr(outputs, 'logits') else outputs
 
-                    loss = criterion(logits, batch_labels)
+                    # Sum of losses for this batch (not mean)
+                    loss = criterion_eval(logits, batch_labels)
                     total_target_loss += loss.item()
 
                     _, predicted = torch.max(logits, 1)
                     total += batch_labels.size(0)
                     correct += (predicted == batch_labels).sum().item()
 
-            num_batches = (len(target_tensors) + batch_size - 1) // batch_size
-            final_target_loss = total_target_loss / num_batches
+            # Correct mean: total sum / total number of samples
+            final_target_loss = total_target_loss / len(target_tensors)
             final_target_acc = 100 * correct / total
 
         if progress_callback:
@@ -398,7 +438,8 @@ dataset_folder/
         "Dataset source",
         options=["📦 Upload ZIP", "📁 Local path"],
         horizontal=True,
-        help="Choose how to load the dataset - upload a ZIP file or specify a local directory path"
+        help="Choose how to load the dataset - upload a ZIP file or specify a local directory path",
+        key="image_selection_dataset_source",
     )
 
     dataset_path = None  # Will be set to the path of the dataset directory
@@ -463,7 +504,7 @@ dataset_folder/
             "Training epochs",
             min_value=1,
             max_value=50,
-            value=5,
+            value=10,
             step=1,
             help="Number of epochs to train the model (more = better TRAK scores, slower)"
         )
@@ -494,7 +535,7 @@ dataset_folder/
         with col_opt1:
             reset_classifier = st.checkbox(
                 "Reset classifier head",
-                value=False,
+                value=True,
                 help="Reinitialize the classifier weights before training. Use this if your custom weights already know the target class."
             )
 
@@ -557,7 +598,7 @@ dataset_folder/
             "Number of checkpoints",
             min_value=1,
             max_value=20,
-            value=1,
+            value=2,
             step=1,
             key="trak_num_checkpoints",
             help="Save multiple checkpoints during training and average TRAK scores across them. More = more stable but slower."
@@ -611,24 +652,54 @@ dataset_folder/
         else:
             st.warning("🔒 Step 3: Waiting for Step 2")
 
-    # Reset button to start over
-    if step1_complete or step2_complete:
-        if st.button("🔄 Reset All Steps", type="secondary"):
-            if "step1_data" in st.session_state:
-                # Clean up temp directory if exists
-                old_temp_dir = st.session_state["step1_data"].get("temp_dir")
-                if old_temp_dir and os.path.exists(old_temp_dir):
-                    shutil.rmtree(old_temp_dir, ignore_errors=True)
-                del st.session_state["step1_data"]
-            if "trak_data" in st.session_state:
-                del st.session_state["trak_data"]
-            st.rerun()
+    # Auto-run and Reset buttons
+    col_auto, col_reset = st.columns([2, 1])
+
+    with col_auto:
+        # Auto-Run All button - only show if not already completed
+        if not step2_complete:
+            auto_run_btn = st.button(
+                "🚀 **Auto-Run All Steps + Compare**",
+                type="primary",
+                use_container_width=True,
+                help="Automatically run Step 1, Step 2, and Compare All Methods"
+            )
+            if auto_run_btn:
+                st.session_state["auto_run_mode"] = True
+                st.session_state["auto_run_step"] = 1
+
+    with col_reset:
+        # Reset button to start over
+        if step1_complete or step2_complete:
+            if st.button("🔄 Reset All Steps", type="secondary", use_container_width=True):
+                if "step1_data" in st.session_state:
+                    # Clean up temp directory if exists
+                    old_temp_dir = st.session_state["step1_data"].get("temp_dir")
+                    if old_temp_dir and os.path.exists(old_temp_dir):
+                        shutil.rmtree(old_temp_dir, ignore_errors=True)
+                    del st.session_state["step1_data"]
+                if "trak_data" in st.session_state:
+                    del st.session_state["trak_data"]
+                if "auto_run_mode" in st.session_state:
+                    del st.session_state["auto_run_mode"]
+                if "auto_run_step" in st.session_state:
+                    del st.session_state["auto_run_step"]
+                st.rerun()
+
+    # Check if we're in auto-run mode
+    auto_run_mode = st.session_state.get("auto_run_mode", False)
+    auto_run_step = st.session_state.get("auto_run_step", 0)
 
     # ==================== STEP 1: TRAIN INITIAL MODEL ====================
     st.markdown("---")
     step1_button_disabled = step1_complete  # Disable if already done (use reset to redo)
 
-    if st.button("🎓 **Step 1: Train Initial Model**", type="primary", use_container_width=True, disabled=step1_button_disabled):
+    # Trigger Step 1 via button OR auto-run mode
+    step1_triggered = st.button("🎓 **Step 1: Train Initial Model**", type="primary", use_container_width=True, disabled=step1_button_disabled)
+    if auto_run_mode and auto_run_step == 1 and not step1_complete:
+        step1_triggered = True
+
+    if step1_triggered:
         with st.spinner("Training initial model..."):
             try:
                 # Clean up previous temp directory if it exists
@@ -722,43 +793,64 @@ dataset_folder/
                     st.warning("⚠️ No selection pool images found in manifest (missing 'select' purpose), using all training images")
                     selection_pool_paths = all_train_paths.copy()
 
-                # Show loaded dataset info
-                st.success(f"📊 Loaded dataset from manifest:")
+                # Show loaded dataset info (collapsed by default)
                 dataset_info = manifest.get('dataset_info', {})
-                if dataset_info:
-                    st.write(f"  - **Dataset**: {dataset_info.get('name', 'Unknown')}")
-                    st.write(f"  - **Description**: {dataset_info.get('description', 'N/A')}")
-
-                st.write(f"\n**Dataset breakdown:**")
-                st.write(f"  - **Training images** (for initial model): {len(all_train_paths)} images")
-
-                # Count by class in training set
                 from collections import Counter
                 train_class_counts = Counter(all_train_class_labels)
-
-                # Get target class info from manifest
                 target_class_idx = dataset_info.get('target_class', 5)
                 target_class_name = dataset_info.get('target_class_name', 'target class')
 
-                st.write(f"    - {target_class_name.capitalize()} images (class {target_class_idx}): {train_class_counts.get(target_class_idx, 0)}")
-                st.write(f"    - Confuser images (other classes): {len(all_train_paths) - train_class_counts.get(target_class_idx, 0)}")
+                # Calculate overlap between train and select sets
+                train_set = set(all_train_paths)
+                select_set = set(selection_pool_paths)
+                overlap_count = len(train_set & select_set)
+                overlap_pct = 100 * overlap_count / len(select_set) if len(select_set) > 0 else 0
 
-                # Show full class distribution in expander
-                with st.expander("📊 Full class distribution in training set"):
+                # Brief summary outside expander
+                dataset_name = dataset_info.get('name', 'Unknown')
+                if overlap_pct == 100:
+                    overlap_str = " (train=select)"
+                elif overlap_pct > 0:
+                    overlap_str = f" ({overlap_pct:.0f}% overlap)"
+                else:
+                    overlap_str = " (disjoint)"
+                st.success(f"📊 Loaded **{dataset_name}**: {len(all_train_paths)} train, {len(selection_pool_paths)} select{overlap_str}, {len(target_paths)} target images")
+
+                # Detailed info in expander
+                with st.expander("📋 Dataset Details", expanded=False):
+                    if dataset_info:
+                        st.write(f"**Dataset**: {dataset_name}")
+                        st.write(f"**Description**: {dataset_info.get('description', 'N/A')}")
+
+                    st.write(f"\n**Dataset breakdown:**")
+                    st.write(f"  - **Training images** (for initial model): {len(all_train_paths)} images")
+                    st.write(f"    - {target_class_name.capitalize()} images (class {target_class_idx}): {train_class_counts.get(target_class_idx, 0)}")
+                    st.write(f"    - Confuser images (other classes): {len(all_train_paths) - train_class_counts.get(target_class_idx, 0)}")
+
+                    st.write(f"  - **Target images** (for evaluation): {len(target_paths)} images")
+                    st.write(f"  - **Selection pool** (for TRAK selection): {len(selection_pool_paths)} images")
+
+                    # Show train/select overlap info
+                    if overlap_pct == 100:
+                        st.write(f"    - 🔄 *Train and select are identical* ({overlap_count} images)")
+                    elif overlap_pct > 0:
+                        st.write(f"    - 🔄 *{overlap_count} images overlap with train* ({overlap_pct:.1f}%)")
+                    else:
+                        st.write(f"    - ✂️ *No overlap with train set* (disjoint)")
+
+                    # Show statistics by source if available
+                    stats = manifest.get('statistics', {})
+                    if stats.get('by_source'):
+                        st.write(f"\n**By source:**")
+                        for source, count in stats['by_source'].items():
+                            st.write(f"  - {source}: {count}")
+
+                    # Full class distribution
+                    st.write(f"\n**Full class distribution in training set:**")
                     for class_id in sorted(train_class_counts.keys()):
                         count = train_class_counts[class_id]
                         marker = "🎯" if class_id == target_class_idx else "  "
                         st.write(f"{marker} Class {class_id}: {count} images")
-
-                st.write(f"  - **Target images** (for evaluation): {len(target_paths)} images")
-                st.write(f"  - **Selection pool** (for TRAK selection): {len(selection_pool_paths)} images")
-
-                # Show statistics by source if available
-                stats = manifest.get('statistics', {})
-                if stats.get('by_source'):
-                    st.write(f"\n**By source:**")
-                    for source, count in stats['by_source'].items():
-                        st.write(f"  - {source}: {count}")
 
                 pool_label = "Selection pool"
 
@@ -778,13 +870,51 @@ dataset_folder/
                     model_config = st.session_state.get("model_config", {})
                     model_name = model_config.get("model_name", "vit_l_16")
                     custom_weights = model_config.get("custom_weights_path")
+                    num_classes_override = model_config.get("num_classes_override")
+
+                    # Auto-detect num_classes from dataset manifest if not specified in sidebar
+                    dataset_num_classes = dataset_info.get('num_classes')
+                    if dataset_num_classes is not None and num_classes_override is None:
+                        num_classes_override = dataset_num_classes
+                        st.info(f"🎯 Auto-detected {num_classes_override} classes from dataset manifest")
+                    elif dataset_num_classes is not None and num_classes_override != dataset_num_classes:
+                        st.warning(f"⚠️ Sidebar specifies {num_classes_override} classes but dataset has {dataset_num_classes}. Using sidebar value.")
 
                     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                     model = load_classification_model_for_images(
                         model_name,
                         custom_weights_path=custom_weights,
-                        device=device
+                        device=device,
+                        num_classes=num_classes_override
                     )
+
+                    # Verify model output classes match dataset
+                    # Handle both simple Linear layers and Sequential classifiers
+                    import torch.nn as nn
+                    def get_classifier_out_features(layer):
+                        """Get output features from a classifier layer (Linear or Sequential)."""
+                        if hasattr(layer, 'out_features'):
+                            return layer.out_features
+                        elif isinstance(layer, nn.Sequential):
+                            # For Sequential, check the last layer
+                            for module in reversed(list(layer.modules())):
+                                if hasattr(module, 'out_features'):
+                                    return module.out_features
+                        return None
+
+                    if hasattr(model, 'classifier'):
+                        model_num_classes = get_classifier_out_features(model.classifier)
+                    elif hasattr(model, 'fc'):
+                        model_num_classes = get_classifier_out_features(model.fc)
+                    elif hasattr(model, 'head'):
+                        model_num_classes = get_classifier_out_features(model.head)
+                    else:
+                        model_num_classes = None
+
+                    if model_num_classes is not None:
+                        if dataset_num_classes is not None and model_num_classes != dataset_num_classes:
+                            st.error(f"🚨 CRITICAL: Model has {model_num_classes} output classes but dataset has {dataset_num_classes} classes! "
+                                     f"This will cause poor accuracy. Please set 'Override number of classes' to {dataset_num_classes} in the sidebar.")
 
                 # Helper function to load and preprocess images
                 def load_and_preprocess_images(image_paths, label_name):
@@ -854,7 +984,7 @@ dataset_folder/
                 train_tensors_for_model = all_train_tensors
                 train_labels_for_model = all_train_labels
 
-                with st.spinner(f"Training initial model for {train_epochs} epochs on {len(train_tensors_for_model)} images..."):
+                with st.status(f"🎓 Training initial model for {train_epochs} epochs on {len(train_tensors_for_model)} images...", expanded=True) as training_status:
                     # Create simple training loop
                     from torch.utils.data import TensorDataset, DataLoader
                     import torch.optim as optim
@@ -862,6 +992,7 @@ dataset_folder/
 
                     train_dataset = TensorDataset(train_tensors_for_model, train_labels_for_model)
                     train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True)
+                    num_batches = len(train_loader)
 
                     # Set up training mode based on unified TRAK config
                     model.train()
@@ -917,12 +1048,45 @@ dataset_folder/
                     criterion = nn.CrossEntropyLoss()
 
                     # Create optimizer based on user selection
+                    # Convert generator to list to ensure we can count params
+                    trainable_params_list = list(trainable_params) if not isinstance(trainable_params, list) else trainable_params
+
                     if step1_optimizer == "AdamW":
-                        optimizer = optim.AdamW(trainable_params, lr=learning_rate, weight_decay=step1_weight_decay)
+                        optimizer = optim.AdamW(trainable_params_list, lr=learning_rate, weight_decay=step1_weight_decay)
                     elif step1_optimizer == "Adam":
-                        optimizer = optim.Adam(trainable_params, lr=learning_rate, weight_decay=step1_weight_decay)
+                        optimizer = optim.Adam(trainable_params_list, lr=learning_rate, weight_decay=step1_weight_decay)
                     else:  # SGD
-                        optimizer = optim.SGD(trainable_params, lr=learning_rate, momentum=step1_momentum, weight_decay=step1_weight_decay)
+                        optimizer = optim.SGD(trainable_params_list, lr=learning_rate, momentum=step1_momentum, weight_decay=step1_weight_decay)
+
+                    # Diagnostic: Show model configuration
+                    num_trainable = sum(p.numel() for p in trainable_params_list)
+                    num_total = sum(p.numel() for p in model.parameters())
+                    num_requires_grad = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+                    if classifier_layer is not None:
+                        # Handle both Linear and Sequential classifiers
+                        if hasattr(classifier_layer, 'out_features'):
+                            classifier_out_features = classifier_layer.out_features
+                        elif isinstance(classifier_layer, nn.Sequential):
+                            # Find the last Linear layer in Sequential
+                            classifier_out_features = 'unknown'
+                            for module in reversed(list(classifier_layer.modules())):
+                                if hasattr(module, 'out_features'):
+                                    classifier_out_features = module.out_features
+                                    break
+                        else:
+                            classifier_out_features = 'unknown'
+
+                        # CRITICAL: Verify num_classes matches expectations
+                        if classifier_out_features != 'unknown' and dataset_num_classes is not None:
+                            if classifier_out_features != dataset_num_classes:
+                                st.error(f"🚨 CLASS MISMATCH: Model outputs {classifier_out_features} classes but dataset has {dataset_num_classes}!")
+                            else:
+                                st.success(f"✅ Classes match: Model and dataset both have {classifier_out_features} classes")
+
+                        st.info(f"📊 Model config: {classifier_out_features} output classes, {num_trainable:,} trainable / {num_requires_grad:,} requires_grad / {num_total:,} total, lr={learning_rate:.0e}")
+                    else:
+                        st.info(f"📊 Model config: {num_trainable:,} trainable params / {num_total:,} total, lr={learning_rate:.0e}")
 
                     # Get class mapping for nice output - prefer dataset.json manifest over model labels
                     # This ensures class indices in the dataset match the displayed class names
@@ -938,9 +1102,6 @@ dataset_folder/
                         else:
                             class_mapping = {}
 
-                    # Live-updating epoch status
-                    epoch_status = st.empty()
-
                     # Calculate checkpoint epochs (evenly spaced)
                     checkpoint_epochs = set()
                     model_checkpoints = {}  # epoch -> state_dict
@@ -953,10 +1114,20 @@ dataset_folder/
                     if num_checkpoints > 1:
                         st.info(f"📸 Will save checkpoints at epochs: {sorted(checkpoint_epochs)}")
 
+                    # Create a placeholder for epoch metrics table
+                    epoch_metrics_placeholder = st.empty()
+                    epoch_metrics_list = []
+
                     for epoch in range(train_epochs):
                         # Training
                         model.train()
                         total_train_loss = 0
+
+                        # Update progress bar: training is 20% -> 80% of total progress
+                        # Each epoch contributes (80-20)/train_epochs = 60/train_epochs percent
+                        epoch_progress = 20 + int(60 * epoch / train_epochs)
+                        progress_bar.progress(epoch_progress)
+
                         for batch_idx, (images, labels) in enumerate(train_loader):
                             images, labels = images.to(device), labels.to(device)
 
@@ -971,9 +1142,28 @@ dataset_folder/
 
                             loss = criterion(logits, labels)
                             loss.backward()
+
+                            # Debug: Check gradients on first batch of first epoch
+                            if epoch == 0 and batch_idx == 0:
+                                grad_norms = []
+                                for p in trainable_params_list:
+                                    if p.grad is not None:
+                                        grad_norms.append(p.grad.norm().item())
+                                if grad_norms:
+                                    avg_grad = sum(grad_norms) / len(grad_norms)
+                                    st.info(f"🔍 Gradient check: avg grad norm = {avg_grad:.4f}")
+                                    if avg_grad < 1e-8:
+                                        st.error("🚨 Gradients are near zero! Training will not converge.")
+                                else:
+                                    st.error("🚨 No gradients found! Check requires_grad settings.")
+
                             optimizer.step()
 
                             total_train_loss += loss.item()
+
+                            # Batch-level status update (every 5 batches or on last batch)
+                            if (batch_idx + 1) % 5 == 0 or batch_idx == num_batches - 1:
+                                training_status.update(label=f"🎓 Epoch {epoch+1}/{train_epochs} | Batch {batch_idx+1}/{num_batches} | Loss: {loss.item():.4f}")
 
                         avg_train_loss = total_train_loss / len(train_loader)
 
@@ -983,6 +1173,9 @@ dataset_folder/
                         correct = 0
                         total = 0
                         all_predictions = []
+
+                        # Use reduction='sum' for correct averaging across variable batch sizes
+                        criterion_eval = nn.CrossEntropyLoss(reduction='sum')
 
                         with torch.no_grad():
                             for i in range(0, len(target_tensors), train_batch_size):
@@ -995,7 +1188,8 @@ dataset_folder/
                                 else:
                                     logits = outputs
 
-                                loss = criterion(logits, batch_labels)
+                                # Sum of losses for this batch (not mean)
+                                loss = criterion_eval(logits, batch_labels)
                                 total_target_loss += loss.item()
 
                                 _, predicted = torch.max(logits, 1)
@@ -1004,21 +1198,42 @@ dataset_folder/
 
                                 all_predictions.extend(predicted.cpu().tolist())
 
-                        avg_target_loss = total_target_loss / ((len(target_tensors) + train_batch_size - 1) // train_batch_size)
+                        # Correct mean: total sum / total number of samples
+                        avg_target_loss = total_target_loss / len(target_tensors)
                         target_acc = 100 * correct / total
 
                         # Save checkpoint if this epoch is a checkpoint epoch (1-indexed)
                         current_epoch_1indexed = epoch + 1
+                        ckpt_marker = ""
                         if current_epoch_1indexed in checkpoint_epochs:
                             # Deep copy the state dict to CPU
                             checkpoint_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                             model_checkpoints[current_epoch_1indexed] = checkpoint_state
-                            epoch_status.text(f"  Epoch {epoch+1}/{train_epochs}: Train Loss = {avg_train_loss:.4f} | Target Loss = {avg_target_loss:.4f} | Target Acc = {target_acc:.1f}% 📸 checkpoint saved")
-                        else:
-                            # Update live status (overwrites previous)
-                            epoch_status.text(f"  Epoch {epoch+1}/{train_epochs}: Train Loss = {avg_train_loss:.4f} | Target Loss = {avg_target_loss:.4f} | Target Acc = {target_acc:.1f}%")
+                            ckpt_marker = "📸"
+
+                        # Store metrics for this epoch
+                        epoch_metrics_list.append({
+                            "Epoch": f"{epoch+1}/{train_epochs}",
+                            "Train Loss": f"{avg_train_loss:.4f}",
+                            "Target Loss": f"{avg_target_loss:.4f}",
+                            "Target Acc": f"{target_acc:.1f}%",
+                            "": ckpt_marker  # Checkpoint marker column
+                        })
+
+                        # Update the metrics table (show last 10 epochs to avoid clutter)
+                        display_metrics = epoch_metrics_list[-10:] if len(epoch_metrics_list) > 10 else epoch_metrics_list
+                        df = pd.DataFrame(display_metrics)
+                        epoch_metrics_placeholder.dataframe(df, use_container_width=True, hide_index=True)
+
+                        # Update status with current epoch info
+                        training_status.update(label=f"🎓 Epoch {epoch+1}/{train_epochs} complete | Train Loss: {avg_train_loss:.4f} | Target Acc: {target_acc:.1f}%")
+
+                        # Final progress update for this epoch
+                        epoch_progress = 20 + int(60 * (epoch + 1) / train_epochs)
+                        progress_bar.progress(epoch_progress)
 
                     model.eval()
+                    training_status.update(label="✅ Training complete!", state="complete")
 
                     # Log checkpoint summary
                     if len(model_checkpoints) > 1:
@@ -1035,7 +1250,6 @@ dataset_folder/
                         for cls, count in top_3
                     ])
 
-                    epoch_status.empty()  # Clear the live status
                     st.write(f"  **Final**: Train Loss = {avg_train_loss:.4f} | Target Loss = {avg_target_loss:.4f} | Target Acc = {target_acc:.1f}%")
                     st.write(f"  **Predictions**: {top_3_str}")
 
@@ -1075,6 +1289,7 @@ dataset_folder/
                     "manifest": manifest,
                     "model_name": model_name,
                     "custom_weights": custom_weights,
+                    "num_classes_override": num_classes_override,  # User-specified class count override
                     "device": str(device),
                     "train_batch_size": train_batch_size,
                     "train_epochs": train_epochs,
@@ -1084,9 +1299,20 @@ dataset_folder/
                     "class_mapping": class_mapping,
                     "dataset_info": dataset_info,
                     "num_checkpoints": len(checkpoints_to_save),
+                    # Training results for display after rerun
+                    "epoch_metrics": epoch_metrics_list,
+                    "final_train_loss": avg_train_loss,
+                    "final_target_loss": avg_target_loss,
+                    "final_target_acc": target_acc,
+                    "final_predictions": all_predictions,
                 }
 
-                st.info("💾 Model and data saved. Click **Step 2** to compute TRAK scores.")
+                # In auto-run mode, advance to Step 2
+                if auto_run_mode:
+                    st.session_state["auto_run_step"] = 2
+                    st.info("💾 Model saved. Auto-running Step 2...")
+                else:
+                    st.info("💾 Model and data saved. Click **Step 2** to compute TRAK scores.")
                 st.rerun()
 
             except Exception as e:
@@ -1098,13 +1324,55 @@ dataset_folder/
     step2_button_disabled = not step1_complete or step2_complete
 
     if step1_complete and not step2_complete:
+        # Display Step 1 training results in expander (persisted from training)
+        step1_data = st.session_state.get("step1_data", {})
+        epoch_metrics = step1_data.get("epoch_metrics", [])
+        if epoch_metrics:
+            with st.expander("📈 Step 1 Training Results", expanded=False):
+                # Show final metrics
+                final_acc = step1_data.get("final_target_acc", 0)
+                final_train_loss = step1_data.get("final_train_loss", 0)
+                final_target_loss = step1_data.get("final_target_loss", 0)
+                train_epochs = step1_data.get("train_epochs", len(epoch_metrics))
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Target Accuracy", f"{final_acc:.1f}%")
+                with col2:
+                    st.metric("Train Loss", f"{final_train_loss:.4f}")
+                with col3:
+                    st.metric("Target Loss", f"{final_target_loss:.4f}")
+
+                # Show epoch-by-epoch table
+                st.markdown("**Epoch-by-epoch metrics:**")
+                df = pd.DataFrame(epoch_metrics)
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+                # Show prediction distribution
+                final_predictions = step1_data.get("final_predictions", [])
+                class_mapping = step1_data.get("class_mapping", {})
+                if final_predictions:
+                    from collections import Counter
+                    pred_counts = Counter(final_predictions)
+                    top_3 = pred_counts.most_common(3)
+                    top_3_str = ", ".join([
+                        f"{class_mapping.get(str(cls), f'class_{cls}')} ({count})"
+                        for cls, count in top_3
+                    ])
+                    st.markdown(f"**Top predictions on target set:** {top_3_str}")
+
         st.markdown("#### 📊 Step 2: Compute TRAK Scores")
         # Show checkpoint info from Step 1 if available
         saved_checkpoints = st.session_state.get("step1_data", {}).get("num_checkpoints", 1)
         ckpt_info = f", {saved_checkpoints} checkpoint(s)" if saved_checkpoints > 1 else ""
         st.caption(f"Using JL dim={jl_dim}, {num_projections} projection(s){ckpt_info}, gradient source: {gradient_source}")
 
-    if st.button("📊 **Step 2: Compute TRAK Scores**", type="primary", use_container_width=True, disabled=step2_button_disabled):
+    # Trigger Step 2 via button OR auto-run mode
+    step2_triggered = st.button("📊 **Step 2: Compute TRAK Scores**", type="primary", use_container_width=True, disabled=step2_button_disabled)
+    if auto_run_mode and auto_run_step == 2 and step1_complete and not step2_complete:
+        step2_triggered = True
+
+    if step2_triggered:
         with st.spinner("Computing TRAK scores..."):
             try:
                 # Load data from Step 1
@@ -1129,6 +1397,7 @@ dataset_folder/
                 dataset_root = step1_data["dataset_root"]
                 class_mapping = step1_data["class_mapping"]
                 dataset_info = step1_data["dataset_info"]
+                num_classes_override = step1_data.get("num_classes_override")  # May be None
                 # NOTE: jl_dim and num_projections come from sliders (defined above), not step1_data
                 # This allows users to modify TRAK parameters after training without retraining
 
@@ -1167,7 +1436,8 @@ dataset_folder/
                     model = load_classification_model_for_images(
                         model_name,
                         custom_weights_path=custom_weights,
-                        device=device
+                        device=device,
+                        num_classes=num_classes_override
                     )
                     ckpt_state_dict = model_checkpoints[ckpt_epoch]
                     model.load_state_dict({k: v.to(device) for k, v in ckpt_state_dict.items()})
@@ -1177,70 +1447,75 @@ dataset_folder/
                     ckpt_base_pct = int((ckpt_idx / num_ckpts) * 90)
                     ckpt_range = int(90 / num_ckpts)
 
-                    # ===== Extract raw gradients for this checkpoint (expensive) =====
-                    status_text_proj.text(f"{ckpt_label}: Extracting selection gradients...")
-                    train_grad_progress = st.empty()
+                    # ===== Fused gradient extraction + projection (GPU-efficient) =====
+                    # Extract gradients and project with all seeds in one pass
+                    # Gradients stay on GPU during projection, avoiding CPU round-trip
+                    proj_seeds = [42 + i for i in range(num_projections)]
 
-                    def train_progress_callback(current, total):
-                        train_grad_progress.text(f"  Processing: {current}/{total} images")
+                    # Selection gradients
+                    status_text_proj.text(f"{ckpt_label}: Extracting & projecting selection gradients...")
+                    selection_progress = st.empty()
 
-                    selection_grads_raw = extract_gradients_from_images(
+                    def selection_progress_callback(current, total):
+                        selection_progress.text(f"  Processing: {current}/{total} images (×{num_projections} projections)")
+
+                    selection_grads_list = extract_and_project_gradients(
                         model,
                         selection_tensors,
                         selection_labels,
+                        proj_dim=jl_dim,
+                        seeds=proj_seeds,
                         device=str(device),
                         batch_size=train_batch_size,
-                        progress_callback=train_progress_callback,
-                        project_dim=None,
-                        projection_seed=None,
+                        progress_callback=selection_progress_callback,
                         last_layer_only=freeze_backbone
                     )
-                    train_grad_progress.empty()
-                    overall_progress.progress(ckpt_base_pct + int(ckpt_range * 0.3))
+                    selection_progress.empty()
+                    overall_progress.progress(ckpt_base_pct + int(ckpt_range * 0.4))
 
                     # Free GPU memory
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                         gc.collect()
 
-                    status_text_proj.text(f"{ckpt_label}: Extracting target gradients...")
-                    target_grad_progress = st.empty()
+                    # Target gradients
+                    status_text_proj.text(f"{ckpt_label}: Extracting & projecting target gradients...")
+                    target_progress = st.empty()
 
                     def target_progress_callback(current, total):
-                        target_grad_progress.text(f"  Processing: {current}/{total} images")
+                        target_progress.text(f"  Processing: {current}/{total} images (×{num_projections} projections)")
 
-                    target_grads_raw = extract_gradients_from_images(
+                    target_grads_list = extract_and_project_gradients(
                         model,
                         target_tensors,
                         target_labels,
+                        proj_dim=jl_dim,
+                        seeds=proj_seeds,
                         device=str(device),
                         batch_size=train_batch_size,
                         progress_callback=target_progress_callback,
-                        project_dim=None,
-                        projection_seed=None,
                         last_layer_only=freeze_backbone
                     )
-                    target_grad_progress.empty()
-                    overall_progress.progress(ckpt_base_pct + int(ckpt_range * 0.5))
+                    target_progress.empty()
+                    overall_progress.progress(ckpt_base_pct + int(ckpt_range * 0.7))
 
                     # Free GPU memory
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                         gc.collect()
 
-                    # ===== Apply projections and compute TRAK scores for this checkpoint =====
+                    # ===== Compute TRAK scores for each projection =====
                     for proj_idx in range(num_projections):
-                        proj_seed = 42 + proj_idx
+                        proj_seed = proj_seeds[proj_idx]
                         proj_label = f"Proj {proj_idx + 1}/{num_projections}" if num_projections > 1 else ""
                         combined_label = f"{ckpt_label} | {proj_label}".strip(" |")
 
                         # Calculate progress within this checkpoint
-                        proj_pct = int(ckpt_range * 0.5) + int((proj_idx / num_projections) * ckpt_range * 0.5)
+                        proj_pct = int(ckpt_range * 0.7) + int((proj_idx / num_projections) * ckpt_range * 0.3)
 
-                        # Project gradients
-                        status_text_proj.text(f"{combined_label}: Projecting gradients (→{jl_dim}D)...")
-                        selection_grads = project_gradients_random(selection_grads_raw, target_dim=jl_dim, seed=proj_seed)
-                        target_grads = project_gradients_random(target_grads_raw, target_dim=jl_dim, seed=proj_seed)
+                        # Get pre-projected gradients for this seed
+                        selection_grads = selection_grads_list[proj_idx]
+                        target_grads = target_grads_list[proj_idx]
 
                         # Compute TRAK scores
                         status_text_proj.text(f"{combined_label}: Computing influence scores...")
@@ -1263,11 +1538,8 @@ dataset_folder/
 
                         overall_progress.progress(ckpt_base_pct + proj_pct)
 
-                        # Free projected gradients
-                        del selection_grads, target_grads
-
-                    # Free raw gradients for this checkpoint
-                    del selection_grads_raw, target_grads_raw, model
+                    # Free projected gradients for this checkpoint
+                    del selection_grads_list, target_grads_list, model
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                         gc.collect()
@@ -1318,7 +1590,6 @@ dataset_folder/
                     "source": [next((e['source'] for e in manifest['entries'] if e['filename'] in p), 'unknown')
                                for p in selection_valid_paths]
                 }
-                import pandas as pd
                 scores_df = pd.DataFrame(scores_data)
                 scores_df_sorted = scores_df.sort_values('trak_score', ascending=False).reset_index(drop=True)
 
@@ -1350,10 +1621,17 @@ dataset_folder/
                     "jl_dim": jl_dim,  # TRAK projection dimension
                     "num_projections": num_projections,  # Number of projections averaged
                     "class_mapping": class_mapping,  # Class name mapping from dataset
+                    "num_classes_override": num_classes_override,  # User-specified class count override
                 }
 
                 st.success("✅ Step 2 Complete! TRAK scores computed.")
-                st.info("💾 Results saved. You can now proceed to **Step 3** to select and retrain.")
+
+                # In auto-run mode, advance to Step 3 (compare all methods)
+                if auto_run_mode:
+                    st.session_state["auto_run_step"] = 3
+                    st.info("💾 Results saved. Auto-running Compare All Methods...")
+                else:
+                    st.info("💾 Results saved. You can now proceed to **Step 3** to select and retrain.")
                 st.rerun()
 
             except Exception as e:
@@ -1363,6 +1641,26 @@ dataset_folder/
 
     # STEP 2.5: Display TRAK Scores (separate from main button to prevent reset on interaction)
     if "trak_data" in st.session_state:
+        # Display Step 1 training results in expander (persisted)
+        step1_data = st.session_state.get("step1_data", {})
+        epoch_metrics = step1_data.get("epoch_metrics", [])
+        if epoch_metrics:
+            with st.expander("📈 Step 1 Training Results", expanded=False):
+                final_acc = step1_data.get("final_target_acc", 0)
+                final_train_loss = step1_data.get("final_train_loss", 0)
+                final_target_loss = step1_data.get("final_target_loss", 0)
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Target Accuracy", f"{final_acc:.1f}%")
+                with col2:
+                    st.metric("Train Loss", f"{final_train_loss:.4f}")
+                with col3:
+                    st.metric("Target Loss", f"{final_target_loss:.4f}")
+
+                df = pd.DataFrame(epoch_metrics)
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
         trak_data = st.session_state["trak_data"]
         scores_df_sorted = trak_data.get("scores_df_sorted")
         selection_valid_paths = trak_data.get("selection_valid_paths")
@@ -1600,6 +1898,7 @@ dataset_folder/
         manifest = trak_data["manifest"]
         model_name = trak_data["model_name"]
         custom_weights = trak_data["custom_weights"]
+        num_classes_override = trak_data.get("num_classes_override")  # May be None
         device = torch.device(trak_data["device"])
         train_batch_size = trak_data["train_batch_size"]
         train_epochs = trak_data["train_epochs"]
@@ -1726,114 +2025,208 @@ dataset_folder/
         st.caption(f"🔧 Training config: **{step3_epochs}** epochs, batch size **{step3_batch_size}**, lr **{step3_lr:.0e}**, {optimizer_choice}, {training_mode}")
 
         # Comparison mode: run all three methods and compare results
+        st.markdown("---")
+        st.markdown("#### 🔬 Compare All Methods")
+
+        # Multi-percentage selection for comprehensive comparison
+        percentages_input = st.text_input(
+            "Percentages to compare",
+            value="10,25,50,75,90",
+            key="compare_percentages",
+            help="Enter percentages as comma-separated integers (e.g., 5, 25, 50, 75, 100)"
+        )
+
+        # Parse input into sorted list of unique percentages
+        compare_percentages = []
+        if percentages_input.strip():
+            try:
+                compare_percentages = sorted(set(
+                    int(x.strip()) for x in percentages_input.split(",")
+                    if x.strip() and 0 < int(x.strip()) <= 100
+                ))
+            except ValueError:
+                st.warning("⚠️ Please enter comma-separated integers (e.g., 10, 25, 50).")
+
         col_retrain, col_compare = st.columns([1, 1])
 
         with col_compare:
-            compare_btn = st.button("🔬 Compare All Methods", type="secondary", use_container_width=True, help="Run Top, Bottom, and Random selection methods and compare their results")
+            compare_btn = st.button("🔬 Compare All Methods", type="secondary", use_container_width=True, help="Run Top, Bottom, and Random selection methods across all selected percentages")
 
-        if compare_btn:
-            st.markdown("### 🔬 Method Comparison")
-            st.info(f"Training and evaluating all three selection methods with **{selection_pct}%** of {pool_label} ({n_select} images each)")
+        # Trigger in auto-run mode
+        if auto_run_mode and auto_run_step == 3 and step2_complete:
+            compare_btn = True
+            # Use default percentages in auto-run mode if none selected
+            if not compare_percentages:
+                compare_percentages = [10, 20, 30]
+
+        if compare_btn and compare_percentages:
+            st.markdown("### 🔬 Multi-Percentage Method Comparison")
+
+            # Auto-detect num_classes from manifest if not set
+            if num_classes_override is None:
+                dataset_info = manifest.get('dataset_info', {})
+                dataset_num_classes = dataset_info.get('num_classes')
+                if dataset_num_classes is not None:
+                    num_classes_override = dataset_num_classes
+                    st.info(f"🎯 Compare: Auto-detected {num_classes_override} classes from dataset manifest")
+
+            st.info(f"Training and evaluating **{len(compare_percentages)} percentages** × **3 methods** = **{len(compare_percentages) * 3}** experiments (model: {num_classes_override or 1000} classes)")
 
             comparison_results = []
             methods = [
-                ("Top (highest influence)", True),
-                ("Bottom (lowest influence)", False),
+                ("Top", True),
+                ("Bottom", False),
                 ("Random", None),
             ]
 
+            total_experiments = len(compare_percentages) * len(methods)
             overall_progress = st.progress(0)
             method_status = st.empty()
+            experiment_idx = 0
 
-            for method_idx, (method_name, descending) in enumerate(methods):
-                method_status.markdown(f"**Running {method_name}...**")
+            for pct in compare_percentages:
+                n_select_pct = max(1, int(len(selection_valid_paths) * pct / 100.0))
+                n_confusers_pct = int(n_confusers_total * pct / 100) if has_confuser_data else 0
+                n_confusers_pct = max(1, n_confusers_pct) if has_confuser_data else 0
 
-                # Select indices based on method
-                if descending is not None:
-                    selected_indices = torch.argsort(importance_scores, descending=descending)[:n_select]
-                else:  # Random
-                    import random
-                    all_indices = list(range(len(selection_valid_paths)))
-                    random.shuffle(all_indices)
-                    selected_indices = torch.tensor(all_indices[:n_select])
+                for method_name, descending in methods:
+                    method_status.markdown(f"**Running {pct}% - {method_name}...** ({experiment_idx + 1}/{total_experiments})")
 
-                # Get subset data
-                method_subset_tensors = selection_tensors[selected_indices]
-                method_subset_labels = selection_labels[selected_indices]
+                    # Select indices based on method
+                    if descending is not None:
+                        selected_indices = torch.argsort(importance_scores, descending=descending)[:n_select_pct]
+                    else:  # Random
+                        import random
+                        all_indices = list(range(len(selection_valid_paths)))
+                        random.shuffle(all_indices)
+                        selected_indices = torch.tensor(all_indices[:n_select_pct])
 
-                # Add confusers if applicable
-                if has_confuser_data and n_confusers_select > 0:
-                    import random
-                    confuser_indices = list(range(n_confusers_total))
-                    random.shuffle(confuser_indices)
-                    selected_confuser_indices = confuser_indices[:n_confusers_select]
+                    # Get subset data
+                    method_subset_tensors = selection_tensors[selected_indices]
+                    method_subset_labels = selection_labels[selected_indices]
 
-                    selected_confuser_tensors = confuser_tensors[selected_confuser_indices]
-                    selected_confuser_labels = confuser_labels[selected_confuser_indices]
+                    # Add confusers if applicable
+                    if has_confuser_data and n_confusers_pct > 0:
+                        import random
+                        confuser_indices = list(range(n_confusers_total))
+                        random.shuffle(confuser_indices)
+                        selected_confuser_indices = confuser_indices[:n_confusers_pct]
 
-                    method_subset_tensors = torch.cat([method_subset_tensors, selected_confuser_tensors], dim=0)
-                    method_subset_labels = torch.cat([method_subset_labels, selected_confuser_labels], dim=0)
+                        selected_confuser_tensors = confuser_tensors[selected_confuser_indices]
+                        selected_confuser_labels = confuser_labels[selected_confuser_indices]
 
-                # Train and evaluate
-                def progress_cb(epoch, total):
-                    base_progress = method_idx / len(methods)
-                    epoch_progress = epoch / total / len(methods)
-                    overall_progress.progress(base_progress + epoch_progress)
+                        method_subset_tensors = torch.cat([method_subset_tensors, selected_confuser_tensors], dim=0)
+                        method_subset_labels = torch.cat([method_subset_labels, selected_confuser_labels], dim=0)
 
-                result = train_and_evaluate_subset(
-                    model_name=model_name,
-                    custom_weights=custom_weights,
-                    subset_tensors=method_subset_tensors,
-                    subset_labels=method_subset_labels,
-                    target_tensors=target_tensors if has_target_data else None,
-                    target_labels=target_labels if has_target_data else None,
-                    epochs=step3_epochs,
-                    batch_size=step3_batch_size,
-                    lr=step3_lr,
-                    optimizer_choice=optimizer_choice,
-                    freeze_backbone=freeze_backbone,
-                    device=device,
-                    progress_callback=progress_cb,
-                )
+                    # Train and evaluate
+                    def progress_cb(epoch, total):
+                        base_progress = experiment_idx / total_experiments
+                        epoch_progress = epoch / total / total_experiments
+                        overall_progress.progress(min(base_progress + epoch_progress, 1.0))
 
-                comparison_results.append({
-                    "Method": method_name,
-                    "Train Loss": result["train_loss"],
-                    "Target Loss": result["target_loss"],
-                    "Target Acc (%)": result["target_acc"],
-                })
+                    result = train_and_evaluate_subset(
+                        model_name=model_name,
+                        custom_weights=custom_weights,
+                        subset_tensors=method_subset_tensors,
+                        subset_labels=method_subset_labels,
+                        target_tensors=target_tensors if has_target_data else None,
+                        target_labels=target_labels if has_target_data else None,
+                        epochs=step3_epochs,
+                        batch_size=step3_batch_size,
+                        lr=step3_lr,
+                        optimizer_choice=optimizer_choice,
+                        freeze_backbone=freeze_backbone,
+                        device=device,
+                        progress_callback=progress_cb,
+                        num_classes=num_classes_override,
+                    )
+
+                    comparison_results.append({
+                        "Pct": f"{pct}%",
+                        "N": n_select_pct,
+                        "Method": method_name,
+                        "Train Loss": result["train_loss"],
+                        "Target Loss": result["target_loss"],
+                        "Target Acc (%)": result["target_acc"],
+                    })
+
+                    experiment_idx += 1
 
             overall_progress.progress(1.0)
             method_status.markdown("**✅ Comparison Complete!**")
 
+            # Clear auto-run mode after completion
+            if auto_run_mode:
+                st.session_state["auto_run_mode"] = False
+                st.session_state["auto_run_step"] = 0
+
             # Display comparison table
-            import pandas as pd
             df = pd.DataFrame(comparison_results)
 
             st.markdown("#### 📊 Comparison Results")
+
+            # Create pivot tables for both accuracy and loss
+            pivot_acc = df.pivot(index="Pct", columns="Method", values="Target Acc (%)")
+            pivot_acc = pivot_acc[["Top", "Bottom", "Random"]]  # Reorder columns
+
+            pivot_loss = df.pivot(index="Pct", columns="Method", values="Target Loss")
+            pivot_loss = pivot_loss[["Top", "Bottom", "Random"]]  # Reorder columns
+
+            # Add N column (number of images) - same for all methods at each pct
+            n_by_pct = df.groupby("Pct")["N"].first()
+
+            # Build result dataframe with N, Acc and Loss for each method
+            result_df = pd.DataFrame(index=pivot_acc.index)
+            result_df["N"] = n_by_pct
+            for method in ["Top", "Bottom", "Random"]:
+                result_df[f"{method} Acc"] = pivot_acc[method]
+                result_df[f"{method} Loss"] = pivot_loss[method]
+
+            # Style: highlight max Acc and min Loss per row
+            acc_cols = ["Top Acc", "Bottom Acc", "Random Acc"]
+            loss_cols = ["Top Loss", "Bottom Loss", "Random Loss"]
+
+            def highlight_best_in_row(row):
+                styles = [""] * len(row)
+                # Highlight max accuracy (green)
+                acc_values = {col: row[col] for col in acc_cols if col in row.index}
+                if acc_values:
+                    max_acc = max(acc_values.values())
+                    for i, col in enumerate(row.index):
+                        if col in acc_cols and row[col] == max_acc:
+                            styles[i] = "background-color: lightgreen"
+                # Highlight min loss (light blue)
+                loss_values = {col: row[col] for col in loss_cols if col in row.index}
+                if loss_values:
+                    min_loss = min(loss_values.values())
+                    for i, col in enumerate(row.index):
+                        if col in loss_cols and row[col] == min_loss:
+                            styles[i] = "background-color: lightblue"
+                return styles
+
             st.dataframe(
-                df.style.format({
-                    "Train Loss": "{:.4f}",
-                    "Target Loss": "{:.4f}",
-                    "Target Acc (%)": "{:.2f}",
-                }).highlight_min(subset=["Train Loss", "Target Loss"], color="lightgreen")
-                 .highlight_max(subset=["Target Acc (%)"], color="lightgreen"),
+                result_df.style.format({
+                    "N": "{:d}",
+                    "Top Acc": "{:.2f}",
+                    "Bottom Acc": "{:.2f}",
+                    "Random Acc": "{:.2f}",
+                    "Top Loss": "{:.4f}",
+                    "Bottom Loss": "{:.4f}",
+                    "Random Loss": "{:.4f}",
+                }).apply(highlight_best_in_row, axis=1),
                 use_container_width=True,
-                hide_index=True,
             )
 
-            # Show which method performed best
+            # Show best configuration overall
             if has_target_data:
                 best_idx = df["Target Acc (%)"].idxmax()
-                best_method = df.loc[best_idx, "Method"]
-                best_acc = df.loc[best_idx, "Target Acc (%)"]
-                st.success(f"🏆 **Best Method**: {best_method} with **{best_acc:.2f}%** target accuracy")
+                best_row = df.loc[best_idx]
+                st.success(f"🏆 **Best Overall**: {best_row['Method']} at {best_row['Pct']} ({best_row['N']} images) with **{best_row['Target Acc (%)']:.2f}%** accuracy (loss: {best_row['Target Loss']:.4f})")
 
             # Store comparison results in session state
             st.session_state["method_comparison_results"] = {
                 "results": comparison_results,
-                "selection_pct": selection_pct,
-                "n_select": n_select,
+                "percentages": compare_percentages,
                 "epochs": step3_epochs,
             }
 
@@ -1892,11 +2285,38 @@ dataset_folder/
                 subset_loader = DataLoader(subset_dataset, batch_size=step3_batch_size, shuffle=True)
 
                 # Reset model (reload from scratch)
+                # Auto-detect num_classes from manifest if not set
+                if num_classes_override is None:
+                    dataset_info = manifest.get('dataset_info', {})
+                    dataset_num_classes = dataset_info.get('num_classes')
+                    if dataset_num_classes is not None:
+                        num_classes_override = dataset_num_classes
+                        st.info(f"🎯 Step 3: Auto-detected {num_classes_override} classes from dataset manifest")
+
                 model = load_classification_model_for_images(
                     model_name,
                     custom_weights_path=custom_weights,
-                    device=device
+                    device=device,
+                    num_classes=num_classes_override
                 )
+
+                # Verify and show model output classes
+                import torch.nn as nn
+                if hasattr(model, 'classifier'):
+                    if hasattr(model.classifier, 'out_features'):
+                        model_classes = model.classifier.out_features
+                    elif isinstance(model.classifier, nn.Sequential):
+                        for m in reversed(list(model.classifier.modules())):
+                            if hasattr(m, 'out_features'):
+                                model_classes = m.out_features
+                                break
+                    else:
+                        model_classes = "unknown"
+                elif hasattr(model, 'fc'):
+                    model_classes = model.fc.out_features if hasattr(model.fc, 'out_features') else "unknown"
+                else:
+                    model_classes = "unknown"
+                st.info(f"📊 Step 3 Model: {model_classes} output classes")
 
                 # Setup training mode and parameters
                 model.train()
@@ -1969,6 +2389,9 @@ dataset_folder/
                         correct = 0
                         total = 0
 
+                        # Use reduction='sum' for correct averaging across variable batch sizes
+                        criterion_eval = nn.CrossEntropyLoss(reduction='sum')
+
                         with torch.no_grad():
                             for i in range(0, len(target_tensors), step3_batch_size):
                                 batch_images = target_tensors[i:i+step3_batch_size].to(device)
@@ -1980,15 +2403,16 @@ dataset_folder/
                                 else:
                                     logits = outputs
 
-                                loss = criterion(logits, batch_labels)
+                                # Sum of losses for this batch (not mean)
+                                loss = criterion_eval(logits, batch_labels)
                                 total_target_loss += loss.item()
 
                                 _, predicted = torch.max(logits, 1)
                                 total += batch_labels.size(0)
                                 correct += (predicted == batch_labels).sum().item()
 
-                        num_target_batches = (len(target_tensors) + step3_batch_size - 1) // step3_batch_size
-                        avg_target_loss = total_target_loss / num_target_batches
+                        # Correct mean: total sum / total number of samples
+                        avg_target_loss = total_target_loss / len(target_tensors)
                         target_acc = 100 * correct / total
 
                         if (epoch + 1) % max(1, step3_epochs // 5) == 0:
