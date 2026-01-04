@@ -28,6 +28,16 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 from plotly.subplots import make_subplots
 
+
+def _get_num_envmaps(envmap_paths: Optional[Sequence[str]]) -> int:
+    """Get the number of environment maps from the paths."""
+    if not envmap_paths:
+        return 1
+    # Filter for actual HDR/EXR files
+    valid_paths = [p for p in envmap_paths if p.lower().endswith(('.hdr', '.exr'))]
+    return len(valid_paths) if valid_paths else 1
+
+
 def create_interactive_polar_plot(
     camera_positions: np.ndarray,
     labels_correct: np.ndarray,

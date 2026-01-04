@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import tempfile
+import io
 import zipfile
 from io import BytesIO
 from pathlib import Path

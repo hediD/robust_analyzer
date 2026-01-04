@@ -18,6 +18,7 @@ import traceback
 import zipfile
 from collections import Counter
 from datetime import datetime
+import io
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -418,6 +419,47 @@ dataset_folder/
     if "model_name" not in st.session_state:
         st.warning("⚠️ Please configure model settings in the sidebar first")
         return
+
+    # Display current model configuration
+    model_config = st.session_state.get("model_config", {})
+    model_name = model_config.get("model_name", st.session_state.get("model_name", "Unknown"))
+    num_classes = model_config.get("num_classes", 1000)
+    custom_weights_path = model_config.get("custom_weights_path")
+    num_classes_override = model_config.get("num_classes_override")
+    custom_labels = model_config.get("custom_labels")
+
+    # Determine source of num_classes
+    if num_classes_override is not None:
+        classes_source = "user override"
+    elif custom_weights_path:
+        classes_source = "detected from weights"
+    else:
+        classes_source = "ImageNet default"
+
+    # Get model display name
+    model_display = MODEL_CONFIGS.get(model_name, {}).get("description", model_name)
+
+    # Show model info box
+    st.markdown("### 🤖 Current Model Configuration")
+    col_model_info1, col_model_info2, col_model_info3 = st.columns(3)
+    with col_model_info1:
+        st.metric("Model", model_display.split(" (")[0] if "(" in model_display else model_display)
+    with col_model_info2:
+        st.metric("Classifier Output Classes", f"{num_classes}")
+    with col_model_info3:
+        if custom_labels:
+            st.metric("Class Labels", f"{len(custom_labels)} custom")
+        else:
+            st.metric("Class Labels", "ImageNet" if num_classes == 1000 else "Generic")
+
+    # Show details in caption
+    details = [f"Classes: {classes_source}"]
+    if custom_weights_path:
+        weights_name = Path(custom_weights_path).name
+        details.append(f"Weights: {weights_name[:30]}..." if len(weights_name) > 30 else f"Weights: {weights_name}")
+    st.caption(" | ".join(details))
+
+    st.markdown("---")
 
     # File upload section
     st.markdown("### 📤 Upload Dataset")
