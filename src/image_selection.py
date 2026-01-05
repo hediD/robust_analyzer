@@ -38,6 +38,174 @@ from trak import (
     project_gradients_random,
 )
 
+
+def generate_dataset_json_from_folder(dataset_root: str, target_class_name: str = None) -> dict:
+    """
+    Auto-generate dataset.json from an ImageFolder-like directory structure.
+
+    Expected structure:
+        dataset_root/
+        ├── train/           # Training images (required)
+        │   ├── class1/
+        │   │   ├── img1.png
+        │   │   └── img2.jpg
+        │   └── class2/
+        │       └── img1.png
+        ├── select/          # Selection pool (optional, defaults to train)
+        │   └── class1/
+        │       └── img1.png
+        └── target/          # Target/evaluation images (required)
+            └── class1/
+                └── img1.png
+
+    Args:
+        dataset_root: Path to the dataset root directory
+        target_class_name: Name of the target class (auto-detected from target/ if not provided)
+
+    Returns:
+        dict: Generated dataset manifest (same format as dataset.json)
+    """
+    dataset_root = Path(dataset_root)
+    train_dir = dataset_root / "train"
+    select_dir = dataset_root / "select"
+    target_dir = dataset_root / "target"
+
+    # Validate required directories
+    if not train_dir.exists():
+        raise ValueError(f"Required 'train/' directory not found in {dataset_root}")
+    if not target_dir.exists():
+        raise ValueError(f"Required 'target/' directory not found in {dataset_root}")
+
+    # Supported image extensions
+    image_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'}
+
+    def find_images(directory: Path) -> List[Tuple[str, str]]:
+        """Find all images in directory, return list of (relative_path, class_name)."""
+        images = []
+        if not directory.exists():
+            return images
+
+        for class_dir in sorted(directory.iterdir()):
+            if not class_dir.is_dir():
+                continue
+            class_name = class_dir.name
+
+            for img_file in sorted(class_dir.iterdir()):
+                if img_file.suffix.lower() in image_extensions:
+                    # Relative path from dataset root
+                    rel_path = img_file.relative_to(dataset_root)
+                    images.append((str(rel_path), class_name))
+
+        return images
+
+    # Find all images
+    train_images = find_images(train_dir)
+    select_images = find_images(select_dir) if select_dir.exists() else []
+    target_images = find_images(target_dir)
+
+    if not train_images:
+        raise ValueError(f"No images found in train/ directory")
+    if not target_images:
+        raise ValueError(f"No images found in target/ directory")
+
+    # If no select folder, use train images as selection pool
+    if not select_images:
+        select_images = train_images.copy()
+
+    # Build class mapping from all unique classes
+    all_classes = set()
+    for _, class_name in train_images + select_images + target_images:
+        all_classes.add(class_name)
+    all_classes = sorted(all_classes)
+
+    # Auto-detect target classes from target/ folder (can have multiple)
+    target_classes = sorted(set(class_name for _, class_name in target_images))
+
+    # Create class mapping (target classes get highest indices)
+    class_to_idx = {}
+    idx = 0
+    # First assign indices to non-target classes
+    for class_name in all_classes:
+        if class_name not in target_classes:
+            class_to_idx[class_name] = idx
+            idx += 1
+    # Then assign indices to target classes
+    target_class_indices = []
+    for class_name in target_classes:
+        class_to_idx[class_name] = idx
+        target_class_indices.append(idx)
+        idx += 1
+
+    class_mapping = {str(v): k for k, v in class_to_idx.items()}
+
+    # Build entries
+    entries = []
+
+    # Helper to create entry
+    def add_entry(rel_path: str, class_name: str, purposes: List[str], source: str):
+        entries.append({
+            "filename": rel_path,
+            "purposes": purposes,
+            "class_idx": class_to_idx[class_name],
+            "class_name": class_name,
+            "source": source
+        })
+
+    # Track which files have which purposes
+    file_purposes = {}  # rel_path -> set of purposes
+
+    # Add train images
+    for rel_path, class_name in train_images:
+        if rel_path not in file_purposes:
+            file_purposes[rel_path] = {"class_name": class_name, "purposes": set()}
+        file_purposes[rel_path]["purposes"].add("train")
+
+    # Add select images
+    for rel_path, class_name in select_images:
+        if rel_path not in file_purposes:
+            file_purposes[rel_path] = {"class_name": class_name, "purposes": set()}
+        file_purposes[rel_path]["purposes"].add("select")
+
+    # Add target images
+    for rel_path, class_name in target_images:
+        if rel_path not in file_purposes:
+            file_purposes[rel_path] = {"class_name": class_name, "purposes": set()}
+        file_purposes[rel_path]["purposes"].add("target")
+
+    # Convert to entries list
+    for rel_path, info in sorted(file_purposes.items()):
+        # Determine source from path
+        if rel_path.startswith("target/"):
+            source = "real"
+        elif rel_path.startswith("select/"):
+            source = "select"
+        else:
+            source = "train"
+
+        entries.append({
+            "filename": rel_path,
+            "purposes": sorted(list(info["purposes"])),
+            "class_idx": class_to_idx[info["class_name"]],
+            "class_name": info["class_name"],
+            "source": source
+        })
+
+    # Build manifest
+    manifest = {
+        "dataset_info": {
+            "name": f"Auto-generated from {dataset_root.name}",
+            "description": "Dataset auto-generated from ImageFolder structure",
+            "num_classes": len(all_classes),
+            "target_classes": target_class_indices,
+            "target_class_names": target_classes
+        },
+        "class_mapping": class_mapping,
+        "entries": entries
+    }
+
+    return manifest
+
+
 def load_classification_model_for_images(model_name, custom_weights_path=None, device='cuda', num_classes=None):
     """
     Load just the classification model for image selection, without 3D rendering components.
@@ -302,14 +470,43 @@ def handle_image_selection():
 
 ### Dataset Structure
 
+You can use either a JSON manifest or a simple folder structure:
+
+**Option 1: JSON Manifest (Full Control)**
 ```
 dataset_folder/
-├── dataset.json          # Manifest file (required)
+├── dataset.json          # Manifest file
 └── images/               # All images referenced in manifest
     ├── train_img_001.png
     ├── target_img_001.png
     └── ...
 ```
+
+**Option 2: ImageFolder Structure (Auto-Generates config)*
+```
+dataset_folder/
+├── train/                # Training images (required)
+│   ├── tank/            # Class folders (target class)
+│   │   ├── img1.png
+│   │   └── img2.jpg
+│   ├── jeep/            # Other classes
+│   │   └── img1.png
+│   └── half_track/
+│       └── img1.png
+├── select/               # Selection pool (optional, defaults to train/)
+│   └── tank/
+│       └── img1.png
+└── target/               # Target/evaluation images (required)
+    └── tank/            # Must match a class in train/
+        └── real_photo.png
+```
+
+When using ImageFolder structure:
+- **Auto-generation**: `dataset.json` is created automatically
+- **Download button**: A "📥 Download generated dataset.json" button appears to review/modify the manifest
+- **Class detection**: Classes are discovered from train/ subfolder names
+- **Target class(es)**: Auto-detected from target/ folder (can have multiple classes!)
+- **Selection pool**: If no select/ folder, train/ images of target class(es) are used
 
 ### Manifest Structure (`dataset.json`)
 
@@ -317,11 +514,11 @@ dataset_folder/
 {
   "dataset_info": {
     "name": "My Dataset",
-    "target_class": 5,
-    "target_class_name": "tank",
+    "target_classes": [5, 6],
+    "target_class_names": ["tank", "jeep"],
     "num_classes": 10
   },
-  "class_mapping": {"0": "airplane", "5": "tank", ...},
+  "class_mapping": {"0": "airplane", "5": "tank", "6": "jeep", ...},
   "entries": [
     {
       "filename": "images/train_img_001.png",
@@ -339,24 +536,26 @@ dataset_folder/
 }
 ```
 
+**Note**: Multiple target classes are supported! Put multiple class folders in `target/` and they'll all be treated as targets.
+
 ### Image Purposes
 
 | Purpose | Description | Required |
 |---------|-------------|----------|
-| `train` | Training images (target class + confusers) | ✅ Yes |
+| `train` | Training images (all classes) | ✅ Yes |
 | `target` | Real-world images to optimize for | ✅ Yes |
-| `select` | Candidate pool for TRAK selection | ⚠️ Optional (defaults to all train) |
+| `select` | Candidate pool for TRAK selection | ⚠️ Optional (defaults to `train`) |
 
 ### Training Parameters
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| **Training epochs** | More epochs = better TRAK signal but slower | 5 |
-| **Batch size** | Adjust based on GPU memory | 128 |
-| **Learning rate** | Lower LR = slower convergence = more gradient signal | 1e-4 |
+| **Training epochs** | More epochs = better TRAK signal but slower | 10 |
+| **Batch size** | Adjust based on GPU memory | 32 |
+| **Learning rate** | Lower LR = slower convergence = more gradient signal | 5e-4 |
 
 **Training Options** (expandable):
-- **Reset classifier head**: Reinitialize classifier weights before training
+- **Reset classifier head**: Reinitialize classifier weights before training (default: enabled)
 - **Optimizer**: AdamW (default), Adam, or SGD
 
 ### TRAK Configuration
@@ -366,15 +565,16 @@ dataset_folder/
 | **JL projection dimension** | Higher = more accurate but slower/more memory | 1024 |
 | **Number of projections** | More = more stable scores (averaged) | 4 |
 | **Gradient source** | "Last layer only" (faster) or "Full model" | Last layer only |
-| **Number of checkpoints** | Save multiple checkpoints during training, average TRAK across them | 1 |
+| **Number of checkpoints** | Save multiple checkpoints during training, average TRAK across them | 2 |
 
 **Ensemble TRAK**: Using multiple checkpoints × multiple projections gives more stable, reliable influence scores. For example, 3 checkpoints × 4 projections = 12 TRAK computations averaged.
 
 ### Workflow (3 Steps)
 
 **Step 1: Train Initial Model**
-- Trains a classifier on all training images (target class + confusers)
+- Trains a classifier on `train` + `select` images combined
 - Saves model checkpoints for TRAK computation
+- Records initial class distribution for Step 3 balancing
 - Shows training/target loss and accuracy per epoch
 
 **Step 2: Compute TRAK Scores**
@@ -388,7 +588,8 @@ dataset_folder/
 - Choose selection strategy: Top (highest influence), Bottom, or Random
 - Optionally override training hyperparameters
 - **Compare All Methods**: Run Top, Bottom, and Random selections and compare target accuracy
-- Retrain model on selected subset + proportional confusers
+- Select top-k% from `select`, then balance with `train` to match initial class ratios
+- Final training set maintains same class proportions as Step 1
 
 ### Understanding Results
 
@@ -399,7 +600,7 @@ dataset_folder/
 
 ### Example Use Case
 
-- **Train images**: 500 simulated tank renders + 500 confuser images (other classes)
+- **Train images**: 500 simulated tank renders + 500 other class images
 - **Target images**: 50 real-world tank photos
 - **Selection pool**: The 500 simulated tank renders
 - **TRAK config**: 3 checkpoints, 4 projections, JL dim=2048
@@ -407,6 +608,8 @@ dataset_folder/
 
 ### Tips
 
+- **Start with ImageFolder**: Just organize images in `train/<class>/` and `target/<class>/` folders - no JSON needed!
+- **Download & customize**: Use the "📥 Download generated dataset.json" button to get the auto-generated manifest, then modify it if needed
 - **Local paths** are faster for large datasets - no upload/extraction overhead
 - **More checkpoints** give more stable scores but take longer to compute
 - **Last layer gradients** are usually sufficient and much faster than full model
@@ -440,7 +643,7 @@ dataset_folder/
     model_display = MODEL_CONFIGS.get(model_name, {}).get("description", model_name)
 
     # Show model info box
-    st.markdown("### 🤖 Current Model Configuration")
+    st.markdown("###Current Model Configuration")
     col_model_info1, col_model_info2, col_model_info3 = st.columns(3)
     with col_model_info1:
         st.metric("Model", model_display.split(" (")[0] if "(" in model_display else model_display)
@@ -469,7 +672,7 @@ dataset_folder/
     - Upload a **dataset folder (as ZIP)** containing images and a `dataset.json` manifest
     - The JSON specifies which images are for:
       - `target`: Evaluation/selection targets (real images)
-      - `train`: Training images (tank + confusers)
+      - `train`: Training images (all classes)
       - `select`: Selection pool (tank images only)
 
     **Format example:** See the `ui_dataset` folder generated by `create_ui_dataset.py`
@@ -495,7 +698,7 @@ dataset_folder/
         )
 
         if not dataset_zip:
-            st.info("👆 Upload dataset ZIP file containing dataset.json and images/")
+            st.info("Upload dataset ZIP file")
             return
 
         st.success(f"✅ Dataset uploaded: {dataset_zip.name}")
@@ -523,13 +726,44 @@ dataset_folder/
             return
 
         manifest_path = local_path / "dataset.json"
-        if not manifest_path.exists():
-            st.error(f"❌ No dataset.json found in {local_dataset_path}")
-            return
+        auto_generated_manifest = None
 
+        if not manifest_path.exists():
+            # Check if ImageFolder structure exists (train/ and target/ folders)
+            train_dir = local_path / "train"
+            target_dir = local_path / "target"
+
+            if train_dir.exists() and target_dir.exists():
+                st.info("📂 No dataset.json found, attempting to auto-generate from folder structure...")
+                try:
+                    auto_generated_manifest = generate_dataset_json_from_folder(str(local_path))
+                    # Save the generated manifest
+                    with open(manifest_path, 'w') as f:
+                        json.dump(auto_generated_manifest, f, indent=2)
+                    st.success(f"✅ Auto-generated dataset.json with {len(auto_generated_manifest['entries'])} entries")
+
+                    # Offer download of the generated manifest
+                    st.download_button(
+                        label="📥 Download generated dataset.json",
+                        data=json.dumps(auto_generated_manifest, indent=2),
+                        file_name="dataset.json",
+                        mime="application/json",
+                        help="Download the auto-generated manifest to review or modify",
+                        key="download_local_manifest"
+                    )
+                except Exception as e:
+                    st.error(f"❌ Failed to auto-generate dataset.json: {str(e)}")
+                    return
+            else:
+                st.error(f"❌ No dataset.json found in {local_dataset_path}")
+                st.info("💡 Either provide a dataset.json or use ImageFolder structure with train/ and target/ folders")
+                return
+
+        # Check for images - either in images/ folder or in train/select/target folders
         images_path = local_path / "images"
-        if not images_path.exists():
-            st.error(f"❌ No images/ folder found in {local_dataset_path}")
+        train_path = local_path / "train"
+        if not images_path.exists() and not train_path.exists():
+            st.error(f"❌ No images/ or train/ folder found in {local_dataset_path}")
             return
 
         st.success(f"✅ Dataset found at: {local_dataset_path}")
@@ -774,9 +1008,42 @@ dataset_folder/
                             break
 
                     if not manifest_file:
-                        st.error("❌ No dataset.json found in the uploaded ZIP file")
-                        shutil.rmtree(temp_dir, ignore_errors=True)
-                        return
+                        # Try to find ImageFolder structure and auto-generate
+                        st.info("📂 No dataset.json found, checking for ImageFolder structure...")
+
+                        # Find root directory (look for train/ folder)
+                        imagefolder_root = None
+                        for root, dirs, files in os.walk(temp_dir):
+                            if 'train' in dirs and 'target' in dirs:
+                                imagefolder_root = Path(root)
+                                break
+
+                        if imagefolder_root:
+                            try:
+                                auto_manifest = generate_dataset_json_from_folder(str(imagefolder_root))
+                                manifest_file = imagefolder_root / "dataset.json"
+                                with open(manifest_file, 'w') as f:
+                                    json.dump(auto_manifest, f, indent=2)
+                                st.success(f"✅ Auto-generated dataset.json with {len(auto_manifest['entries'])} entries")
+
+                                # Offer download of the generated manifest
+                                st.download_button(
+                                    label="📥 Download generated dataset.json",
+                                    data=json.dumps(auto_manifest, indent=2),
+                                    file_name="dataset.json",
+                                    mime="application/json",
+                                    help="Download the auto-generated manifest to review or modify",
+                                    key="download_zip_manifest"
+                                )
+                            except Exception as e:
+                                st.error(f"❌ Failed to auto-generate dataset.json: {str(e)}")
+                                shutil.rmtree(temp_dir, ignore_errors=True)
+                                return
+                        else:
+                            st.error("❌ No dataset.json found and no ImageFolder structure (train/ + target/) detected")
+                            st.info("💡 Upload a ZIP with either:\n- A dataset.json manifest\n- ImageFolder structure: train/<class>/*.png and target/<class>/*.png")
+                            shutil.rmtree(temp_dir, ignore_errors=True)
+                            return
 
                     # Get dataset root (parent of dataset.json)
                     dataset_root = str(manifest_file.parent)
@@ -839,8 +1106,11 @@ dataset_folder/
                 dataset_info = manifest.get('dataset_info', {})
                 from collections import Counter
                 train_class_counts = Counter(all_train_class_labels)
-                target_class_idx = dataset_info.get('target_class', 5)
-                target_class_name = dataset_info.get('target_class_name', 'target class')
+
+                # Support both multi-target and legacy single-target formats
+                target_class_indices = dataset_info.get('target_classes', [dataset_info.get('target_class', 0)])
+                target_class_names = dataset_info.get('target_class_names', [dataset_info.get('target_class_name', 'target')])
+                target_set = set(target_class_indices)
 
                 # Calculate overlap between train and select sets
                 train_set = set(all_train_paths)
@@ -866,8 +1136,11 @@ dataset_folder/
 
                     st.write(f"\n**Dataset breakdown:**")
                     st.write(f"  - **Training images** (for initial model): {len(all_train_paths)} images")
-                    st.write(f"    - {target_class_name.capitalize()} images (class {target_class_idx}): {train_class_counts.get(target_class_idx, 0)}")
-                    st.write(f"    - Confuser images (other classes): {len(all_train_paths) - train_class_counts.get(target_class_idx, 0)}")
+                    # Show target class(es) breakdown
+                    target_count = sum(train_class_counts.get(idx, 0) for idx in target_class_indices)
+                    target_names_str = ", ".join(target_class_names)
+                    st.write(f"    - Target class(es) [{target_names_str}]: {target_count} images")
+                    st.write(f"    - Other classes: {len(all_train_paths) - target_count} images")
 
                     st.write(f"  - **Target images** (for evaluation): {len(target_paths)} images")
                     st.write(f"  - **Selection pool** (for TRAK selection): {len(selection_pool_paths)} images")
@@ -891,7 +1164,7 @@ dataset_folder/
                     st.write(f"\n**Full class distribution in training set:**")
                     for class_id in sorted(train_class_counts.keys()):
                         count = train_class_counts[class_id]
-                        marker = "🎯" if class_id == target_class_idx else "  "
+                        marker = "🎯" if class_id in target_set else "  "
                         st.write(f"{marker} Class {class_id}: {count} images")
 
                 pool_label = "Selection pool"
@@ -996,13 +1269,6 @@ dataset_folder/
                     # Use actual class labels from manifest
                     all_train_labels = torch.tensor(all_train_class_labels, dtype=torch.long)
 
-                    # Separate confusers from target class for Step 3 retraining
-                    target_class_idx = dataset_info.get('target_class', 0)
-                    confuser_mask = all_train_labels != target_class_idx
-                    confuser_tensors = all_train_tensors[confuser_mask]
-                    confuser_labels = all_train_labels[confuser_mask]
-                    confuser_paths = [p for i, p in enumerate(all_train_valid_paths) if confuser_mask[i]]
-
                 progress_bar.progress(10)
                 with st.spinner("Preprocessing selection pool images..."):
                     selection_tensors, selection_valid_paths = load_and_preprocess_images(selection_pool_paths, pool_label)
@@ -1022,9 +1288,17 @@ dataset_folder/
                 # Train initial model
                 progress_bar.progress(20)
 
-                # Use all training images (including target class)
-                train_tensors_for_model = all_train_tensors
-                train_labels_for_model = all_train_labels
+                # Train on train + select combined
+                train_tensors_for_model = torch.cat([all_train_tensors, selection_tensors], dim=0)
+                train_labels_for_model = torch.cat([all_train_labels, selection_labels], dim=0)
+
+                # Calculate initial class distribution for Step 3 balancing
+                from collections import Counter
+                initial_class_counts = Counter(train_labels_for_model.tolist())
+                initial_total = len(train_labels_for_model)
+                initial_class_ratios = {cls: count / initial_total for cls, count in initial_class_counts.items()}
+
+                st.info(f"📊 Step 1: Training on {len(all_train_tensors)} train + {len(selection_tensors)} select = {initial_total} total")
 
                 with st.status(f"🎓 Training initial model for {train_epochs} epochs on {len(train_tensors_for_model)} images...", expanded=True) as training_status:
                     # Create simple training loop
@@ -1299,11 +1573,14 @@ dataset_folder/
                     with st.expander("🔍 Debug: Class mapping details", expanded=False):
                         unique_labels = set(target_labels.tolist())
                         unique_preds = set(all_predictions)
-                        st.write(f"**Target labels (ground truth):** {sorted(unique_labels)} → should be class {dataset_info.get('target_class', '?')} ({dataset_info.get('target_class_name', '?')})")
+                        target_indices_debug = dataset_info.get('target_classes', [dataset_info.get('target_class', 0)])
+                        target_names_debug = dataset_info.get('target_class_names', [dataset_info.get('target_class_name', '?')])
+                        st.write(f"**Target labels (ground truth):** {sorted(unique_labels)} → should be classes {target_indices_debug} ({target_names_debug})")
                         st.write(f"**Model predictions (unique):** {sorted(unique_preds)}")
                         st.write(f"**Class mapping being used:**")
+                        target_set_debug = set(target_indices_debug)
                         for k, v in sorted(class_mapping.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 999):
-                            marker = "← target" if str(k) == str(dataset_info.get('target_class', -1)) else ""
+                            marker = "← target" if int(k) in target_set_debug else ""
                             st.write(f"  Class {k}: {v} {marker}")
 
                 progress_bar.progress(100)
@@ -1325,9 +1602,13 @@ dataset_folder/
                     "selection_valid_paths": selection_valid_paths,
                     "target_tensors": target_tensors.cpu(),
                     "target_labels": target_labels.cpu(),
-                    "confuser_tensors": confuser_tensors.cpu(),
-                    "confuser_labels": confuser_labels.cpu(),
-                    "confuser_paths": confuser_paths,
+                    # Store full train data for Step 3 class balancing
+                    "train_tensors": all_train_tensors.cpu(),
+                    "train_labels": all_train_labels.cpu(),
+                    "train_paths": all_train_valid_paths,
+                    # Initial class ratios from train+select for Step 3 balancing
+                    "initial_class_ratios": initial_class_ratios,
+                    "initial_class_counts": dict(initial_class_counts),
                     "manifest": manifest,
                     "model_name": model_name,
                     "custom_weights": custom_weights,
@@ -1425,9 +1706,13 @@ dataset_folder/
                 selection_valid_paths = step1_data["selection_valid_paths"]
                 target_tensors = step1_data["target_tensors"]
                 target_labels = step1_data["target_labels"]
-                confuser_tensors = step1_data["confuser_tensors"]
-                confuser_labels = step1_data["confuser_labels"]
-                confuser_paths = step1_data["confuser_paths"]
+                # Full train data for Step 3 class balancing
+                train_tensors = step1_data["train_tensors"]
+                train_labels = step1_data["train_labels"]
+                train_paths = step1_data["train_paths"]
+                # Initial class ratios from train+select for Step 3 balancing
+                initial_class_ratios = step1_data.get("initial_class_ratios", {})
+                initial_class_counts = step1_data.get("initial_class_counts", {})
                 manifest = step1_data["manifest"]
                 model_name = step1_data["model_name"]
                 custom_weights = step1_data["custom_weights"]
@@ -1647,9 +1932,13 @@ dataset_folder/
                     "selection_valid_paths": selection_valid_paths,
                     "target_tensors": target_tensors.cpu(),  # For target evaluation during retraining
                     "target_labels": target_labels.cpu(),    # For target evaluation during retraining
-                    "confuser_tensors": confuser_tensors.cpu(),  # Confusers to add back in Step 3
-                    "confuser_labels": confuser_labels.cpu(),    # Confuser labels
-                    "confuser_paths": confuser_paths,            # Confuser paths for display
+                    # Full train data for Step 3 class balancing
+                    "train_tensors": train_tensors.cpu(),
+                    "train_labels": train_labels.cpu(),
+                    "train_paths": train_paths,
+                    # Initial class ratios from train+select for balancing
+                    "initial_class_ratios": initial_class_ratios,
+                    "initial_class_counts": initial_class_counts,
                     "manifest": manifest,
                     "model_name": model_name,
                     "custom_weights": custom_weights,
@@ -1946,11 +2235,15 @@ dataset_folder/
         train_epochs = trak_data["train_epochs"]
         pool_label = trak_data["pool_label"]
 
-        # Confuser data for balanced retraining
-        confuser_tensors = trak_data.get("confuser_tensors")
-        confuser_labels = trak_data.get("confuser_labels")
-        has_confuser_data = confuser_tensors is not None and confuser_labels is not None
-        n_confusers_total = len(confuser_tensors) if has_confuser_data else 0
+        # Full train data for class balancing
+        train_tensors = trak_data.get("train_tensors")
+        train_labels = trak_data.get("train_labels")
+        train_paths = trak_data.get("train_paths")
+        has_train_data = train_tensors is not None and train_labels is not None
+
+        # Initial class ratios from Step 1 (train+select combined)
+        initial_class_ratios = trak_data.get("initial_class_ratios", {})
+        initial_class_counts = trak_data.get("initial_class_counts", {})
 
         # Selection parameters (moved here from initial config since TRAK scoring is independent)
         st.markdown("#### 📊 Selection Parameters")
@@ -1998,15 +2291,19 @@ dataset_folder/
 
         # Show selection summary
         pct_of_total = 100 * n_select / len(selection_valid_paths)
-        # Calculate proportional confusers
-        n_confusers_select = int(n_confusers_total * pct_of_total / 100) if has_confuser_data else 0
-        n_confusers_select = max(1, n_confusers_select) if has_confuser_data else 0  # At least 1 confuser if available
 
-        if has_confuser_data:
-            st.info(f"📌 Will select **{n_select}** target images ({pct_of_total:.1f}%) + **{n_confusers_select}** random confusers ({pct_of_total:.1f}% of {n_confusers_total}) = **{n_select + n_confusers_select}** total")
+        # Calculate class balancing to match initial train+select ratios
+        if initial_class_ratios and has_train_data:
+            # After selecting n_select from select, balance to match initial ratios
+            # Total final size should maintain same class proportions as initial training
+            total_initial = sum(initial_class_counts.values()) if initial_class_counts else len(train_labels)
+            target_total = int(total_initial * pct_of_total / 100)
+            target_per_class = {cls: max(1, int(ratio * target_total)) for cls, ratio in initial_class_ratios.items()}
+            st.info(f"📌 Will select **{n_select}** from select ({pct_of_total:.1f}%), then balance to **~{target_total}** total (matching initial {pct_of_total:.1f}% class mix)")
         else:
             st.info(f"📌 Will select **{n_select}** images ({pct_of_total:.1f}% of {len(selection_valid_paths)}) using: **{subset_method}**")
-            st.warning("⚠️ No confuser data available. Re-run Step 1 to include confusers in retraining.")
+            if not initial_class_ratios:
+                st.warning("⚠️ No initial class ratios available for balancing. Re-run Step 1.")
 
         # Training Parameters for Step 3 (can override Step 1 defaults)
         st.markdown("#### ⚙️ Training Parameters")
@@ -2128,8 +2425,6 @@ dataset_folder/
 
             for pct in compare_percentages:
                 n_select_pct = max(1, int(len(selection_valid_paths) * pct / 100.0))
-                n_confusers_pct = int(n_confusers_total * pct / 100) if has_confuser_data else 0
-                n_confusers_pct = max(1, n_confusers_pct) if has_confuser_data else 0
 
                 for method_name, descending in methods:
                     method_status.markdown(f"**Running {pct}% - {method_name}...** ({experiment_idx + 1}/{total_experiments})")
@@ -2143,22 +2438,40 @@ dataset_folder/
                         random.shuffle(all_indices)
                         selected_indices = torch.tensor(all_indices[:n_select_pct])
 
-                    # Get subset data
+                    # Get subset data from selection pool
                     method_subset_tensors = selection_tensors[selected_indices]
                     method_subset_labels = selection_labels[selected_indices]
 
-                    # Add confusers if applicable
-                    if has_confuser_data and n_confusers_pct > 0:
+                    # Balance to match initial train+select class ratios
+                    if initial_class_ratios and has_train_data:
                         import random
-                        confuser_indices = list(range(n_confusers_total))
-                        random.shuffle(confuser_indices)
-                        selected_confuser_indices = confuser_indices[:n_confusers_pct]
+                        from collections import Counter
 
-                        selected_confuser_tensors = confuser_tensors[selected_confuser_indices]
-                        selected_confuser_labels = confuser_labels[selected_confuser_indices]
+                        # Count what we have from select
+                        selected_class_counts = Counter(method_subset_labels.tolist())
 
-                        method_subset_tensors = torch.cat([method_subset_tensors, selected_confuser_tensors], dim=0)
-                        method_subset_labels = torch.cat([method_subset_labels, selected_confuser_labels], dim=0)
+                        # Calculate target total and per-class targets
+                        total_initial = sum(initial_class_counts.values())
+                        target_total = int(total_initial * pct / 100)
+
+                        # For each class, calculate target count and add from train if needed
+                        for cls, ratio in initial_class_ratios.items():
+                            target_count = max(1, int(ratio * target_total))
+                            current_count = selected_class_counts.get(cls, 0)
+                            n_to_add = max(0, target_count - current_count)
+
+                            if n_to_add > 0:
+                                # Get indices of this class in train
+                                cls_mask = (train_labels == cls)
+                                cls_indices = torch.where(cls_mask)[0].tolist()
+                                random.shuffle(cls_indices)
+                                selected_cls_indices = cls_indices[:n_to_add]
+
+                                if selected_cls_indices:
+                                    cls_tensors = train_tensors[selected_cls_indices]
+                                    cls_labels_tensor = train_labels[selected_cls_indices]
+                                    method_subset_tensors = torch.cat([method_subset_tensors, cls_tensors], dim=0)
+                                    method_subset_labels = torch.cat([method_subset_labels, cls_labels_tensor], dim=0)
 
                     # Train and evaluate
                     def progress_cb(epoch, total):
@@ -2295,25 +2608,44 @@ dataset_folder/
                 random.shuffle(all_indices)
                 selected_indices = torch.tensor(all_indices[:n_select])
 
-            # Get TRAK-selected target class images
+            # Get TRAK-selected images from selection pool
             subset_tensors = selection_tensors[selected_indices]
             subset_labels = selection_labels[selected_indices]
 
-            # Add proportional random confusers to maintain class balance
-            if has_confuser_data and n_confusers_select > 0:
+            # Balance to match initial train+select class ratios
+            if initial_class_ratios and has_train_data:
                 import random
-                confuser_indices = list(range(n_confusers_total))
-                random.shuffle(confuser_indices)
-                selected_confuser_indices = confuser_indices[:n_confusers_select]
+                from collections import Counter
 
-                selected_confuser_tensors = confuser_tensors[selected_confuser_indices]
-                selected_confuser_labels = confuser_labels[selected_confuser_indices]
+                # Count what we have from select
+                selected_class_counts = Counter(subset_labels.tolist())
 
-                # Combine target class + confusers
-                subset_tensors = torch.cat([subset_tensors, selected_confuser_tensors], dim=0)
-                subset_labels = torch.cat([subset_labels, selected_confuser_labels], dim=0)
+                # Calculate target total and per-class targets
+                total_initial = sum(initial_class_counts.values())
+                target_total = int(total_initial * pct_of_total / 100)
+                n_added_total = 0
 
-                st.success(f"✅ Combined {n_select} TRAK-selected target images + {n_confusers_select} random confusers = {len(subset_tensors)} total")
+                # For each class, calculate target count and add from train if needed
+                for cls, ratio in initial_class_ratios.items():
+                    target_count = max(1, int(ratio * target_total))
+                    current_count = selected_class_counts.get(cls, 0)
+                    n_to_add = max(0, target_count - current_count)
+
+                    if n_to_add > 0:
+                        # Get indices of this class in train
+                        cls_mask = (train_labels == cls)
+                        cls_indices = torch.where(cls_mask)[0].tolist()
+                        random.shuffle(cls_indices)
+                        selected_cls_indices = cls_indices[:n_to_add]
+
+                        if selected_cls_indices:
+                            cls_tensors = train_tensors[selected_cls_indices]
+                            cls_labels_tensor = train_labels[selected_cls_indices]
+                            subset_tensors = torch.cat([subset_tensors, cls_tensors], dim=0)
+                            subset_labels = torch.cat([subset_labels, cls_labels_tensor], dim=0)
+                            n_added_total += len(selected_cls_indices)
+
+                st.success(f"✅ Selected {n_select} from select + {n_added_total} from train (balanced to {pct_of_total:.1f}% of initial mix) = {len(subset_tensors)} total")
 
             progress_bar_retrain.progress(10)
 
