@@ -556,7 +556,7 @@ dataset_folder/
             "Batch size",
             min_value=1,
             max_value=2048,
-            value=128,
+            value=32,
             step=8,
             help="Batch size for training and gradient extraction"
         )
@@ -565,7 +565,7 @@ dataset_folder/
         learning_rate = st.select_slider(
             "Learning rate",
             options=[1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 1e-1],
-            value=1e-4,
+            value=5e-4,
             format_func=lambda x: f"{x:.0e}",
             help="Lower learning rate = slower convergence = more gradient signal for TRAK"
         )
@@ -2073,7 +2073,7 @@ dataset_folder/
         # Multi-percentage selection for comprehensive comparison
         percentages_input = st.text_input(
             "Percentages to compare",
-            value="10,25,50,75,90",
+            value="25,50,75",
             key="compare_percentages",
             help="Enter percentages as comma-separated integers (e.g., 5, 25, 50, 75, 100)"
         )
