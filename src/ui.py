@@ -144,11 +144,28 @@ def setup_page() -> None:
 
 
 # ImageNet Labeling & Target Selection
+def _download_imagenet_labels() -> Optional[Path]:
+    """Download ImageNet labels from GitHub Gist if not found locally."""
+    url = "https://gist.githubusercontent.com/yrevar/942d3a0ac09ec9e5eb3a/raw/238f720ff059c1f82f368259d1ca4ffa5dd8f9f5/imagenet1000_clsidx_to_labels.txt"
+    target_path = Path(*IMAGENET_JSON_REL)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import urllib.request
+        urllib.request.urlretrieve(url, target_path)
+        return target_path
+    except Exception as e:
+        print(f"Failed to download ImageNet labels: {e}")
+        return None
+
+
 def load_imagenet_labels() -> Tuple[List[Tuple[int, str]], Dict[int, str]]:
     try:
         labels_file = _imagenet_labels_path()
         if not labels_file:
-            raise FileNotFoundError("imagenet1000_clsidx_to_labels.json not found")
+            labels_file = _download_imagenet_labels()
+        if not labels_file:
+            raise FileNotFoundError("imagenet1000_clsidx_to_labels.json not found and download failed")
 
         text = labels_file.read_text()
         id_to_class: Dict[int, str] = _safe_json_or_eval_text(text)
@@ -738,122 +755,140 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
                 else:
                     st.info("💡 Using generic class names")
 
-    # Robustness Analysis settings in an expander
-    with st.sidebar.expander("🎯 Robustness Analysis Settings", expanded=True):
-        # Target class selector with knowledge of num_classes and custom_labels
-        target_class = create_target_class_selector(num_classes, custom_labels)
+    # Robustness Analysis settings - only show when on robustness tab
+    active_tab = st.session_state.get("active_upload_tab", "robustness")
+    if active_tab == "robustness":
+        with st.sidebar.expander("🎯 Robustness Analysis Settings", expanded=True):
+            target_class = create_target_class_selector(num_classes, custom_labels)
 
-        batch_size = st.number_input(
-            "Batch Size",
-            min_value=1,
-            max_value=8,
-            value=1,
-            step=1,
-            help="Number of viewpoints to optimize in parallel",
-            key="robustness_batch_size"
-        )
+            batch_size = st.number_input(
+                "Batch Size",
+                min_value=1,
+                max_value=8,
+                value=1,
+                step=1,
+                help="Number of viewpoints to optimize in parallel",
+                key="robustness_batch_size"
+            )
 
-        st.subheader("Optimization Parameters")
-        params_to_optimize = st.multiselect(
-            "Parameters to Optimize",
-            options=["camera"],
-            default=["camera"],
-            help="Select which parameters to optimize during adversarial attack",
-            key="robustness_params_to_optimize"
-        )
+            st.subheader("Optimization Parameters")
+            params_to_optimize = st.multiselect(
+                "Parameters to Optimize",
+                options=["camera"],
+                default=["camera"],
+                help="Select which parameters to optimize during adversarial attack",
+                key="robustness_params_to_optimize"
+            )
 
-        num_runs = st.number_input(
-            "Number of Runs",
-            min_value=1,
-            max_value=20_000,
-            value=1,
-            step=1,
-            help="Total number of optimization runs",
-            key="robustness_num_runs"
-        )
+            num_runs = st.number_input(
+                "Number of Runs",
+                min_value=1,
+                max_value=20_000,
+                value=1,
+                step=1,
+                help="Total number of optimization runs",
+                key="robustness_num_runs"
+            )
 
-        num_iterations = st.number_input(
-            "Adversarial Optimization Steps",
-            min_value=1,
-            max_value=100,
-            value=1,
-            step=1,
-            help="Number of optimization steps per adversarial run",
-            key="robustness_num_iterations"
-        )
+            num_iterations = st.number_input(
+                "Adversarial Optimization Steps",
+                min_value=1,
+                max_value=100,
+                value=1,
+                step=1,
+                help="Number of optimization steps per adversarial run",
+                key="robustness_num_iterations"
+            )
 
-        learning_rate = st.select_slider(
-            "Learning Rate",
-            options=[1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2],
-            value=5e-3,
-            format_func=lambda x: f"{x:.1e}",
-            key="robustness_learning_rate"
-        )
+            learning_rate = st.select_slider(
+                "Learning Rate",
+                options=[1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2],
+                value=5e-3,
+                format_func=lambda x: f"{x:.1e}",
+                key="robustness_learning_rate"
+            )
 
-        targeted = st.checkbox(
-            "Targeted Attack",
-            value=False,
-            help="Whether this is a targeted adversarial attack",
-            key="robustness_targeted"
-        )
+            targeted = st.checkbox(
+                "Targeted Attack",
+                value=False,
+                help="Whether this is a targeted adversarial attack",
+                key="robustness_targeted"
+            )
 
-        st.markdown("---")
-        st.markdown("**Camera Constraints**")
-        positive_z = st.checkbox(
-            "Positive Z",
-            value=True,
-            help="Constrain camera to positive elevation (z > 0)",
-            key="robustness_positive_z"
-        )
+            st.markdown("---")
+            st.markdown("**Camera Constraints**")
+            positive_z = st.checkbox(
+                "Positive Z",
+                value=True,
+                help="Constrain camera to positive elevation (z > 0)",
+                key="robustness_positive_z"
+            )
 
-        min_max_proportion = st.slider(
-            "Object proportion in image range",
-            min_value=0.05,
-            max_value=0.8,
-            value=(0.3, 0.8),
-            step=0.1,
-            help="Camera distance range as proportion of bounding box size (min, max)",
-            key="robustness_min_max_proportion"
-        )
-        st.caption(f"💡 object size proportion in image ({min_max_proportion[0]:.1f}x to {min_max_proportion[1]:.1f}x).")
+            min_max_proportion = st.slider(
+                "Object proportion in image range",
+                min_value=0.05,
+                max_value=0.8,
+                value=(0.3, 0.8),
+                step=0.1,
+                help="Camera distance range as proportion of bounding box size (min, max)",
+                key="robustness_min_max_proportion"
+            )
+            st.caption(f"💡 object size proportion in image ({min_max_proportion[0]:.1f}x to {min_max_proportion[1]:.1f}x).")
 
-        st.markdown("---")
-        st.markdown("**Rendering Settings**")
-        image_size = st.select_slider(
-            "Image Size",
-            options=[224, 256, 320, 384, 448, 512],
-            value=448,
-            help="Resolution of rendered images (image_size x image_size)",
-            key="robustness_image_size"
-        )
-        bin_size = st.slider(
-            "Bin Size",
-            min_value=16,
-            max_value=64,
-            value=32,
-            help="Spatial partitioning for rasterization - larger values use less memory but may be slower",
-            key="robustness_bin_size"
-        )
-        max_faces_per_bin = st.number_input(
-            "Max Faces per Bin",
-            min_value=10000,
-            max_value=200000,
-            value=100000,
-            step=10000,
-            help="Maximum faces per spatial bin - increase for complex meshes, decrease to save memory",
-            key="robustness_max_faces_per_bin"
-        )
-        st.info("💡 **Tip:** Use smaller bin sizes and fewer faces per bin if you encounter GPU memory issues.")
+            st.markdown("---")
+            st.markdown("**Rendering Settings**")
+            image_size = st.select_slider(
+                "Image Size",
+                options=[224, 256, 320, 384, 448, 512],
+                value=448,
+                help="Resolution of rendered images (image_size x image_size)",
+                key="robustness_image_size"
+            )
+            bin_size = st.slider(
+                "Bin Size",
+                min_value=16,
+                max_value=64,
+                value=32,
+                help="Spatial partitioning for rasterization - larger values use less memory but may be slower",
+                key="robustness_bin_size"
+            )
+            max_faces_per_bin = st.number_input(
+                "Max Faces per Bin",
+                min_value=10000,
+                max_value=200000,
+                value=100000,
+                step=10000,
+                help="Maximum faces per spatial bin - increase for complex meshes, decrease to save memory",
+                key="robustness_max_faces_per_bin"
+            )
+            st.info("💡 **Tip:** Use smaller bin sizes and fewer faces per bin if you encounter GPU memory issues.")
 
-        st.markdown("---")
-        st.markdown("**Download Settings**")
-        include_heatmap = st.checkbox(
-            "📊 Include heatmap in downloads",
-            value=True,
-            help="When checked: downloads include rendered image + heatmap composite. When unchecked: downloads only the rendered images with separate metadata files.",
-            key="global_include_heatmap"
-        )
-        st.session_state["include_heatmap_global"] = include_heatmap
+            st.markdown("---")
+            st.markdown("**Download Settings**")
+            include_heatmap = st.checkbox(
+                "📊 Include heatmap in downloads",
+                value=True,
+                help="When checked: downloads include rendered image + heatmap composite. When unchecked: downloads only the rendered images with separate metadata files.",
+                key="global_include_heatmap"
+            )
+            st.session_state["include_heatmap_global"] = include_heatmap
+    else:
+        # Use session state values or defaults when not on robustness tab
+        target_class = st.session_state.get("target_class_imagenet_selector", DEFAULT_TARGET_LABEL)
+        if target_class and ":" in str(target_class):
+            target_class = target_class.split(": ", 1)[-1] if ": " in target_class else target_class
+        batch_size = st.session_state.get("robustness_batch_size", 1)
+        params_to_optimize = st.session_state.get("robustness_params_to_optimize", ["camera"])
+        num_runs = st.session_state.get("robustness_num_runs", 1)
+        num_iterations = st.session_state.get("robustness_num_iterations", 1)
+        learning_rate = st.session_state.get("robustness_learning_rate", 5e-3)
+        targeted = st.session_state.get("robustness_targeted", False)
+        positive_z = st.session_state.get("robustness_positive_z", True)
+        min_max_proportion = st.session_state.get("robustness_min_max_proportion", (0.3, 0.8))
+        image_size = st.session_state.get("robustness_image_size", 448)
+        bin_size = st.session_state.get("robustness_bin_size", 32)
+        max_faces_per_bin = st.session_state.get("robustness_max_faces_per_bin", 100000)
+        include_heatmap = st.session_state.get("global_include_heatmap", True)
 
     # Store model config in session state for image selection panel
     st.session_state["model_config"] = {
@@ -892,6 +927,7 @@ def handle_file_uploads():
     tab1, tab2, tab3 = st.tabs(["🎯 Robustness Analysis Files", "🔧 Texture Atlas Creator", "🖼️ Image Selection"])
 
     with tab1:
+        st.session_state["active_upload_tab"] = "robustness"
         st.subheader("📦 3D Files for Robustness Analysis")
 
         # Help expander with documentation
@@ -1191,9 +1227,11 @@ Upload a JSON file to use custom class names instead of generic indices:
             return "individual", obj_file, mtl_file, (single_texture or texture_files), env_files
 
     with tab2:
+        st.session_state["active_upload_tab"] = "texture_atlas"
         handle_texture_atlas()
 
     with tab3:
+        st.session_state["active_upload_tab"] = "image_selection"
         handle_image_selection()
 
     return "individual", None, None, None, None
@@ -2283,7 +2321,7 @@ def main() -> None:
                     }
                 except Exception as e:
                     st.error(f"❌ Error processing files: {str(e)}")
-            else:
+            elif st.session_state.get("active_upload_tab") == "robustness":
                 st.warning("⚠️ Please upload at least an OBJ file and environment map(s) to proceed.")
 
         elif upload_type == "local_path":

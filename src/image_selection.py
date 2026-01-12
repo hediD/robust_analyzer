@@ -37,6 +37,45 @@ from trak import (
     extract_and_project_gradients,
     project_gradients_random,
 )
+import base64
+
+
+def auto_download_json(data: dict, filename: str = "dataset.json") -> None:
+    """
+    Automatically trigger a file download in Streamlit using JavaScript.
+
+    This creates a hidden anchor element with the data as a base64-encoded
+    data URI and programmatically clicks it to trigger the download.
+
+    Args:
+        data: Dictionary to be downloaded as JSON
+        filename: Name of the downloaded file
+    """
+    json_str = json.dumps(data, indent=2)
+    b64 = base64.b64encode(json_str.encode()).decode()
+
+    # Create a unique ID for this download to avoid conflicts
+    download_id = f"auto_download_{hash(json_str) % 10000}"
+
+    # JavaScript to create and click a download link
+    download_js = f'''
+        <script>
+            (function() {{
+                // Only download once per page load
+                if (window.{download_id}_downloaded) return;
+                window.{download_id}_downloaded = true;
+
+                var link = document.createElement('a');
+                link.href = 'data:application/json;base64,{b64}';
+                link.download = '{filename}';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }})();
+        </script>
+    '''
+
+    st.components.v1.html(download_js, height=0)
 
 
 def generate_dataset_json_from_folder(dataset_root: str, target_class_name: str = None) -> dict:
@@ -503,7 +542,8 @@ dataset_folder/
 
 When using ImageFolder structure:
 - **Auto-generation**: `dataset.json` is created automatically
-- **Download button**: A "📥 Download generated dataset.json" button appears to review/modify the manifest
+- **Auto-download**: The generated `dataset.json` is automatically downloaded to your browser
+- **Manual download**: A "📥 Download dataset.json again" button is also available for re-downloading
 - **Class detection**: Classes are discovered from train/ subfolder names
 - **Target class(es)**: Auto-detected from target/ folder (can have multiple classes!)
 - **Selection pool**: If no select/ folder, train/ images of target class(es) are used
@@ -609,7 +649,7 @@ When using ImageFolder structure:
 ### Tips
 
 - **Start with ImageFolder**: Just organize images in `train/<class>/` and `target/<class>/` folders - no JSON needed!
-- **Download & customize**: Use the "📥 Download generated dataset.json" button to get the auto-generated manifest, then modify it if needed
+- **Auto-download**: The generated `dataset.json` is automatically downloaded when you upload the folder structure
 - **Local paths** are faster for large datasets - no upload/extraction overhead
 - **More checkpoints** give more stable scores but take longer to compute
 - **Last layer gradients** are usually sufficient and much faster than full model
@@ -625,42 +665,52 @@ When using ImageFolder structure:
 
     # Display current model configuration
     model_config = st.session_state.get("model_config", {})
-    model_name = model_config.get("model_name", st.session_state.get("model_name", "Unknown"))
-    num_classes = model_config.get("num_classes", 1000)
+    model_name = model_config.get("model_name", st.session_state.get("model_name", "vit_l_16"))
     custom_weights_path = model_config.get("custom_weights_path")
     num_classes_override = model_config.get("num_classes_override")
     custom_labels = model_config.get("custom_labels")
 
-    # Determine source of num_classes
+    # Check if dataset has been previewed (num_classes from dataset)
+    dataset_preview = st.session_state.get("dataset_preview", {})
+    dataset_info = dataset_preview.get("dataset_info", {})
+    dataset_num_classes = dataset_info.get("num_classes")
+
+    # Determine effective num_classes and source
     if num_classes_override is not None:
-        classes_source = "user override"
+        num_classes = num_classes_override
+        classes_source = "sidebar override"
+    elif dataset_num_classes is not None:
+        num_classes = dataset_num_classes
+        classes_source = "from dataset"
     elif custom_weights_path:
-        classes_source = "detected from weights"
+        num_classes = model_config.get("num_classes", 1000)
+        classes_source = "from weights"
     else:
-        classes_source = "ImageNet default"
+        num_classes = 1000
+        classes_source = "default (will auto-detect from dataset)"
 
     # Get model display name
     model_display = MODEL_CONFIGS.get(model_name, {}).get("description", model_name)
 
     # Show model info box
-    st.markdown("###Current Model Configuration")
+    st.markdown("### Current Model Configuration")
     col_model_info1, col_model_info2, col_model_info3 = st.columns(3)
     with col_model_info1:
         st.metric("Model", model_display.split(" (")[0] if "(" in model_display else model_display)
     with col_model_info2:
-        st.metric("Classifier Output Classes", f"{num_classes}")
+        st.metric("Output Classes", f"{num_classes}")
     with col_model_info3:
         if custom_labels:
             st.metric("Class Labels", f"{len(custom_labels)} custom")
+        elif dataset_num_classes:
+            st.metric("Class Labels", "From dataset")
         else:
-            st.metric("Class Labels", "ImageNet" if num_classes == 1000 else "Generic")
+            st.metric("Class Labels", "Auto-detect")
 
-    # Show details in caption
-    details = [f"Classes: {classes_source}"]
+    # Show custom weights path if used
     if custom_weights_path:
         weights_name = Path(custom_weights_path).name
-        details.append(f"Weights: {weights_name[:30]}..." if len(weights_name) > 30 else f"Weights: {weights_name}")
-    st.caption(" | ".join(details))
+        st.caption(f"Weights: {weights_name[:40]}..." if len(weights_name) > 40 else f"Weights: {weights_name}")
 
     st.markdown("---")
 
@@ -703,6 +753,128 @@ When using ImageFolder structure:
 
         st.success(f"✅ Dataset uploaded: {dataset_zip.name}")
 
+        # Preview ZIP contents
+        try:
+            with zipfile.ZipFile(dataset_zip, 'r') as zf:
+                file_list = zf.namelist()
+
+                # Find dataset.json
+                manifest = None
+                manifest_path = None
+                for f in file_list:
+                    if f.endswith('dataset.json'):
+                        manifest_path = f
+                        with zf.open(f) as mf:
+                            manifest = json.load(mf)
+                        break
+
+                if manifest:
+                    # Count images by purpose
+                    train_count = 0
+                    select_count = 0
+                    target_count = 0
+                    class_counts = {}
+                    train_paths = []
+                    select_paths = []
+
+                    for entry in manifest.get('entries', []):
+                        purposes = entry.get('purposes', [])
+                        class_idx = entry.get('class_idx', 0)
+                        img_path = entry.get('filename', '')
+
+                        if 'train' in purposes:
+                            train_count += 1
+                            train_paths.append(img_path)
+                            class_counts[class_idx] = class_counts.get(class_idx, 0) + 1
+                        if 'select' in purposes:
+                            select_count += 1
+                            select_paths.append(img_path)
+                        if 'target' in purposes:
+                            target_count += 1
+
+                    if select_count == 0:
+                        select_count = train_count
+
+                    # Calculate overlap
+                    train_set = set(train_paths)
+                    select_set = set(select_paths) if select_paths else train_set
+                    overlap_count = len(train_set & select_set)
+                    overlap_pct = 100 * overlap_count / len(select_set) if len(select_set) > 0 else 0
+
+                    if overlap_pct == 100:
+                        overlap_str = " (train=select)"
+                    elif overlap_pct > 0:
+                        overlap_str = f" ({overlap_pct:.0f}% overlap)"
+                    else:
+                        overlap_str = " (disjoint)"
+
+                    dataset_info = manifest.get('dataset_info', {})
+                    class_mapping = manifest.get('class_mapping', {})
+                    st.info(f"📊 **Dataset**: {train_count} train, {select_count} select{overlap_str}, {target_count} target images")
+
+                    with st.expander("📋 Dataset Details", expanded=False):
+                        if dataset_info:
+                            if dataset_info.get('name'):
+                                st.write(f"**Name**: {dataset_info['name']}")
+                            if dataset_info.get('description'):
+                                st.write(f"**Description**: {dataset_info['description']}")
+                            if 'num_classes' in dataset_info:
+                                st.write(f"**Number of classes**: {dataset_info['num_classes']}")
+
+                        st.write(f"\n**Dataset breakdown:**")
+                        st.write(f"  - **Training images**: {train_count}")
+                        st.write(f"  - **Selection pool**: {select_count}")
+                        st.write(f"  - **Target images**: {target_count}")
+
+                        if class_counts:
+                            target_class_indices = dataset_info.get('target_classes', [dataset_info.get('target_class', 0)])
+                            target_set = set(target_class_indices)
+                            st.write(f"\n**Class distribution in training set:**")
+                            for class_id in sorted(class_counts.keys()):
+                                count = class_counts[class_id]
+                                marker = "🎯" if class_id in target_set else "  "
+                                class_name = class_mapping.get(str(class_id), f"class_{class_id}")
+                                st.write(f"{marker} {class_name}: {count} images")
+
+                else:
+                    # Check for ImageFolder structure
+                    has_train = any('train/' in f for f in file_list)
+                    has_target = any('target/' in f for f in file_list)
+                    if has_train and has_target:
+                        # Count images per class folder
+                        train_classes = {}
+                        target_classes = set()
+                        for f in file_list:
+                            if '/train/' in f or f.startswith('train/'):
+                                parts = f.split('/')
+                                idx = parts.index('train') if 'train' in parts else -1
+                                if idx >= 0 and len(parts) > idx + 2:
+                                    class_name = parts[idx + 1]
+                                    if class_name and not f.endswith('/'):
+                                        train_classes[class_name] = train_classes.get(class_name, 0) + 1
+                            if '/target/' in f or f.startswith('target/'):
+                                parts = f.split('/')
+                                idx = parts.index('target') if 'target' in parts else -1
+                                if idx >= 0 and len(parts) > idx + 1:
+                                    class_name = parts[idx + 1]
+                                    if class_name and not f.endswith('/'):
+                                        target_classes.add(class_name)
+
+                        total_train = sum(train_classes.values())
+                        st.info(f"📊 **ImageFolder**: {total_train} train images, {len(train_classes)} classes")
+
+                        with st.expander("📋 Dataset Details (ImageFolder)", expanded=False):
+                            st.write("**Structure detected**: ImageFolder (will auto-generate manifest)")
+                            st.write(f"**Target class(es)**: {', '.join(sorted(target_classes))}")
+                            st.write(f"\n**Class distribution in train/:**")
+                            for class_name in sorted(train_classes.keys()):
+                                count = train_classes[class_name]
+                                marker = "🎯" if class_name in target_classes else "  "
+                                st.write(f"{marker} {class_name}: {count} images")
+
+        except Exception as e:
+            st.warning(f"⚠️ Could not preview ZIP contents: {str(e)}")
+
     else:  # Local path
         st.markdown("**Enter the path to your local dataset directory:**")
         local_dataset_path = st.text_input(
@@ -742,9 +914,17 @@ When using ImageFolder structure:
                         json.dump(auto_generated_manifest, f, indent=2)
                     st.success(f"✅ Auto-generated dataset.json with {len(auto_generated_manifest['entries'])} entries")
 
-                    # Offer download of the generated manifest
+                    # Auto-download the generated manifest (only once per path)
+                    manifest_hash = hash(json.dumps(auto_generated_manifest, sort_keys=True))
+                    download_key = f"auto_downloaded_local_manifest_{manifest_hash}"
+                    if download_key not in st.session_state:
+                        st.session_state[download_key] = True
+                        auto_download_json(auto_generated_manifest, "dataset.json")
+                        st.info("📥 **dataset.json auto-downloaded!** Check your downloads folder.")
+
+                    # Also provide manual download button as fallback
                     st.download_button(
-                        label="📥 Download generated dataset.json",
+                        label="📥 Download dataset.json again",
                         data=json.dumps(auto_generated_manifest, indent=2),
                         file_name="dataset.json",
                         mime="application/json",
@@ -769,7 +949,95 @@ When using ImageFolder structure:
         st.success(f"✅ Dataset found at: {local_dataset_path}")
         dataset_path = local_path  # Store for later use
         dataset_zip = None  # No ZIP file to process
-    st.info("📋 The JSON manifest will be parsed to identify target/train/select images")
+
+        # Parse and display dataset details immediately
+        try:
+            with open(manifest_path, 'r') as f:
+                manifest = json.load(f)
+
+            # Count images by purpose
+            train_count = 0
+            select_count = 0
+            target_count = 0
+            train_paths_preview = []
+            select_paths_preview = []
+            target_paths_preview = []
+            class_counts = {}
+
+            for entry in manifest.get('entries', []):
+                purposes = entry.get('purposes', [])
+                class_idx = entry.get('class_idx', 0)
+                img_path = entry.get('filename', '')
+
+                if 'train' in purposes:
+                    train_count += 1
+                    train_paths_preview.append(img_path)
+                    class_counts[class_idx] = class_counts.get(class_idx, 0) + 1
+                if 'select' in purposes:
+                    select_count += 1
+                    select_paths_preview.append(img_path)
+                if 'target' in purposes:
+                    target_count += 1
+                    target_paths_preview.append(img_path)
+
+            # If no select pool, it will use train images
+            if select_count == 0:
+                select_count = train_count
+
+            # Calculate overlap
+            train_set = set(train_paths_preview)
+            select_set = set(select_paths_preview) if select_paths_preview else train_set
+            overlap_count = len(train_set & select_set)
+            overlap_pct = 100 * overlap_count / len(select_set) if len(select_set) > 0 else 0
+
+            if overlap_pct == 100:
+                overlap_str = " (train=select)"
+            elif overlap_pct > 0:
+                overlap_str = f" ({overlap_pct:.0f}% overlap)"
+            else:
+                overlap_str = " (disjoint)"
+
+            dataset_info = manifest.get('dataset_info', {})
+            class_mapping = manifest.get('class_mapping', {})
+            st.info(f"📊 **Dataset**: {train_count} train, {select_count} select{overlap_str}, {target_count} target images")
+
+            # Dataset details expander
+            with st.expander("📋 Dataset Details", expanded=False):
+                if dataset_info:
+                    if dataset_info.get('name'):
+                        st.write(f"**Name**: {dataset_info['name']}")
+                    if dataset_info.get('description'):
+                        st.write(f"**Description**: {dataset_info['description']}")
+                    if 'num_classes' in dataset_info:
+                        st.write(f"**Number of classes**: {dataset_info['num_classes']}")
+
+                st.write(f"\n**Dataset breakdown:**")
+                st.write(f"  - **Training images**: {train_count}")
+                st.write(f"  - **Selection pool**: {select_count}")
+                st.write(f"  - **Target images**: {target_count}")
+
+                if class_counts:
+                    target_class_indices = dataset_info.get('target_classes', [dataset_info.get('target_class', 0)])
+                    target_set = set(target_class_indices)
+                    st.write(f"\n**Class distribution in training set:**")
+                    for class_id in sorted(class_counts.keys()):
+                        count = class_counts[class_id]
+                        marker = "🎯" if class_id in target_set else "  "
+                        class_name = class_mapping.get(str(class_id), f"class_{class_id}")
+                        st.write(f"{marker} {class_name}: {count} images")
+
+            # Cache parsed data for Step 1
+            st.session_state["dataset_preview"] = {
+                "manifest": manifest,
+                "train_count": train_count,
+                "select_count": select_count,
+                "target_count": target_count,
+                "class_counts": class_counts,
+                "dataset_info": dataset_info,
+            }
+
+        except Exception as e:
+            st.warning(f"⚠️ Could not preview dataset: {str(e)}")
 
     # Training parameters (selection parameters moved to Step 3)
     st.markdown("### ⚙️ Training Parameters")
@@ -780,7 +1048,7 @@ When using ImageFolder structure:
             "Training epochs",
             min_value=1,
             max_value=50,
-            value=10,
+            value=5,
             step=1,
             help="Number of epochs to train the model (more = better TRAK scores, slower)"
         )
@@ -790,7 +1058,7 @@ When using ImageFolder structure:
             "Batch size",
             min_value=1,
             max_value=2048,
-            value=32,
+            value=64,
             step=8,
             help="Batch size for training and gradient extraction"
         )
@@ -970,6 +1238,25 @@ When using ImageFolder structure:
     st.markdown("---")
     step1_button_disabled = step1_complete  # Disable if already done (use reset to redo)
 
+    # Show training configuration summary before Step 1 button
+    if not step1_complete:
+        model_config = st.session_state.get("model_config", {})
+        model_name_display = model_config.get("model_name", "vit_l_16")
+        custom_weights = model_config.get("custom_weights_path")
+
+        # Get num_classes from dataset preview or sidebar override
+        dataset_preview = st.session_state.get("dataset_preview", {})
+        dataset_num_classes = dataset_preview.get("dataset_info", {}).get("num_classes")
+        num_classes_override = model_config.get("num_classes_override")
+        effective_classes = num_classes_override or dataset_num_classes or 1000
+
+        st.info(
+            f"**Training config:** {model_name_display} → {effective_classes} classes | "
+            f"{train_epochs} epochs | batch {train_batch_size} | lr {learning_rate:.0e} | "
+            f"{'Frozen backbone' if freeze_backbone else 'Full model'}"
+            + (f" | Custom weights" if custom_weights else "")
+        )
+
     # Trigger Step 1 via button OR auto-run mode
     step1_triggered = st.button("🎓 **Step 1: Train Initial Model**", type="primary", use_container_width=True, disabled=step1_button_disabled)
     if auto_run_mode and auto_run_step == 1 and not step1_complete:
@@ -1026,9 +1313,17 @@ When using ImageFolder structure:
                                     json.dump(auto_manifest, f, indent=2)
                                 st.success(f"✅ Auto-generated dataset.json with {len(auto_manifest['entries'])} entries")
 
-                                # Offer download of the generated manifest
+                                # Auto-download the generated manifest (only once per upload)
+                                manifest_hash = hash(json.dumps(auto_manifest, sort_keys=True))
+                                download_key = f"auto_downloaded_manifest_{manifest_hash}"
+                                if download_key not in st.session_state:
+                                    st.session_state[download_key] = True
+                                    auto_download_json(auto_manifest, "dataset.json")
+                                    st.info("📥 **dataset.json auto-downloaded!** Check your downloads folder.")
+
+                                # Also provide manual download button as fallback
                                 st.download_button(
-                                    label="📥 Download generated dataset.json",
+                                    label="📥 Download dataset.json again",
                                     data=json.dumps(auto_manifest, indent=2),
                                     file_name="dataset.json",
                                     mime="application/json",
@@ -1104,6 +1399,7 @@ When using ImageFolder structure:
 
                 # Show loaded dataset info (collapsed by default)
                 dataset_info = manifest.get('dataset_info', {})
+                class_mapping = manifest.get('class_mapping', {})
                 from collections import Counter
                 train_class_counts = Counter(all_train_class_labels)
 
@@ -1119,20 +1415,21 @@ When using ImageFolder structure:
                 overlap_pct = 100 * overlap_count / len(select_set) if len(select_set) > 0 else 0
 
                 # Brief summary outside expander
-                dataset_name = dataset_info.get('name', 'Unknown')
                 if overlap_pct == 100:
                     overlap_str = " (train=select)"
                 elif overlap_pct > 0:
                     overlap_str = f" ({overlap_pct:.0f}% overlap)"
                 else:
                     overlap_str = " (disjoint)"
-                st.success(f"📊 Loaded **{dataset_name}**: {len(all_train_paths)} train, {len(selection_pool_paths)} select{overlap_str}, {len(target_paths)} target images")
+                st.success(f"📊 Loaded: {len(all_train_paths)} train, {len(selection_pool_paths)} select{overlap_str}, {len(target_paths)} target images")
 
                 # Detailed info in expander
                 with st.expander("📋 Dataset Details", expanded=False):
                     if dataset_info:
-                        st.write(f"**Dataset**: {dataset_name}")
-                        st.write(f"**Description**: {dataset_info.get('description', 'N/A')}")
+                        if dataset_info.get('name'):
+                            st.write(f"**Name**: {dataset_info['name']}")
+                        if dataset_info.get('description'):
+                            st.write(f"**Description**: {dataset_info['description']}")
 
                     st.write(f"\n**Dataset breakdown:**")
                     st.write(f"  - **Training images** (for initial model): {len(all_train_paths)} images")
@@ -1165,7 +1462,8 @@ When using ImageFolder structure:
                     for class_id in sorted(train_class_counts.keys()):
                         count = train_class_counts[class_id]
                         marker = "🎯" if class_id in target_set else "  "
-                        st.write(f"{marker} Class {class_id}: {count} images")
+                        class_name = class_mapping.get(str(class_id), f"class_{class_id}")
+                        st.write(f"{marker} {class_name}: {count} images")
 
                 pool_label = "Selection pool"
 
@@ -1217,19 +1515,37 @@ When using ImageFolder structure:
                                     return module.out_features
                         return None
 
+                    # Detect classifier layer and its output size
+                    classifier_layer = None
+                    classifier_name = None
                     if hasattr(model, 'classifier'):
+                        classifier_layer = model.classifier
+                        classifier_name = "classifier"
                         model_num_classes = get_classifier_out_features(model.classifier)
                     elif hasattr(model, 'fc'):
+                        classifier_layer = model.fc
+                        classifier_name = "fc"
                         model_num_classes = get_classifier_out_features(model.fc)
                     elif hasattr(model, 'head'):
+                        classifier_layer = model.head
+                        classifier_name = "head"
                         model_num_classes = get_classifier_out_features(model.head)
                     else:
                         model_num_classes = None
+                        classifier_name = "unknown"
 
+                    # Always show the actual classifier info for verification
                     if model_num_classes is not None:
+                        st.success(f"✅ **Model loaded:** {model_name} with **{model_num_classes} output classes** (layer: {classifier_name})")
+
                         if dataset_num_classes is not None and model_num_classes != dataset_num_classes:
-                            st.error(f"🚨 CRITICAL: Model has {model_num_classes} output classes but dataset has {dataset_num_classes} classes! "
-                                     f"This will cause poor accuracy. Please set 'Override number of classes' to {dataset_num_classes} in the sidebar.")
+                            st.error(f"🚨 CRITICAL MISMATCH: Model outputs {model_num_classes} classes but dataset has {dataset_num_classes}!")
+                            st.error("Training will likely fail or produce wrong results. Check your configuration.")
+                            return
+                        elif dataset_num_classes is not None:
+                            st.success(f"✅ Classes match: Model ({model_num_classes}) = Dataset ({dataset_num_classes})")
+                    else:
+                        st.warning(f"⚠️ Could not detect classifier output size for {model_name}")
 
                 # Helper function to load and preprocess images
                 def load_and_preprocess_images(image_paths, label_name):
@@ -1299,6 +1615,24 @@ When using ImageFolder structure:
                 initial_class_ratios = {cls: count / initial_total for cls, count in initial_class_counts.items()}
 
                 st.info(f"📊 Step 1: Training on {len(all_train_tensors)} train + {len(selection_tensors)} select = {initial_total} total")
+
+                # Sanity check: verify label indices are valid for model output classes
+                all_label_indices = set(train_labels_for_model.tolist()) | set(target_labels.tolist())
+                target_label_set = set(target_labels.tolist())
+                train_label_set = set(train_labels_for_model.tolist())
+                max_label = max(all_label_indices)
+                min_label = min(all_label_indices)
+                if model_num_classes is not None:
+                    if max_label >= model_num_classes:
+                        st.error(f"🚨 LABEL ERROR: Dataset has label {max_label} but model only has {model_num_classes} outputs (0-{model_num_classes-1})!")
+                        return
+                    st.info(f"📋 Train labels: {sorted(train_label_set)} ({len(train_label_set)} classes) | Target labels: {sorted(target_label_set)} ({len(target_label_set)} classes)")
+
+                    # Warn if target is single-class
+                    if len(target_label_set) == 1:
+                        target_class = list(target_label_set)[0]
+                        target_class_name = class_mapping.get(str(target_class), f"class_{target_class}")
+                        st.warning(f"⚠️ Target set is single-class ({target_class_name}). High target accuracy (~100%) is expected if model learns this class.")
 
                 with st.status(f"🎓 Training initial model for {train_epochs} epochs on {len(train_tensors_for_model)} images...", expanded=True) as training_status:
                     # Create simple training loop
@@ -1438,6 +1772,8 @@ When using ImageFolder structure:
                         # Training
                         model.train()
                         total_train_loss = 0
+                        train_correct = 0
+                        train_total = 0
 
                         # Update progress bar: training is 20% -> 80% of total progress
                         # Each epoch contributes (80-20)/train_epochs = 60/train_epochs percent
@@ -1458,6 +1794,11 @@ When using ImageFolder structure:
 
                             loss = criterion(logits, labels)
                             loss.backward()
+
+                            # Track training accuracy
+                            _, predicted = torch.max(logits.detach(), 1)
+                            train_total += labels.size(0)
+                            train_correct += (predicted == labels).sum().item()
 
                             # Debug: Check gradients on first batch of first epoch
                             if epoch == 0 and batch_idx == 0:
@@ -1482,6 +1823,7 @@ When using ImageFolder structure:
                                 training_status.update(label=f"🎓 Epoch {epoch+1}/{train_epochs} | Batch {batch_idx+1}/{num_batches} | Loss: {loss.item():.4f}")
 
                         avg_train_loss = total_train_loss / len(train_loader)
+                        train_acc = 100 * train_correct / train_total
 
                         # Evaluate on target set
                         model.eval()
@@ -1531,6 +1873,7 @@ When using ImageFolder structure:
                         epoch_metrics_list.append({
                             "Epoch": f"{epoch+1}/{train_epochs}",
                             "Train Loss": f"{avg_train_loss:.4f}",
+                            "Train Acc": f"{train_acc:.1f}%",
                             "Target Loss": f"{avg_target_loss:.4f}",
                             "Target Acc": f"{target_acc:.1f}%",
                             "": ckpt_marker  # Checkpoint marker column
@@ -1542,7 +1885,7 @@ When using ImageFolder structure:
                         epoch_metrics_placeholder.dataframe(df, use_container_width=True, hide_index=True)
 
                         # Update status with current epoch info
-                        training_status.update(label=f"🎓 Epoch {epoch+1}/{train_epochs} complete | Train Loss: {avg_train_loss:.4f} | Target Acc: {target_acc:.1f}%")
+                        training_status.update(label=f"🎓 Epoch {epoch+1}/{train_epochs} | Train: {train_acc:.1f}% | Target: {target_acc:.1f}%")
 
                         # Final progress update for this epoch
                         epoch_progress = 20 + int(60 * (epoch + 1) / train_epochs)
@@ -1566,7 +1909,7 @@ When using ImageFolder structure:
                         for cls, count in top_3
                     ])
 
-                    st.write(f"  **Final**: Train Loss = {avg_train_loss:.4f} | Target Loss = {avg_target_loss:.4f} | Target Acc = {target_acc:.1f}%")
+                    st.write(f"  **Final**: Train Loss = {avg_train_loss:.4f} (Acc: {train_acc:.1f}%) | Target Loss = {avg_target_loss:.4f} (Acc: {target_acc:.1f}%)")
                     st.write(f"  **Predictions**: {top_3_str}")
 
                     # Debug: Show raw class indices to help diagnose mismatches
@@ -1616,6 +1959,9 @@ When using ImageFolder structure:
                     "device": str(device),
                     "train_batch_size": train_batch_size,
                     "train_epochs": train_epochs,
+                    "learning_rate": learning_rate,
+                    "optimizer": step1_optimizer,
+                    "freeze_backbone": freeze_backbone,
                     "pool_label": pool_label,
                     "temp_dir": temp_dir,
                     "dataset_root": dataset_root,
@@ -1626,6 +1972,7 @@ When using ImageFolder structure:
                     "epoch_metrics": epoch_metrics_list,
                     "final_train_loss": avg_train_loss,
                     "final_target_loss": avg_target_loss,
+                    "final_train_acc": train_acc,
                     "final_target_acc": target_acc,
                     "final_predictions": all_predictions,
                 }
@@ -1651,19 +1998,49 @@ When using ImageFolder structure:
         step1_data = st.session_state.get("step1_data", {})
         epoch_metrics = step1_data.get("epoch_metrics", [])
         if epoch_metrics:
-            with st.expander("📈 Step 1 Training Results", expanded=False):
+            with st.expander("📈 Step 1 Training Results", expanded=True):
+                # Show model and training configuration
+                st.markdown("**Run Configuration:**")
+                model_name = step1_data.get("model_name", "unknown")
+                num_classes = step1_data.get("num_classes_override") or step1_data.get("dataset_info", {}).get("num_classes", 1000)
+                custom_weights = step1_data.get("custom_weights")
+                lr = step1_data.get("learning_rate", 0)
+                batch_size = step1_data.get("train_batch_size", 0)
+                epochs = step1_data.get("train_epochs", 0)
+                optimizer = step1_data.get("optimizer", "AdamW")
+                freeze_backbone = step1_data.get("freeze_backbone", True)
+
+                col_c1, col_c2, col_c3, col_c4 = st.columns(4)
+                with col_c1:
+                    st.write(f"**Model**: {model_name}")
+                    st.write(f"**Output classes**: {num_classes}")
+                with col_c2:
+                    st.write(f"**Custom weights**: {'Yes' if custom_weights else 'No'}")
+                    st.write(f"**Backbone**: {'Frozen' if freeze_backbone else 'Trainable'}")
+                with col_c3:
+                    st.write(f"**Epochs**: {epochs}")
+                    st.write(f"**Batch size**: {batch_size}")
+                with col_c4:
+                    st.write(f"**Learning rate**: {lr:.0e}")
+                    st.write(f"**Optimizer**: {optimizer}")
+
+                st.markdown("---")
+                st.markdown("**Training Results:**")
+
                 # Show final metrics
-                final_acc = step1_data.get("final_target_acc", 0)
+                final_train_acc = step1_data.get("final_train_acc", 0)
+                final_target_acc = step1_data.get("final_target_acc", 0)
                 final_train_loss = step1_data.get("final_train_loss", 0)
                 final_target_loss = step1_data.get("final_target_loss", 0)
-                train_epochs = step1_data.get("train_epochs", len(epoch_metrics))
 
-                col1, col2, col3 = st.columns(3)
+                col1, col2, col3, col4 = st.columns(4)
                 with col1:
-                    st.metric("Target Accuracy", f"{final_acc:.1f}%")
+                    st.metric("Train Accuracy", f"{final_train_acc:.1f}%")
                 with col2:
-                    st.metric("Train Loss", f"{final_train_loss:.4f}")
+                    st.metric("Target Accuracy", f"{final_target_acc:.1f}%")
                 with col3:
+                    st.metric("Train Loss", f"{final_train_loss:.4f}")
+                with col4:
                     st.metric("Target Loss", f"{final_target_loss:.4f}")
 
                 # Show epoch-by-epoch table
@@ -1977,16 +2354,47 @@ When using ImageFolder structure:
         epoch_metrics = step1_data.get("epoch_metrics", [])
         if epoch_metrics:
             with st.expander("📈 Step 1 Training Results", expanded=False):
-                final_acc = step1_data.get("final_target_acc", 0)
+                # Show model and training configuration
+                st.markdown("**Run Configuration:**")
+                model_name = step1_data.get("model_name", "unknown")
+                num_classes = step1_data.get("num_classes_override") or step1_data.get("dataset_info", {}).get("num_classes", 1000)
+                custom_weights = step1_data.get("custom_weights")
+                lr = step1_data.get("learning_rate", 0)
+                batch_size = step1_data.get("train_batch_size", 0)
+                epochs = step1_data.get("train_epochs", 0)
+                optimizer = step1_data.get("optimizer", "AdamW")
+                freeze_backbone = step1_data.get("freeze_backbone", True)
+
+                col_c1, col_c2, col_c3, col_c4 = st.columns(4)
+                with col_c1:
+                    st.write(f"**Model**: {model_name}")
+                    st.write(f"**Output classes**: {num_classes}")
+                with col_c2:
+                    st.write(f"**Custom weights**: {'Yes' if custom_weights else 'No'}")
+                    st.write(f"**Backbone**: {'Frozen' if freeze_backbone else 'Trainable'}")
+                with col_c3:
+                    st.write(f"**Epochs**: {epochs}")
+                    st.write(f"**Batch size**: {batch_size}")
+                with col_c4:
+                    st.write(f"**Learning rate**: {lr:.0e}")
+                    st.write(f"**Optimizer**: {optimizer}")
+
+                st.markdown("---")
+                st.markdown("**Training Results:**")
+
+                final_train_acc = step1_data.get("final_train_acc", 0)
+                final_target_acc = step1_data.get("final_target_acc", 0)
                 final_train_loss = step1_data.get("final_train_loss", 0)
                 final_target_loss = step1_data.get("final_target_loss", 0)
 
-                col1, col2, col3 = st.columns(3)
+                col1, col2, col3, col4 = st.columns(4)
                 with col1:
-                    st.metric("Target Accuracy", f"{final_acc:.1f}%")
+                    st.metric("Train Accuracy", f"{final_train_acc:.1f}%")
                 with col2:
-                    st.metric("Train Loss", f"{final_train_loss:.4f}")
+                    st.metric("Target Accuracy", f"{final_target_acc:.1f}%")
                 with col3:
+                    st.metric("Train Loss", f"{final_train_loss:.4f}")
+                with col4:
                     st.metric("Target Loss", f"{final_target_loss:.4f}")
 
                 df = pd.DataFrame(epoch_metrics)
@@ -2289,6 +2697,14 @@ When using ImageFolder structure:
                 help="Which images to select based on TRAK scores"
             )
 
+        # Per-class selection option
+        per_class_selection = st.checkbox(
+            "📊 Select per-class (balanced)",
+            value=True,
+            key="step3_per_class",
+            help="If enabled, selects top/bottom k% from EACH class separately (maintaining class balance). Otherwise, selects globally regardless of class."
+        )
+
         # Show selection summary
         pct_of_total = 100 * n_select / len(selection_valid_paths)
 
@@ -2430,7 +2846,27 @@ When using ImageFolder structure:
                     method_status.markdown(f"**Running {pct}% - {method_name}...** ({experiment_idx + 1}/{total_experiments})")
 
                     # Select indices based on method
-                    if descending is not None:
+                    if per_class_selection and descending is not None:
+                        # Per-class selection: select top/bottom k% from EACH class
+                        import random
+                        from collections import defaultdict
+
+                        # Group indices by class
+                        class_to_indices = defaultdict(list)
+                        for idx, label in enumerate(selection_labels.tolist()):
+                            class_to_indices[label].append(idx)
+
+                        # Select k% from each class
+                        selected_indices_list = []
+                        for cls, indices in class_to_indices.items():
+                            n_per_class = max(1, int(len(indices) * pct / 100.0))
+                            cls_scores = importance_scores[indices]
+                            sorted_local = torch.argsort(cls_scores, descending=descending)[:n_per_class]
+                            selected_indices_list.extend([indices[i] for i in sorted_local.tolist()])
+
+                        selected_indices = torch.tensor(selected_indices_list)
+                    elif descending is not None:
+                        # Global selection (original behavior)
                         selected_indices = torch.argsort(importance_scores, descending=descending)[:n_select_pct]
                     else:  # Random
                         import random
@@ -2598,7 +3034,32 @@ When using ImageFolder structure:
             progress_bar_retrain.progress(5)
 
             # Select indices based on method (for target class images via TRAK)
-            if subset_method == "Top (highest influence)":
+            if per_class_selection and subset_method != "Random":
+                # Per-class selection: select top/bottom k% from EACH class
+                import random
+                from collections import defaultdict
+
+                descending = subset_method == "Top (highest influence)"
+
+                # Group indices by class
+                class_to_indices = defaultdict(list)
+                for idx, label in enumerate(selection_labels.tolist()):
+                    class_to_indices[label].append(idx)
+
+                # Calculate selection percentage from n_select
+                selection_pct_value = 100.0 * n_select / len(selection_valid_paths)
+
+                # Select k% from each class
+                selected_indices_list = []
+                for cls, indices in class_to_indices.items():
+                    n_per_class = max(1, int(len(indices) * selection_pct_value / 100.0))
+                    cls_scores = importance_scores[indices]
+                    sorted_local = torch.argsort(cls_scores, descending=descending)[:n_per_class]
+                    selected_indices_list.extend([indices[i] for i in sorted_local.tolist()])
+
+                selected_indices = torch.tensor(selected_indices_list)
+                st.info(f"📊 Per-class selection: {len(selected_indices)} images across {len(class_to_indices)} classes (~{selection_pct_value:.1f}% from each)")
+            elif subset_method == "Top (highest influence)":
                 selected_indices = torch.argsort(importance_scores, descending=True)[:n_select]
             elif subset_method == "Bottom (lowest influence)":
                 selected_indices = torch.argsort(importance_scores, descending=False)[:n_select]
