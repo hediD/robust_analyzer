@@ -1,4 +1,5 @@
 import math
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import Counter
@@ -11,11 +12,16 @@ import torch
 ch = torch
 
 # Load ImageNet labels (will be used as default fallback)
+# Use absolute path based on this file's location
+_UTILS_DIR = os.path.dirname(os.path.abspath(__file__))
+_LABELS_PATH = os.path.join(_UTILS_DIR, '..', 'data', 'imagenet1000_clsidx_to_labels.json')
+
 try:
-    with open('../data/imagenet1000_clsidx_to_labels.json', 'r+') as f:
+    with open(_LABELS_PATH, 'r') as f:
         id_to_class = eval(f.read())
         class_to_id = {v: k for k, v in id_to_class.items()}
-except:
+except Exception as e:
+    print(f"⚠️ Warning: Could not load ImageNet labels from {_LABELS_PATH}: {e}")
     id_to_class = {}
     class_to_id = {}
 
@@ -116,11 +122,30 @@ def get_idx(class_label: str):
     except ValueError:
         pass
 
-    # Handle ImageNet class names
+    # Handle ImageNet class names - try exact match first
     class_idx = class_to_id.get(class_label)
-    if class_idx is None:
-        raise ValueError(f"Class label '{class_label}' not found in id_to_class.")
-    return class_idx
+    if class_idx is not None:
+        return class_idx
+
+    # Try partial match (first word or substring match)
+    class_label_lower = class_label.lower().strip()
+    for full_label, idx in class_to_id.items():
+        # Check if the label starts with the search term
+        if full_label.lower().startswith(class_label_lower):
+            return idx
+        # Check if the first word matches
+        first_word = full_label.split(',')[0].strip().lower()
+        if first_word == class_label_lower:
+            return idx
+
+    # Check if class_to_id is empty (labels not loaded)
+    if not class_to_id:
+        raise ValueError(
+            f"Class label '{class_label}' not found - ImageNet labels may not have loaded correctly. "
+            f"Try using a numeric class index instead (e.g., 847 for 'tank')."
+        )
+
+    raise ValueError(f"Class label '{class_label}' not found in class_to_id mapping.")
 
 def get_target_idx(class_label: str):
     return get_idx(class_label)

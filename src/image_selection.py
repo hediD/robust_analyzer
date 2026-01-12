@@ -675,11 +675,25 @@ When using ImageFolder structure:
     st.markdown("### 📤 Upload Dataset")
 
     st.markdown("""
-    **JSON Manifest Upload:**
-    - Upload a **dataset folder (as ZIP)** containing images and a `dataset.json` manifest
-    - The JSON specifies which images are for:
-      - `train`: Training images (all classes) - also used as selection pool
-      - `target`: Evaluation/selection targets (real images)
+    **Two upload formats supported:**
+
+    **Option 1: JSON Manifest** (`dataset.json` + images)
+    - Upload a folder containing `dataset.json` manifest and `images/` folder
+    - JSON specifies `train`, `select`, and `target` purposes per image
+
+    **Option 2: ImageFolder Structure** (auto-generates manifest)
+    - Upload a folder with `train/` and `target/` subfolders
+    - Each subfolder contains class folders with images:
+      ```
+      dataset/
+      ├── train/
+      │   ├── class_0/  (images...)
+      │   ├── class_1/  (images...)
+      │   └── tank/     (images...)
+      └── target/
+          └── tank/     (real target images...)
+      ```
+    - Manifest will be auto-generated from folder structure
     """)
 
     # Dataset source selection
@@ -697,7 +711,7 @@ When using ImageFolder structure:
         dataset_zip = st.file_uploader(
             "Upload dataset folder (as ZIP)",
             type=["zip"],
-            help="ZIP file containing images/ folder and dataset.json manifest",
+            help="ZIP with either: (1) dataset.json + images/, or (2) train/ + target/ class folders",
             key="dataset_zip"
         )
 
@@ -835,7 +849,7 @@ When using ImageFolder structure:
             "Local dataset path",
             value="",
             placeholder="/path/to/ui_dataset",
-            help="Absolute path to a directory containing dataset.json and images/ folder"
+            help="Path to directory with either: (1) dataset.json + images/, or (2) train/ + target/ folders"
         )
 
         if not local_dataset_path:

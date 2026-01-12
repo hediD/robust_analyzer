@@ -15,12 +15,14 @@ import base64
 import io
 import os
 import tempfile
+import traceback
 import zipfile
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
@@ -28,7 +30,12 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 from plotly.subplots import make_subplots
 
+import utils
 
+
+# ==========================
+# Helper Functions
+# ==========================
 def _get_num_envmaps(envmap_paths: Optional[Sequence[str]]) -> int:
     """Get the number of environment maps from the paths."""
     if not envmap_paths:
@@ -36,6 +43,64 @@ def _get_num_envmaps(envmap_paths: Optional[Sequence[str]]) -> int:
     # Filter for actual HDR/EXR files
     valid_paths = [p for p in envmap_paths if p.lower().endswith(('.hdr', '.exr'))]
     return len(valid_paths) if valid_paths else 1
+
+
+def _expand_for_envmaps(
+    logits: torch.Tensor,
+    cam_positions_stack: torch.Tensor,
+    envmap_paths: Optional[Sequence[str]],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Expand logits and camera positions to account for environment maps."""
+    # Infer num_classes from logits shape
+    num_classes = logits.shape[-1]
+    n_env = _get_num_envmaps(envmap_paths)
+    if n_env > 1:
+        cams = cam_positions_stack.unsqueeze(2).expand(-1, -1, n_env, -1)
+        logits_2d = logits.reshape(-1, num_classes)
+        cameras_2d = cams.reshape(-1, 3)
+    else:
+        logits_2d = logits.reshape(-1, num_classes)
+        cameras_2d = cam_positions_stack.reshape(-1, 3)
+    return logits_2d, cameras_2d
+
+
+def _pred_top1(logits: torch.Tensor) -> np.ndarray:
+    """Return argmax per row."""
+    return torch.argmax(logits, dim=1).cpu().numpy()
+
+
+def _softmax_max_probs(logits: torch.Tensor) -> np.ndarray:
+    """Return max softmax probabilities per row."""
+    return torch.softmax(logits, dim=1).max(dim=1)[0].cpu().numpy()
+
+
+def _now_iso() -> str:
+    """Return current timestamp in ISO format."""
+    return datetime.now().isoformat()
+
+
+def _get_idx_safe(target: str) -> int:
+    """Safely get class index from target string."""
+    from utils import get_idx
+    return get_idx(target)
+
+
+def get_class_label(class_idx: int, num_classes: int = 1000, custom_labels: Optional[Dict[int, str]] = None) -> str:
+    """
+    Get class label for a given index.
+    For ImageNet (1000 classes), use actual labels.
+    For custom models, use custom labels if provided, otherwise generic 'class_N' format.
+    """
+    # First check if custom labels are provided
+    if custom_labels is not None and class_idx in custom_labels:
+        return custom_labels[class_idx]
+
+    # Fall back to ImageNet labels for 1000-class models
+    if num_classes == 1000:
+        from utils import id_to_class
+        return id_to_class.get(class_idx, f"class_{class_idx}")
+    else:
+        return f"class_{class_idx}"
 
 
 def create_interactive_polar_plot(

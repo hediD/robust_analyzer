@@ -1053,115 +1053,204 @@ Upload a JSON file to use custom class names instead of generic indices:
                 return "zip", zip_file, None, None, None
 
         elif mode == "📁 Local path":
-            st.subheader("Specify Local File Paths")
-            st.info("💡 Enter absolute paths to files on the server filesystem")
+            st.subheader("Local File Paths")
 
-            col_obj, col_env = st.columns(2)
+            local_mode = st.radio(
+                "Path specification mode",
+                options=["🔍 Auto-detect from directory (Recommended)", "📝 Specify individual paths"],
+                horizontal=True,
+                key="local_path_mode",
+                help="Auto-detect will find OBJ, MTL, textures, and envmaps automatically from a root directory"
+            )
 
-            with col_obj:
-                st.markdown("**3D Object Files**")
-                obj_path = st.text_input(
-                    "OBJ file path",
+            if local_mode == "🔍 Auto-detect from directory (Recommended)":
+                st.info("💡 Enter a directory path containing your 3D assets - files will be auto-detected")
+
+                root_dir = st.text_input(
+                    "Root directory path",
                     value="",
-                    placeholder="/path/to/model.obj",
-                    help="Absolute path to the .obj mesh file",
-                    key="local_obj_path"
-                )
-                mtl_path = st.text_input(
-                    "MTL file path (optional)",
-                    value="",
-                    placeholder="/path/to/model.mtl",
-                    help="Absolute path to the .mtl material file",
-                    key="local_mtl_path"
-                )
-                texture_dir = st.text_input(
-                    "Textures directory (optional)",
-                    value="",
-                    placeholder="/path/to/textures/",
-                    help="Directory containing texture files referenced in MTL",
-                    key="local_texture_dir"
+                    placeholder="/path/to/assets/",
+                    help="Directory containing .obj, .mtl, texture (.png/.jpg), and environment map (.exr/.hdr) files",
+                    key="local_root_dir"
                 )
 
-            with col_env:
-                st.markdown("**Environment Maps**")
-                env_dir = st.text_input(
-                    "Environment maps directory",
-                    value="",
-                    placeholder="/path/to/envmaps/",
-                    help="Directory containing environment map files (.hdr, .exr, .png, .jpg)",
-                    key="local_env_dir"
-                )
+                if root_dir:
+                    root_path = Path(root_dir)
+                    if not root_path.exists():
+                        st.error(f"❌ Directory not found: {root_dir}")
+                    elif not root_path.is_dir():
+                        st.error(f"❌ Not a directory: {root_dir}")
+                    else:
+                        # Auto-detect files
+                        obj_files = list(root_path.glob("*.obj")) + list(root_path.glob("*.OBJ"))
+                        mtl_files = list(root_path.glob("*.mtl")) + list(root_path.glob("*.MTL"))
+                        texture_files = []
+                        for ext in ['*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tga']:
+                            texture_files.extend(root_path.glob(ext))
+                            texture_files.extend(root_path.glob(ext.upper()))
+                        # Exclude envmaps from textures (will be detected separately)
+                        env_files = []
+                        for ext in ['*.hdr', '*.exr']:
+                            env_files.extend(root_path.glob(ext))
+                            env_files.extend(root_path.glob(ext.upper()))
 
-            # Validate paths
-            if obj_path:
-                obj_file_path = Path(obj_path)
-                if not obj_file_path.exists():
-                    st.error(f"❌ OBJ file not found: {obj_path}")
-                elif not obj_file_path.suffix.lower() == '.obj':
-                    st.error(f"❌ File is not an OBJ: {obj_path}")
-                else:
-                    st.success(f"✅ OBJ: {obj_file_path.name}")
+                        # Show detected files
+                        st.markdown("**Detected files:**")
+                        col1, col2 = st.columns(2)
 
-                    # Validate MTL if provided
-                    mtl_file_path = None
-                    if mtl_path:
-                        mtl_file_path = Path(mtl_path)
-                        if not mtl_file_path.exists():
-                            st.warning(f"⚠️ MTL file not found: {mtl_path}")
-                            mtl_file_path = None
-                        else:
-                            st.success(f"✅ MTL: {mtl_file_path.name}")
-
-                    # Validate texture directory if provided
-                    texture_files_list = []
-                    if texture_dir:
-                        texture_dir_path = Path(texture_dir)
-                        if not texture_dir_path.exists():
-                            st.warning(f"⚠️ Texture directory not found: {texture_dir}")
-                        elif not texture_dir_path.is_dir():
-                            st.warning(f"⚠️ Not a directory: {texture_dir}")
-                        else:
-                            # Find texture files
-                            for ext in ['*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tga']:
-                                texture_files_list.extend(texture_dir_path.glob(ext))
-                                texture_files_list.extend(texture_dir_path.glob(ext.upper()))
-                            if texture_files_list:
-                                st.success(f"✅ Found {len(texture_files_list)} texture(s)")
+                        with col1:
+                            if obj_files:
+                                st.success(f"✅ OBJ: {obj_files[0].name}")
+                                if len(obj_files) > 1:
+                                    st.warning(f"⚠️ Multiple OBJ files found, using first one")
                             else:
-                                st.info("💡 No texture files found in directory")
+                                st.error("❌ No OBJ file found")
 
-                    # Validate environment maps directory
-                    env_files_list = []
-                    if env_dir:
-                        env_dir_path = Path(env_dir)
-                        if not env_dir_path.exists():
-                            st.error(f"❌ Environment maps directory not found: {env_dir}")
-                        elif not env_dir_path.is_dir():
-                            st.error(f"❌ Not a directory: {env_dir}")
-                        else:
-                            # Find environment map files
-                            for ext in ['*.hdr', '*.exr', '*.png', '*.jpg', '*.jpeg']:
-                                env_files_list.extend(env_dir_path.glob(ext))
-                                env_files_list.extend(env_dir_path.glob(ext.upper()))
-                            if env_files_list:
-                                st.success(f"✅ Found {len(env_files_list)} environment map(s)")
-                                for env_f in sorted(env_files_list)[:5]:  # Show first 5
+                            if mtl_files:
+                                st.success(f"✅ MTL: {mtl_files[0].name}")
+                            else:
+                                st.info("ℹ️ No MTL file found (optional)")
+
+                            if texture_files:
+                                # Filter out envmaps from texture list
+                                non_env_textures = [t for t in texture_files if t.suffix.lower() not in ['.hdr', '.exr']]
+                                if non_env_textures:
+                                    st.success(f"✅ Textures: {len(non_env_textures)} file(s)")
+                                    for tex in non_env_textures[:3]:
+                                        st.text(f"  • {tex.name}")
+                                    if len(non_env_textures) > 3:
+                                        st.text(f"  ... and {len(non_env_textures) - 3} more")
+
+                        with col2:
+                            if env_files:
+                                st.success(f"✅ Environment maps: {len(env_files)} file(s)")
+                                for env_f in sorted(env_files)[:5]:
                                     st.text(f"  • {env_f.name}")
-                                if len(env_files_list) > 5:
-                                    st.text(f"  ... and {len(env_files_list) - 5} more")
+                                if len(env_files) > 5:
+                                    st.text(f"  ... and {len(env_files) - 5} more")
                             else:
-                                st.error("❌ No environment map files found in directory")
+                                st.error("❌ No environment maps (.hdr/.exr) found")
 
-                    # Return local paths if valid
-                    if obj_file_path.exists() and env_files_list:
-                        return "local_path", {
-                            "obj_path": str(obj_file_path),
-                            "mtl_path": str(mtl_file_path) if mtl_file_path else None,
-                            "texture_paths": [str(t) for t in texture_files_list],
-                            "env_paths": [str(e) for e in sorted(env_files_list)],
-                        }, None, None, None
-            else:
-                st.info("👆 Enter the path to your OBJ file to get started")
+                        # Return if valid
+                        if obj_files and env_files:
+                            return "local_path", {
+                                "obj_path": str(obj_files[0]),
+                                "mtl_path": str(mtl_files[0]) if mtl_files else None,
+                                "texture_paths": [str(t) for t in texture_files if t.suffix.lower() not in ['.hdr', '.exr']],
+                                "env_paths": [str(e) for e in sorted(env_files)],
+                            }, None, None, None
+                else:
+                    st.info("👆 Enter the path to your assets directory to get started")
+
+            else:  # Specify individual paths
+                st.info("💡 Enter absolute paths to files on the server filesystem")
+
+                col_obj, col_env = st.columns(2)
+
+                with col_obj:
+                    st.markdown("**3D Object Files**")
+                    obj_path = st.text_input(
+                        "OBJ file path",
+                        value="",
+                        placeholder="/path/to/model.obj",
+                        help="Absolute path to the .obj mesh file",
+                        key="local_obj_path"
+                    )
+                    mtl_path = st.text_input(
+                        "MTL file path (optional)",
+                        value="",
+                        placeholder="/path/to/model.mtl",
+                        help="Absolute path to the .mtl material file",
+                        key="local_mtl_path"
+                    )
+                    texture_dir = st.text_input(
+                        "Textures directory (optional)",
+                        value="",
+                        placeholder="/path/to/textures/",
+                        help="Directory containing texture files referenced in MTL",
+                        key="local_texture_dir"
+                    )
+
+                with col_env:
+                    st.markdown("**Environment Maps**")
+                    env_dir = st.text_input(
+                        "Environment maps directory",
+                        value="",
+                        placeholder="/path/to/envmaps/",
+                        help="Directory containing environment map files (.hdr, .exr, .png, .jpg)",
+                        key="local_env_dir"
+                    )
+
+                # Validate paths
+                if obj_path:
+                    obj_file_path = Path(obj_path)
+                    if not obj_file_path.exists():
+                        st.error(f"❌ OBJ file not found: {obj_path}")
+                    elif not obj_file_path.suffix.lower() == '.obj':
+                        st.error(f"❌ File is not an OBJ: {obj_path}")
+                    else:
+                        st.success(f"✅ OBJ: {obj_file_path.name}")
+
+                        # Validate MTL if provided
+                        mtl_file_path = None
+                        if mtl_path:
+                            mtl_file_path = Path(mtl_path)
+                            if not mtl_file_path.exists():
+                                st.warning(f"⚠️ MTL file not found: {mtl_path}")
+                                mtl_file_path = None
+                            else:
+                                st.success(f"✅ MTL: {mtl_file_path.name}")
+
+                        # Validate texture directory if provided
+                        texture_files_list = []
+                        if texture_dir:
+                            texture_dir_path = Path(texture_dir)
+                            if not texture_dir_path.exists():
+                                st.warning(f"⚠️ Texture directory not found: {texture_dir}")
+                            elif not texture_dir_path.is_dir():
+                                st.warning(f"⚠️ Not a directory: {texture_dir}")
+                            else:
+                                # Find texture files
+                                for ext in ['*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tga']:
+                                    texture_files_list.extend(texture_dir_path.glob(ext))
+                                    texture_files_list.extend(texture_dir_path.glob(ext.upper()))
+                                if texture_files_list:
+                                    st.success(f"✅ Found {len(texture_files_list)} texture(s)")
+                                else:
+                                    st.info("💡 No texture files found in directory")
+
+                        # Validate environment maps directory
+                        env_files_list = []
+                        if env_dir:
+                            env_dir_path = Path(env_dir)
+                            if not env_dir_path.exists():
+                                st.error(f"❌ Environment maps directory not found: {env_dir}")
+                            elif not env_dir_path.is_dir():
+                                st.error(f"❌ Not a directory: {env_dir}")
+                            else:
+                                # Find environment map files
+                                for ext in ['*.hdr', '*.exr', '*.png', '*.jpg', '*.jpeg']:
+                                    env_files_list.extend(env_dir_path.glob(ext))
+                                    env_files_list.extend(env_dir_path.glob(ext.upper()))
+                                if env_files_list:
+                                    st.success(f"✅ Found {len(env_files_list)} environment map(s)")
+                                    for env_f in sorted(env_files_list)[:5]:  # Show first 5
+                                        st.text(f"  • {env_f.name}")
+                                    if len(env_files_list) > 5:
+                                        st.text(f"  ... and {len(env_files_list) - 5} more")
+                                else:
+                                    st.error("❌ No environment map files found in directory")
+
+                        # Return local paths if valid
+                        if obj_file_path.exists() and env_files_list:
+                            return "local_path", {
+                                "obj_path": str(obj_file_path),
+                                "mtl_path": str(mtl_file_path) if mtl_file_path else None,
+                                "texture_paths": [str(t) for t in texture_files_list],
+                                "env_paths": [str(e) for e in sorted(env_files_list)],
+                            }, None, None, None
+                else:
+                    st.info("👆 Enter the path to your OBJ file to get started")
 
         else:  # Individual files (📤 Individual files)
             col1, col2, col3 = st.columns(3)
