@@ -84,16 +84,13 @@ def generate_dataset_json_from_folder(dataset_root: str, target_class_name: str 
 
     Expected structure:
         dataset_root/
-        ├── train/           # Training images (required)
+        ├── train/           # Training images (used for both training and selection pool)
         │   ├── class1/
         │   │   ├── img1.png
         │   │   └── img2.jpg
         │   └── class2/
         │       └── img1.png
-        ├── select/          # Selection pool (optional, defaults to train)
-        │   └── class1/
-        │       └── img1.png
-        └── target/          # Target/evaluation images (required)
+        └── target/          # Target/evaluation images (real-world test images)
             └── class1/
                 └── img1.png
 
@@ -106,7 +103,6 @@ def generate_dataset_json_from_folder(dataset_root: str, target_class_name: str 
     """
     dataset_root = Path(dataset_root)
     train_dir = dataset_root / "train"
-    select_dir = dataset_root / "select"
     target_dir = dataset_root / "target"
 
     # Validate required directories
@@ -139,7 +135,6 @@ def generate_dataset_json_from_folder(dataset_root: str, target_class_name: str 
 
     # Find all images
     train_images = find_images(train_dir)
-    select_images = find_images(select_dir) if select_dir.exists() else []
     target_images = find_images(target_dir)
 
     if not train_images:
@@ -147,13 +142,9 @@ def generate_dataset_json_from_folder(dataset_root: str, target_class_name: str 
     if not target_images:
         raise ValueError(f"No images found in target/ directory")
 
-    # If no select folder, use train images as selection pool
-    if not select_images:
-        select_images = train_images.copy()
-
     # Build class mapping from all unique classes
     all_classes = set()
-    for _, class_name in train_images + select_images + target_images:
+    for _, class_name in train_images + target_images:
         all_classes.add(class_name)
     all_classes = sorted(all_classes)
 
@@ -180,53 +171,24 @@ def generate_dataset_json_from_folder(dataset_root: str, target_class_name: str 
     # Build entries
     entries = []
 
-    # Helper to create entry
-    def add_entry(rel_path: str, class_name: str, purposes: List[str], source: str):
+    # Add train images (used for both training and selection pool)
+    for rel_path, class_name in train_images:
         entries.append({
             "filename": rel_path,
-            "purposes": purposes,
+            "purposes": ["select", "train"],  # Train images are both training data and selection pool
             "class_idx": class_to_idx[class_name],
             "class_name": class_name,
-            "source": source
+            "source": "train"
         })
-
-    # Track which files have which purposes
-    file_purposes = {}  # rel_path -> set of purposes
-
-    # Add train images
-    for rel_path, class_name in train_images:
-        if rel_path not in file_purposes:
-            file_purposes[rel_path] = {"class_name": class_name, "purposes": set()}
-        file_purposes[rel_path]["purposes"].add("train")
-
-    # Add select images
-    for rel_path, class_name in select_images:
-        if rel_path not in file_purposes:
-            file_purposes[rel_path] = {"class_name": class_name, "purposes": set()}
-        file_purposes[rel_path]["purposes"].add("select")
 
     # Add target images
     for rel_path, class_name in target_images:
-        if rel_path not in file_purposes:
-            file_purposes[rel_path] = {"class_name": class_name, "purposes": set()}
-        file_purposes[rel_path]["purposes"].add("target")
-
-    # Convert to entries list
-    for rel_path, info in sorted(file_purposes.items()):
-        # Determine source from path
-        if rel_path.startswith("target/"):
-            source = "real"
-        elif rel_path.startswith("select/"):
-            source = "select"
-        else:
-            source = "train"
-
         entries.append({
             "filename": rel_path,
-            "purposes": sorted(list(info["purposes"])),
-            "class_idx": class_to_idx[info["class_name"]],
-            "class_name": info["class_name"],
-            "source": source
+            "purposes": ["target"],
+            "class_idx": class_to_idx[class_name],
+            "class_name": class_name,
+            "source": "real"
         })
 
     # Build manifest
@@ -532,10 +494,7 @@ dataset_folder/
 │   │   └── img1.png
 │   └── half_track/
 │       └── img1.png
-├── select/               # Selection pool (optional, defaults to train/)
-│   └── tank/
-│       └── img1.png
-└── target/               # Target/evaluation images (required)
+└── target/               # Target/evaluation images (real-world test images)
     └── tank/            # Must match a class in train/
         └── real_photo.png
 ```
@@ -546,7 +505,7 @@ When using ImageFolder structure:
 - **Manual download**: A "📥 Download dataset.json again" button is also available for re-downloading
 - **Class detection**: Classes are discovered from train/ subfolder names
 - **Target class(es)**: Auto-detected from target/ folder (can have multiple classes!)
-- **Selection pool**: If no select/ folder, train/ images of target class(es) are used
+- **Selection pool**: Train images are automatically used as the selection pool
 
 ### Manifest Structure (`dataset.json`)
 
@@ -582,9 +541,8 @@ When using ImageFolder structure:
 
 | Purpose | Description | Required |
 |---------|-------------|----------|
-| `train` | Training images (all classes) | ✅ Yes |
+| `train` | Training images (all classes) - also used as selection pool | ✅ Yes |
 | `target` | Real-world images to optimize for | ✅ Yes |
-| `select` | Candidate pool for TRAK selection | ⚠️ Optional (defaults to `train`) |
 
 ### Training Parameters
 
@@ -640,9 +598,8 @@ When using ImageFolder structure:
 
 ### Example Use Case
 
-- **Train images**: 500 simulated tank renders + 500 other class images
+- **Train images**: 500 simulated tank renders + 500 other class images (also used as selection pool)
 - **Target images**: 50 real-world tank photos
-- **Selection pool**: The 500 simulated tank renders
 - **TRAK config**: 3 checkpoints, 4 projections, JL dim=2048
 - **Result**: Top 10% (50 images) most influential for real-world tank recognition
 
@@ -721,11 +678,8 @@ When using ImageFolder structure:
     **JSON Manifest Upload:**
     - Upload a **dataset folder (as ZIP)** containing images and a `dataset.json` manifest
     - The JSON specifies which images are for:
+      - `train`: Training images (all classes) - also used as selection pool
       - `target`: Evaluation/selection targets (real images)
-      - `train`: Training images (all classes)
-      - `select`: Selection pool (tank images only)
-
-    **Format example:** See the `ui_dataset` folder generated by `create_ui_dataset.py`
     """)
 
     # Dataset source selection
@@ -939,7 +893,7 @@ When using ImageFolder structure:
                 st.info("💡 Either provide a dataset.json or use ImageFolder structure with train/ and target/ folders")
                 return
 
-        # Check for images - either in images/ folder or in train/select/target folders
+        # Check for images - either in images/ folder or in train/target folders
         images_path = local_path / "images"
         train_path = local_path / "train"
         if not images_path.exists() and not train_path.exists():
@@ -1116,7 +1070,7 @@ When using ImageFolder structure:
             "Number of projections",
             min_value=1,
             max_value=128,
-            value=4,
+            value=2,
             step=1,
             key="trak_num_projections",
             help="Number of random projections to average. More = more stable scores but slower."
@@ -2708,14 +2662,17 @@ When using ImageFolder structure:
         # Show selection summary
         pct_of_total = 100 * n_select / len(selection_valid_paths)
 
-        # Calculate class balancing to match initial train+select ratios
-        if initial_class_ratios and has_train_data:
-            # After selecting n_select from select, balance to match initial ratios
-            # Total final size should maintain same class proportions as initial training
+        # Calculate expected selection counts
+        if per_class_selection and subset_method != "Random":
+            # Per-class selection: k% from each class
+            num_classes = len(set(selection_labels.tolist()))
+            imgs_per_class = n_select // num_classes if num_classes > 0 else n_select
+            st.info(f"📌 **Per-class selection**: ~{pct_of_total:.1f}% from each of {num_classes} classes = ~{imgs_per_class} per class, **{n_select}** total")
+        elif initial_class_ratios and has_train_data:
+            # Global selection with post-hoc balancing (legacy mode)
             total_initial = sum(initial_class_counts.values()) if initial_class_counts else len(train_labels)
             target_total = int(total_initial * pct_of_total / 100)
-            target_per_class = {cls: max(1, int(ratio * target_total)) for cls, ratio in initial_class_ratios.items()}
-            st.info(f"📌 Will select **{n_select}** from select ({pct_of_total:.1f}%), then balance to **~{target_total}** total (matching initial {pct_of_total:.1f}% class mix)")
+            st.info(f"📌 **Global selection**: {n_select} images ({pct_of_total:.1f}%), then balance to ~{target_total} total")
         else:
             st.info(f"📌 Will select **{n_select}** images ({pct_of_total:.1f}% of {len(selection_valid_paths)}) using: **{subset_method}**")
             if not initial_class_ratios:
