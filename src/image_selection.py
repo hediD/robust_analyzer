@@ -487,15 +487,15 @@ dataset_folder/
 ```
 dataset_folder/
 ├── train/                # Training images (required)
-│   ├── tank/            # Class folders (target class)
+│   ├── class_a/         # Class folders
 │   │   ├── img1.png
 │   │   └── img2.jpg
-│   ├── jeep/            # Other classes
+│   ├── class_b/         # Other classes
 │   │   └── img1.png
-│   └── half_track/
+│   └── target_class/    # Your target class
 │       └── img1.png
 └── target/               # Target/evaluation images (real-world test images)
-    └── tank/            # Must match a class in train/
+    └── target_class/    # Must match a class in train/
         └── real_photo.png
 ```
 
@@ -513,21 +513,21 @@ When using ImageFolder structure:
 {
   "dataset_info": {
     "name": "My Dataset",
-    "target_classes": [5, 6],
-    "target_class_names": ["tank", "jeep"],
-    "num_classes": 10
+    "target_classes": [2],
+    "target_class_names": ["target_class"],
+    "num_classes": 3
   },
-  "class_mapping": {"0": "airplane", "5": "tank", "6": "jeep", ...},
+  "class_mapping": {"0": "class_a", "1": "class_b", "2": "target_class"},
   "entries": [
     {
       "filename": "images/train_img_001.png",
-      "class_idx": 5,
+      "class_idx": 2,
       "purposes": ["train", "select"],
-      "source": "simulated"
+      "source": "synthetic"
     },
     {
       "filename": "images/real_001.png",
-      "class_idx": 5,
+      "class_idx": 2,
       "purposes": ["target"],
       "source": "real"
     }
@@ -598,10 +598,10 @@ When using ImageFolder structure:
 
 ### Example Use Case
 
-- **Train images**: 500 simulated tank renders + 500 other class images (also used as selection pool)
-- **Target images**: 50 real-world tank photos
+- **Train images**: 500 synthetic renders of target class + 500 other class images (also used as selection pool)
+- **Target images**: 50 real-world photos of target class
 - **TRAK config**: 3 checkpoints, 4 projections, JL dim=2048
-- **Result**: Top 10% (50 images) most influential for real-world tank recognition
+- **Result**: Top 10% most influential synthetic images for real-world recognition
 
 ### Tips
 
@@ -687,11 +687,11 @@ When using ImageFolder structure:
       ```
       dataset/
       ├── train/
-      │   ├── class_0/  (images...)
-      │   ├── class_1/  (images...)
-      │   └── tank/     (images...)
+      │   ├── class_a/       (images...)
+      │   ├── class_b/       (images...)
+      │   └── target_class/  (images...)
       └── target/
-          └── tank/     (real target images...)
+          └── target_class/  (real target images...)
       ```
     - Manifest will be auto-generated from folder structure
     """)
@@ -2474,6 +2474,68 @@ When using ImageFolder structure:
             display_df = display_df[cols]
 
             st.write(f"**Showing {len(display_df)} of {len(scores_df_sorted)} images** ({view_mode})")
+
+            # Download button for displayed subset (ZIP with images + JSON)
+            displayed_filenames = set(display_df['filename'].tolist())
+            score_lookup = dict(zip(display_df['filename'], display_df['trak_score']))
+            rank_lookup = dict(zip(display_df['filename'], display_df['rank']))
+
+            # Build subset manifest with only displayed images (paths relative to ZIP)
+            subset_manifest = copy.deepcopy(manifest)
+            subset_entries = []
+            for entry in subset_manifest.get('entries', []):
+                entry_filename = os.path.basename(entry.get('filename', ''))
+                if entry_filename in displayed_filenames:
+                    # Update path to be relative within the ZIP (just filename)
+                    entry['filename'] = entry_filename
+                    entry['trak_score'] = float(score_lookup.get(entry_filename, 0))
+                    entry['trak_rank'] = int(rank_lookup.get(entry_filename, 0))
+                    subset_entries.append(entry)
+            subset_manifest['entries'] = subset_entries
+
+            # Update dataset info
+            subset_manifest['subset_info'] = {
+                'selection_mode': view_mode,
+                'k_value': k_value,
+                'total_images': len(scores_df_sorted),
+                'subset_size': len(display_df),
+                'created_at': datetime.now().isoformat(),
+                'score_range': {
+                    'min': float(display_df['trak_score'].min()),
+                    'max': float(display_df['trak_score'].max()),
+                    'mean': float(display_df['trak_score'].mean()),
+                }
+            }
+
+            # Build ZIP with images + JSON manifest
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                # Add images
+                for path in selection_valid_paths:
+                    filename = os.path.basename(path)
+                    if filename in displayed_filenames:
+                        try:
+                            with open(path, 'rb') as f:
+                                zf.writestr(filename, f.read())
+                        except Exception:
+                            pass  # Skip files that can't be read
+
+                # Add JSON manifest
+                subset_json = json.dumps(subset_manifest, indent=2)
+                zf.writestr("dataset.json", subset_json)
+
+            zip_buffer.seek(0)
+            view_suffix = "top" if "Top" in view_mode else ("bottom" if "Bottom" in view_mode else "all")
+            zip_filename = f"trak_{view_suffix}_{len(display_df)}.zip"
+
+            st.download_button(
+                label=f"📥 Download {len(display_df)} Images",
+                data=zip_buffer.getvalue(),
+                file_name=zip_filename,
+                mime="application/zip",
+                use_container_width=True,
+                help=f"Download ZIP with {len(display_df)} images and dataset.json containing TRAK scores/ranks"
+            )
 
             # Two-panel layout: Table on left, Visualizer on right
             col_table, col_viz = st.columns([1, 1])
