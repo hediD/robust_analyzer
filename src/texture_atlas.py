@@ -10,9 +10,12 @@ Contains functions for:
 
 from __future__ import annotations
 
+import glob
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import io
 import zipfile
@@ -321,6 +324,28 @@ model.zip/
             if "atlas_result" in st.session_state:
                 del st.session_state["atlas_result"]
             st.rerun()
+
+
+def load_texture_for_preview(tex_path: str, tex_name: str) -> Optional[Dict]:
+    """
+    Load a texture file and return info dict for preview.
+
+    Args:
+        tex_path: Full path to the texture file
+        tex_name: Display name for the texture
+
+    Returns:
+        Dict with 'name', 'image', 'size' keys, or None if load fails
+    """
+    try:
+        img = Image.open(tex_path)
+        return {
+            "name": tex_name,
+            "image": img,
+            "size": f"{img.width}x{img.height}",
+        }
+    except Exception:
+        return None
 
 
 def _collect_original_textures_from_mtl(mtl_path: str) -> List[Dict]:
