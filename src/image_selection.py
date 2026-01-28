@@ -804,6 +804,25 @@ When using ImageFolder structure:
                                 class_name = class_mapping.get(str(class_id), f"class_{class_id}")
                                 st.write(f"{marker} {class_name}: {count} images")
 
+                    # Check for pre-computed TRAK scores in ZIP manifest
+                    has_precomputed_trak = any(
+                        entry.get('trak_score') is not None
+                        for entry in manifest.get('entries', [])
+                    )
+                    if has_precomputed_trak:
+                        train_entries_with_scores = [
+                            e for e in manifest.get('entries', [])
+                            if e.get('trak_score') is not None and 'train' in e.get('purposes', [])
+                        ]
+                        st.success(
+                            f"🎯 **Pre-computed TRAK scores detected!** {len(train_entries_with_scores)} training entries have `trak_score` field. "
+                            f"You can skip to Step 3 below to run selection comparison & retraining."
+                        )
+                        st.session_state["has_precomputed_trak"] = True
+                        st.session_state["precomputed_zip"] = dataset_zip
+                    else:
+                        st.session_state["has_precomputed_trak"] = False
+
                 else:
                     # Check for ImageFolder structure
                     has_train = any('train/' in f for f in file_list)
@@ -865,8 +884,17 @@ When using ImageFolder structure:
             st.error(f"❌ Path is not a directory: {local_dataset_path}")
             return
 
+        # Check for dataset_trak.json first (pre-computed TRAK scores)
+        trak_manifest_path = local_path / "dataset_trak.json"
         manifest_path = local_path / "dataset.json"
         auto_generated_manifest = None
+        using_trak_manifest = False
+
+        # Use dataset_trak.json if it exists and user hasn't reset
+        if trak_manifest_path.exists() and "force_reset_trak" not in st.session_state:
+            manifest_path = trak_manifest_path
+            using_trak_manifest = True
+            st.info("📂 Found `dataset_trak.json` with pre-computed TRAK scores - will auto-load for Step 3.")
 
         if not manifest_path.exists():
             # Check if ImageFolder structure exists (train/ and target/ folders)
@@ -1004,6 +1032,33 @@ When using ImageFolder structure:
                 "dataset_info": dataset_info,
             }
 
+            # Check if dataset.json already has pre-computed TRAK scores
+            has_precomputed_trak = any(
+                entry.get('trak_score') is not None
+                for entry in manifest.get('entries', [])
+            )
+
+            if has_precomputed_trak:
+                # Count entries with TRAK scores
+                entries_with_scores = [e for e in manifest.get('entries', []) if e.get('trak_score') is not None]
+                train_entries_with_scores = [e for e in entries_with_scores if 'train' in e.get('purposes', [])]
+
+                st.success(
+                    f"🎯 **Pre-computed TRAK scores detected!** {len(train_entries_with_scores)} training entries have `trak_score` field. "
+                    f"You can skip to Step 3 below to run selection comparison & retraining."
+                )
+
+                # Store in session state for the checkbox to reference
+                st.session_state["has_precomputed_trak"] = True
+                st.session_state["precomputed_manifest_path"] = str(manifest_path)
+                st.session_state["precomputed_dataset_root"] = str(local_path)
+
+                # If this is from dataset_trak.json and trak_data not loaded, auto-trigger loading
+                if using_trak_manifest and "trak_data" not in st.session_state:
+                    st.session_state["auto_load_trak"] = True
+            else:
+                st.session_state["has_precomputed_trak"] = False
+
         except Exception as e:
             st.warning(f"⚠️ Could not preview dataset: {str(e)}")
 
@@ -1016,7 +1071,7 @@ When using ImageFolder structure:
             "Training epochs",
             min_value=1,
             max_value=50,
-            value=5,
+            value=8,
             step=1,
             help="Number of epochs to train the model (more = better TRAK scores, slower)"
         )
@@ -1084,7 +1139,7 @@ When using ImageFolder structure:
             "Number of projections",
             min_value=1,
             max_value=128,
-            value=2,
+            value=8,
             step=1,
             key="trak_num_projections",
             help="Number of random projections to average. More = more stable scores but slower."
@@ -1110,7 +1165,7 @@ When using ImageFolder structure:
             "Number of checkpoints",
             min_value=1,
             max_value=20,
-            value=2,
+            value=4,
             step=1,
             key="trak_num_checkpoints",
             help="Save multiple checkpoints during training and average TRAK scores across them. More = more stable but slower."
@@ -1135,6 +1190,261 @@ When using ImageFolder structure:
         st.info(f"💡 Ensemble TRAK: {' × '.join(parts)} = **{total_score_computations}** score computations averaged (JL dim={jl_dim})")
     else:
         st.caption(f"🔧 Single checkpoint, single projection (JL dim={jl_dim})")
+
+    # ==================== SKIP STEPS 1 & 2 WITH PRE-COMPUTED TRAK SCORES ====================
+    if st.session_state.get("has_precomputed_trak", False) and "trak_data" not in st.session_state:
+        st.markdown("---")
+        st.markdown("### ⚡ Skip to Step 3 (Pre-computed TRAK Scores)")
+
+        # Check if we should auto-load (from dataset_trak.json)
+        auto_load_trak = st.session_state.pop("auto_load_trak", False)
+
+        if auto_load_trak:
+            st.success(
+                "🎯 **Found `dataset_trak.json`!** Auto-loading pre-computed TRAK scores. "
+                "Click 'Reset All Steps' if you want to recompute."
+            )
+        else:
+            st.info(
+                "🎯 **Pre-computed TRAK scores detected!** Your `dataset.json` contains `trak_score` fields in entries.\n\n"
+                "You can skip Steps 1 (Train Model) & 2 (Compute TRAK) and go directly to "
+                "Step 3 to run **selection comparison** and **retrain with selected subsets**.\n\n"
+                "This is useful when you've already computed TRAK scores and want to experiment with different "
+                "selection percentages or methods without re-running the expensive computation."
+            )
+
+        # Auto-trigger if from dataset_trak.json, otherwise show button
+        load_triggered = auto_load_trak or st.button("⚡ **Load Pre-computed TRAK Scores & Skip to Step 3**", type="primary", use_container_width=True)
+
+        if load_triggered:
+            with st.spinner("Loading pre-computed TRAK scores..."):
+                try:
+                    # Handle both local path and ZIP file sources
+                    dataset_root = st.session_state.get("precomputed_dataset_root")
+                    manifest_path = st.session_state.get("precomputed_manifest_path")
+                    precomputed_zip = st.session_state.get("precomputed_zip")
+                    temp_dir = None
+
+                    if precomputed_zip is not None:
+                        # Extract ZIP to temp directory
+                        temp_dir = tempfile.mkdtemp(prefix="trak_precomputed_")
+                        st.write(f"📦 Extracting ZIP to temporary directory...")
+                        with zipfile.ZipFile(precomputed_zip, 'r') as zip_ref:
+                            zip_ref.extractall(temp_dir)
+
+                        # Find dataset.json in extracted files
+                        for root, dirs, files in os.walk(temp_dir):
+                            if 'dataset.json' in files:
+                                manifest_path = os.path.join(root, 'dataset.json')
+                                dataset_root = root
+                                break
+
+                        if not manifest_path or not os.path.exists(manifest_path):
+                            st.error("❌ Could not find dataset.json in ZIP file")
+                            if temp_dir:
+                                shutil.rmtree(temp_dir, ignore_errors=True)
+                            st.stop()
+
+                    with open(manifest_path, 'r') as f:
+                        manifest = json.load(f)
+
+                    # Get class mapping
+                    class_mapping = manifest.get('class_mapping', {})
+                    dataset_info = manifest.get('dataset_info', {})
+                    num_classes = dataset_info.get('num_classes', len(class_mapping))
+
+                    # Separate entries by purpose
+                    train_entries = []
+                    select_entries = []
+                    target_entries = []
+
+                    for entry in manifest.get('entries', []):
+                        purposes = entry.get('purposes', [])
+                        if 'train' in purposes:
+                            train_entries.append(entry)
+                        if 'select' in purposes:
+                            select_entries.append(entry)
+                        if 'target' in purposes:
+                            target_entries.append(entry)
+
+                    # If no separate select pool, use train as select
+                    if not select_entries:
+                        select_entries = train_entries
+
+                    # Filter to entries with TRAK scores
+                    scored_entries = [e for e in select_entries if e.get('trak_score') is not None]
+
+                    if not scored_entries:
+                        st.error("❌ No entries with TRAK scores found in select/train pool")
+                        st.stop()
+
+                    st.write(f"📊 Loading {len(scored_entries)} scored entries, {len(train_entries)} train, {len(target_entries)} target...")
+
+                    # Image transforms
+                    transform = transforms.Compose([
+                        transforms.Resize(256),
+                        transforms.CenterCrop(224),
+                        transforms.ToTensor(),
+                        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                    ])
+
+                    # Load selection pool images and scores
+                    selection_tensors_list = []
+                    selection_labels_list = []
+                    selection_valid_paths = []
+                    importance_scores_list = []
+
+                    progress_bar = st.progress(0, text="Loading selection pool...")
+                    for i, entry in enumerate(scored_entries):
+                        img_path = os.path.join(dataset_root, entry['filename'])
+                        if os.path.exists(img_path):
+                            try:
+                                img = Image.open(img_path).convert('RGB')
+                                tensor = transform(img)
+                                selection_tensors_list.append(tensor)
+                                selection_labels_list.append(entry.get('class_idx', 0))
+                                selection_valid_paths.append(entry['filename'])
+                                importance_scores_list.append(entry['trak_score'])
+                            except Exception:
+                                pass
+                        if i % 100 == 0:
+                            progress_bar.progress(i / len(scored_entries), text=f"Loading selection pool... {i}/{len(scored_entries)}")
+                    progress_bar.empty()
+
+                    selection_tensors = torch.stack(selection_tensors_list)
+                    selection_labels = torch.tensor(selection_labels_list, dtype=torch.long)
+                    importance_scores = torch.tensor(importance_scores_list, dtype=torch.float32)
+
+                    # Load train images
+                    train_tensors_list = []
+                    train_labels_list = []
+                    train_paths = []
+
+                    progress_bar = st.progress(0, text="Loading train images...")
+                    for i, entry in enumerate(train_entries):
+                        img_path = os.path.join(dataset_root, entry['filename'])
+                        if os.path.exists(img_path):
+                            try:
+                                img = Image.open(img_path).convert('RGB')
+                                tensor = transform(img)
+                                train_tensors_list.append(tensor)
+                                train_labels_list.append(entry.get('class_idx', 0))
+                                train_paths.append(entry['filename'])
+                            except Exception:
+                                pass
+                        if i % 100 == 0:
+                            progress_bar.progress(i / len(train_entries), text=f"Loading train images... {i}/{len(train_entries)}")
+                    progress_bar.empty()
+
+                    train_tensors = torch.stack(train_tensors_list) if train_tensors_list else None
+                    train_labels = torch.tensor(train_labels_list, dtype=torch.long) if train_labels_list else None
+
+                    # Load target images
+                    target_tensors_list = []
+                    target_labels_list = []
+
+                    progress_bar = st.progress(0, text="Loading target images...")
+                    for i, entry in enumerate(target_entries):
+                        img_path = os.path.join(dataset_root, entry['filename'])
+                        if os.path.exists(img_path):
+                            try:
+                                img = Image.open(img_path).convert('RGB')
+                                tensor = transform(img)
+                                target_tensors_list.append(tensor)
+                                target_labels_list.append(entry.get('class_idx', 0))
+                            except Exception:
+                                pass
+                        if i % 100 == 0:
+                            progress_bar.progress(i / len(target_entries), text=f"Loading target images... {i}/{len(target_entries)}")
+                    progress_bar.empty()
+
+                    target_tensors = torch.stack(target_tensors_list) if target_tensors_list else None
+                    target_labels = torch.tensor(target_labels_list, dtype=torch.long) if target_labels_list else None
+
+                    # Calculate initial class ratios from train data
+                    initial_class_counts = {}
+                    initial_class_ratios = {}
+                    if train_labels is not None:
+                        for label in train_labels.tolist():
+                            initial_class_counts[label] = initial_class_counts.get(label, 0) + 1
+                        total = sum(initial_class_counts.values())
+                        initial_class_ratios = {k: v / total for k, v in initial_class_counts.items()}
+
+                    # Build scores dataframe
+                    scores_data = {
+                        'filename': selection_valid_paths,
+                        'trak_score': importance_scores.numpy().tolist(),
+                        'class': selection_labels.numpy().tolist(),
+                    }
+                    scores_df = pd.DataFrame(scores_data)
+                    scores_df_sorted = scores_df.sort_values('trak_score', ascending=False).reset_index(drop=True)
+
+                    # Get model config from session state
+                    model_config = st.session_state.get("model_config", {})
+                    model_name = model_config.get("model_name", "resnet50")
+                    custom_weights = model_config.get("custom_weights_path")
+                    num_classes_override = model_config.get("num_classes_override")
+
+                    # Determine target class for pool_label
+                    target_classes = dataset_info.get('target_classes', [])
+                    pool_label = target_classes[0] if target_classes else 0
+
+                    # Store trak_data in session state
+                    st.session_state["trak_data"] = {
+                        "importance_scores": importance_scores,
+                        "selection_tensors": selection_tensors,
+                        "selection_labels": selection_labels,
+                        "selection_valid_paths": selection_valid_paths,
+                        "target_tensors": target_tensors,
+                        "target_labels": target_labels,
+                        "train_tensors": train_tensors,
+                        "train_labels": train_labels,
+                        "train_paths": train_paths,
+                        "initial_class_ratios": initial_class_ratios,
+                        "initial_class_counts": initial_class_counts,
+                        "manifest": manifest,
+                        "model_name": model_name,
+                        "custom_weights": custom_weights,
+                        "device": "cuda" if torch.cuda.is_available() else "cpu",
+                        "train_batch_size": train_batch_size,
+                        "train_epochs": train_epochs,
+                        "pool_label": pool_label,
+                        "temp_dir": temp_dir,  # Will be set if extracted from ZIP
+                        "dataset_root": dataset_root,
+                        "scores_df_sorted": scores_df_sorted,
+                        "jl_dim": jl_dim,
+                        "num_projections": num_projections,
+                        "class_mapping": class_mapping,
+                        "num_classes_override": num_classes_override or num_classes,
+                    }
+
+                    # Also mark step1 as complete (with minimal data)
+                    st.session_state["step1_data"] = {
+                        "model_name": model_name,
+                        "custom_weights": custom_weights,
+                        "dataset_info": dataset_info,
+                        "num_classes_override": num_classes_override or num_classes,
+                        "learning_rate": learning_rate,
+                        "train_batch_size": train_batch_size,
+                        "train_epochs": train_epochs,
+                        "freeze_backbone": freeze_backbone,
+                        "epoch_metrics": [],  # No training metrics since we skipped
+                        "final_train_acc": 0,
+                        "final_target_acc": 0,
+                        "final_train_loss": 0,
+                        "final_target_loss": 0,
+                        "skipped": True,  # Flag to indicate steps were skipped
+                    }
+
+                    st.success(f"✅ Loaded {len(selection_valid_paths)} scored images! Ready for Step 3.")
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"❌ Error loading pre-computed scores: {str(e)}")
+                    st.error(traceback.format_exc())
+                    # Clean up temp directory on error
+                    if temp_dir and os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir, ignore_errors=True)
 
     # ==================== STEP STATUS INDICATORS ====================
     st.markdown("---")
@@ -1196,6 +1506,13 @@ When using ImageFolder structure:
                     del st.session_state["auto_run_mode"]
                 if "auto_run_step" in st.session_state:
                     del st.session_state["auto_run_step"]
+                # Set flag to prevent auto-loading dataset_trak.json on next load
+                st.session_state["force_reset_trak"] = True
+                # Clear precomputed trak flags
+                if "has_precomputed_trak" in st.session_state:
+                    del st.session_state["has_precomputed_trak"]
+                if "auto_load_trak" in st.session_state:
+                    del st.session_state["auto_load_trak"]
                 st.rerun()
 
     # Check if we're in auto-run mode
@@ -2302,6 +2619,39 @@ When using ImageFolder structure:
 
                 st.success("✅ Step 2 Complete! TRAK scores computed.")
 
+                # Auto-save dataset_trak.json to local folder (only if using local path, not ZIP)
+                if temp_dir is None and dataset_root:
+                    try:
+                        # Build dataset_trak.json with TRAK scores
+                        score_lookup = dict(zip(scores_df_sorted['filename'], scores_df_sorted['trak_score']))
+                        manifest_with_trak = copy.deepcopy(manifest)
+                        for entry in manifest_with_trak.get('entries', []):
+                            filename = entry.get('filename', '')
+                            entry['trak_score'] = score_lookup.get(filename, None)
+
+                        # Add TRAK metadata
+                        manifest_with_trak['trak_info'] = {
+                            'computed_at': datetime.now().isoformat(),
+                            'jl_dim': jl_dim,
+                            'num_projections': num_projections,
+                            'num_checkpoints': num_checkpoints,
+                            'model_name': model_name,
+                            'train_epochs': train_epochs,
+                            'min_score': float(scores_df_sorted['trak_score'].min()),
+                            'max_score': float(scores_df_sorted['trak_score'].max()),
+                            'mean_score': float(scores_df_sorted['trak_score'].mean()),
+                        }
+
+                        trak_json_path = os.path.join(dataset_root, 'dataset_trak.json')
+                        with open(trak_json_path, 'w') as f:
+                            json.dump(manifest_with_trak, f, indent=2)
+                        st.success(f"💾 Auto-saved `dataset_trak.json` to {dataset_root}")
+                        # Clear force_reset_trak flag since we have fresh TRAK scores
+                        if "force_reset_trak" in st.session_state:
+                            del st.session_state["force_reset_trak"]
+                    except Exception as e:
+                        st.warning(f"⚠️ Could not auto-save dataset_trak.json: {str(e)}")
+
                 # In auto-run mode, advance to Step 3 (compare all methods)
                 if auto_run_mode:
                     st.session_state["auto_run_step"] = 3
@@ -2819,7 +3169,7 @@ When using ImageFolder structure:
         # Multi-percentage selection for comprehensive comparison
         percentages_input = st.text_input(
             "Percentages to compare",
-            value="25,50,75",
+            value="10,20,30,40,50,60,70,80,90",
             key="compare_percentages",
             help="Enter percentages as comma-separated integers (e.g., 5, 25, 50, 75, 100)"
         )
@@ -3053,6 +3403,76 @@ When using ImageFolder structure:
                 "percentages": compare_percentages,
                 "epochs": step3_epochs,
             }
+
+        # Display persisted comparison results (survives reruns from download buttons, etc.)
+        if "method_comparison_results" in st.session_state and not (compare_btn and compare_percentages):
+            stored_results = st.session_state["method_comparison_results"]
+            comparison_results = stored_results["results"]
+
+            if comparison_results:
+                st.markdown("---")
+                st.markdown("#### 📊 Comparison Results (from previous run)")
+
+                df = pd.DataFrame(comparison_results)
+
+                # Create pivot tables for both accuracy and loss
+                pivot_acc = df.pivot(index="Pct", columns="Method", values="Target Acc (%)")
+                pivot_acc = pivot_acc[["Top", "Bottom", "Random"]]  # Reorder columns
+
+                pivot_loss = df.pivot(index="Pct", columns="Method", values="Target Loss")
+                pivot_loss = pivot_loss[["Top", "Bottom", "Random"]]  # Reorder columns
+
+                # Add N column (number of images) - same for all methods at each pct
+                n_by_pct = df.groupby("Pct")["N"].first()
+
+                # Build result dataframe with N, Acc and Loss for each method
+                result_df = pd.DataFrame(index=pivot_acc.index)
+                result_df["N"] = n_by_pct
+                for method in ["Top", "Bottom", "Random"]:
+                    result_df[f"{method} Acc"] = pivot_acc[method]
+                    result_df[f"{method} Loss"] = pivot_loss[method]
+
+                # Style: highlight max Acc and min Loss per row
+                acc_cols = ["Top Acc", "Bottom Acc", "Random Acc"]
+                loss_cols = ["Top Loss", "Bottom Loss", "Random Loss"]
+
+                def highlight_best_in_row_persisted(row):
+                    styles = [""] * len(row)
+                    # Highlight max accuracy (green)
+                    acc_values = {col: row[col] for col in acc_cols if col in row.index}
+                    if acc_values:
+                        max_acc = max(acc_values.values())
+                        for i, col in enumerate(row.index):
+                            if col in acc_cols and row[col] == max_acc:
+                                styles[i] = "background-color: lightgreen"
+                    # Highlight min loss (light blue)
+                    loss_values = {col: row[col] for col in loss_cols if col in row.index}
+                    if loss_values:
+                        min_loss = min(loss_values.values())
+                        for i, col in enumerate(row.index):
+                            if col in loss_cols and row[col] == min_loss:
+                                styles[i] = "background-color: lightblue"
+                    return styles
+
+                st.dataframe(
+                    result_df.style.format({
+                        "N": "{:d}",
+                        "Top Acc": "{:.2f}",
+                        "Bottom Acc": "{:.2f}",
+                        "Random Acc": "{:.2f}",
+                        "Top Loss": "{:.4f}",
+                        "Bottom Loss": "{:.4f}",
+                        "Random Loss": "{:.4f}",
+                    }).apply(highlight_best_in_row_persisted, axis=1),
+                    use_container_width=True,
+                    key="comparison_results_persisted"
+                )
+
+                # Show best configuration overall
+                if "Target Acc (%)" in df.columns:
+                    best_idx = df["Target Acc (%)"].idxmax()
+                    best_row = df.loc[best_idx]
+                    st.success(f"🏆 **Best Overall**: {best_row['Method']} at {best_row['Pct']} ({best_row['N']} images) with **{best_row['Target Acc (%)']:.2f}%** accuracy (loss: {best_row['Target Loss']:.4f})")
 
         with col_retrain:
             retrain_btn = st.button("🚀 Retrain Model on Selected Subset", type="primary", use_container_width=True)
