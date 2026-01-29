@@ -38,6 +38,70 @@ from trak import (
     project_gradients_random,
 )
 import base64
+import random
+
+
+def set_seed(seed: int = 42, cudnn_deterministic: bool = False) -> None:
+    """
+    Set random seeds for reproducibility across all random number generators.
+
+    This ensures deterministic behavior for:
+    - Python's random module (data shuffling, random selection)
+    - NumPy's random number generator
+    - PyTorch's CPU and CUDA random number generators (model initialization)
+
+    Args:
+        seed: The seed value to use (default: 42)
+        cudnn_deterministic: If True, also enable cuDNN deterministic mode.
+            This ensures bit-for-bit reproducibility but may reduce performance.
+            Usually not necessary - data shuffling and init are the main variance sources.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # For multi-GPU setups
+
+    # cuDNN determinism (optional - usually unnecessary, has performance cost)
+    if cudnn_deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        # For PyTorch >= 1.8, enable deterministic algorithms globally
+        if hasattr(torch, 'use_deterministic_algorithms'):
+            try:
+                torch.use_deterministic_algorithms(True, warn_only=True)
+            except Exception:
+                pass  # Some operations don't have deterministic implementations
+
+
+def get_dataloader_generator(seed: int = 42) -> torch.Generator:
+    """
+    Create a seeded generator for DataLoader shuffling.
+
+    Args:
+        seed: The seed value to use
+
+    Returns:
+        A torch.Generator with the specified seed
+    """
+    g = torch.Generator()
+    g.manual_seed(seed)
+    return g
+
+
+def worker_init_fn(worker_id: int) -> None:
+    """
+    Initialize worker seeds for deterministic multi-worker data loading.
+
+    Each worker gets a unique but deterministic seed based on its ID and
+    the initial seed set by the main process.
+
+    Args:
+        worker_id: The worker's ID (0 to num_workers-1)
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def auto_download_json(data: dict, filename: str = "dataset.json") -> None:
@@ -332,6 +396,8 @@ def train_and_evaluate_subset(
     device: str = "cuda",
     progress_callback=None,
     num_classes: int = None,
+    enable_reproducibility: bool = True,
+    training_seed: int = 42,
 ) -> Dict:
     """
     Train a model on a subset and evaluate on target data.
@@ -376,9 +442,22 @@ def train_and_evaluate_subset(
 
     criterion = nn.CrossEntropyLoss()
 
-    # Data loader
+    # Set seeds for reproducibility
+    if enable_reproducibility:
+        set_seed(training_seed)
+
+    # Data loader with reproducible shuffling
     subset_dataset = TensorDataset(subset_tensors, subset_labels)
-    subset_loader = DataLoader(subset_dataset, batch_size=batch_size, shuffle=True)
+    if enable_reproducibility:
+        subset_loader = DataLoader(
+            subset_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            generator=get_dataloader_generator(training_seed),
+            worker_init_fn=worker_init_fn
+        )
+    else:
+        subset_loader = DataLoader(subset_dataset, batch_size=batch_size, shuffle=True)
 
     final_train_loss = 0
     final_target_loss = 0
@@ -1119,6 +1198,30 @@ When using ImageFolder structure:
         step1_weight_decay = 0.01
         step1_momentum = 0.9
 
+    # Reproducibility settings
+    with st.expander("🎲 Reproducibility Settings", expanded=False):
+        col_repro1, col_repro2 = st.columns(2)
+        with col_repro1:
+            enable_reproducibility = st.checkbox(
+                "Enable deterministic training",
+                value=True,
+                key="enable_reproducibility",
+                help="Fix random seeds for data shuffling and model initialization. Same seed = same results."
+            )
+        with col_repro2:
+            training_seed = st.number_input(
+                "Random seed",
+                min_value=0,
+                max_value=2**31 - 1,
+                value=42,
+                step=1,
+                key="training_seed",
+                help="Seed for random number generators.",
+                disabled=not enable_reproducibility
+            )
+        if enable_reproducibility:
+            st.caption("✓ Fixes data shuffling order and model weight initialization for reproducible results.")
+
     # ==================== TRAK CONFIGURATION (UNIFIED) ====================
     st.markdown("### 🔬 TRAK Configuration")
     st.caption("These settings apply to gradient extraction (Step 2) and are also used for training/retraining (Steps 1 & 3).")
@@ -1416,6 +1519,9 @@ When using ImageFolder structure:
                         "num_projections": num_projections,
                         "class_mapping": class_mapping,
                         "num_classes_override": num_classes_override or num_classes,
+                        # Reproducibility settings
+                        "enable_reproducibility": enable_reproducibility,
+                        "training_seed": training_seed,
                     }
 
                     # Also mark step1 as complete (with minimal data)
@@ -1428,6 +1534,8 @@ When using ImageFolder structure:
                         "train_batch_size": train_batch_size,
                         "train_epochs": train_epochs,
                         "freeze_backbone": freeze_backbone,
+                        "enable_reproducibility": enable_reproducibility,
+                        "training_seed": training_seed,
                         "epoch_metrics": [],  # No training metrics since we skipped
                         "final_train_acc": 0,
                         "final_target_acc": 0,
@@ -1550,6 +1658,11 @@ When using ImageFolder structure:
     if step1_triggered:
         with st.spinner("Training initial model..."):
             try:
+                # Set random seeds for reproducibility
+                if enable_reproducibility:
+                    set_seed(training_seed)
+                    st.info(f"🎲 Reproducibility enabled with seed: {training_seed}")
+
                 # Clean up previous temp directory if it exists
                 if "trak_data" in st.session_state:
                     old_temp_dir = st.session_state["trak_data"].get("temp_dir")
@@ -1926,7 +2039,17 @@ When using ImageFolder structure:
                     import torch.nn as nn
 
                     train_dataset = TensorDataset(train_tensors_for_model, train_labels_for_model)
-                    train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True)
+                    # Use seeded generator for reproducible shuffling
+                    if enable_reproducibility:
+                        train_loader = DataLoader(
+                            train_dataset,
+                            batch_size=train_batch_size,
+                            shuffle=True,
+                            generator=get_dataloader_generator(training_seed),
+                            worker_init_fn=worker_init_fn
+                        )
+                    else:
+                        train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True)
                     num_batches = len(train_loader)
 
                     # Set up training mode based on unified TRAK config
@@ -2247,6 +2370,8 @@ When using ImageFolder structure:
                     "learning_rate": learning_rate,
                     "optimizer": step1_optimizer,
                     "freeze_backbone": freeze_backbone,
+                    "enable_reproducibility": enable_reproducibility,
+                    "training_seed": training_seed,
                     "pool_label": pool_label,
                     "temp_dir": temp_dir,
                     "dataset_root": dataset_root,
@@ -2615,6 +2740,9 @@ When using ImageFolder structure:
                     "num_projections": num_projections,  # Number of projections averaged
                     "class_mapping": class_mapping,  # Class name mapping from dataset
                     "num_classes_override": num_classes_override,  # User-specified class count override
+                    # Reproducibility settings from Step 1
+                    "enable_reproducibility": step1_data.get("enable_reproducibility", True),
+                    "training_seed": step1_data.get("training_seed", 42),
                 }
 
                 st.success("✅ Step 2 Complete! TRAK scores computed.")
@@ -2755,12 +2883,19 @@ When using ImageFolder structure:
             # Download buttons
             col_dl_csv, col_dl_json = st.columns(2)
 
+            # Get dataset name for download filenames
+            dataset_root = trak_data.get("dataset_root", "")
+            dataset_name = Path(dataset_root).name if dataset_root else "dataset"
+            # Remove common prefixes/suffixes for cleaner names
+            if dataset_name.endswith(".zip"):
+                dataset_name = dataset_name[:-4]
+
             with col_dl_csv:
                 scores_csv = scores_df_sorted.to_csv(index=False)
                 st.download_button(
                     label="📥 Download CSV",
                     data=scores_csv,
-                    file_name="trak_scores.csv",
+                    file_name=f"{dataset_name}_trak_scores.csv",
                     mime="text/csv",
                     use_container_width=True
                 )
@@ -2789,10 +2924,25 @@ When using ImageFolder structure:
                 }
 
                 manifest_json = json.dumps(enriched_manifest, indent=2)
+
+                # Auto-save enriched manifest to dataset folder (if we have a local path)
+                dataset_root = trak_data.get("dataset_root")
+                if dataset_root and os.path.isdir(dataset_root):
+                    auto_save_path = os.path.join(dataset_root, "dataset.json")
+                    save_key = f"trak_scores_saved_{hash(manifest_json) % 100000}"
+                    if save_key not in st.session_state:
+                        try:
+                            with open(auto_save_path, 'w') as f:
+                                f.write(manifest_json)
+                            st.session_state[save_key] = True
+                            st.success(f"✅ TRAK scores auto-saved to `{auto_save_path}`")
+                        except Exception as e:
+                            st.warning(f"⚠️ Could not auto-save: {e}")
+
                 st.download_button(
                     label="📥 Download JSON",
                     data=manifest_json,
-                    file_name="dataset_with_trak_scores.json",
+                    file_name=f"{dataset_name}_trak.json",
                     mime="application/json",
                     use_container_width=True,
                     help="Original manifest with trak_score added to each entry"
@@ -2876,7 +3026,12 @@ When using ImageFolder structure:
 
             zip_buffer.seek(0)
             view_suffix = "top" if "Top" in view_mode else ("bottom" if "Bottom" in view_mode else "all")
-            zip_filename = f"trak_{view_suffix}_{len(display_df)}.zip"
+            # Get dataset name for filename
+            dataset_root_dl = trak_data.get("dataset_root", "")
+            dataset_name_dl = Path(dataset_root_dl).name if dataset_root_dl else "dataset"
+            if dataset_name_dl.endswith(".zip"):
+                dataset_name_dl = dataset_name_dl[:-4]
+            zip_filename = f"{dataset_name_dl}_{view_suffix}_{len(display_df)}.zip"
 
             st.download_button(
                 label=f"📥 Download {len(display_df)} Images",
@@ -3023,6 +3178,10 @@ When using ImageFolder structure:
         train_epochs = trak_data["train_epochs"]
         pool_label = trak_data["pool_label"]
 
+        # Reproducibility settings from Step 1
+        enable_reproducibility = trak_data.get("enable_reproducibility", True)
+        training_seed = trak_data.get("training_seed", 42)
+
         # Full train data for class balancing
         train_tensors = trak_data.get("train_tensors")
         train_labels = trak_data.get("train_labels")
@@ -3142,13 +3301,27 @@ When using ImageFolder structure:
 
         # Additional training options (hidden in expander)
         with st.expander("🔧 Training Options", expanded=False):
-            optimizer_choice = st.selectbox(
-                "Optimizer",
-                options=["AdamW", "Adam", "SGD"],
-                index=0,
-                key="step3_optimizer",
-                help="Optimization algorithm"
-            )
+            col_opt1, col_opt2 = st.columns(2)
+
+            with col_opt1:
+                optimizer_choice = st.selectbox(
+                    "Optimizer",
+                    options=["AdamW", "Adam", "SGD"],
+                    index=0,
+                    key="step3_optimizer",
+                    help="Optimization algorithm"
+                )
+
+            with col_opt2:
+                step3_seed = st.number_input(
+                    "Random seed",
+                    min_value=0,
+                    max_value=999999,
+                    value=training_seed,  # Default from Step 1
+                    step=1,
+                    key="step3_seed",
+                    help="Random seed for reproducibility. Change this to run multiple experiments with different initializations."
+                )
 
             # Show current gradient source setting (from unified TRAK config)
             training_layer_mode = "Last layer only (frozen backbone)" if freeze_backbone else "Full model"
@@ -3198,6 +3371,11 @@ When using ImageFolder structure:
                 compare_percentages = [10, 20, 30]
 
         if compare_btn and compare_percentages:
+            # Set seeds for reproducibility at the start of comparison
+            if enable_reproducibility:
+                set_seed(step3_seed)
+                st.info(f"🎲 Reproducibility enabled for comparison with seed: {step3_seed}")
+
             st.markdown("### 🔬 Multi-Percentage Method Comparison")
 
             # Auto-detect num_classes from manifest if not set
@@ -3313,6 +3491,8 @@ When using ImageFolder structure:
                         device=device,
                         progress_callback=progress_cb,
                         num_classes=num_classes_override,
+                        enable_reproducibility=enable_reproducibility,
+                        training_seed=step3_seed,
                     )
 
                     comparison_results.append({
@@ -3478,6 +3658,11 @@ When using ImageFolder structure:
             retrain_btn = st.button("🚀 Retrain Model on Selected Subset", type="primary", use_container_width=True)
 
         if retrain_btn:
+            # Set seeds for reproducibility at the start of Step 3
+            if enable_reproducibility:
+                set_seed(step3_seed)
+                st.info(f"🎲 Reproducibility enabled for Step 3 with seed: {step3_seed}")
+
             # Create new progress tracking for step 3
             st.markdown("### 🔄 Retraining Progress")
             progress_bar_retrain = st.progress(0)
@@ -3569,8 +3754,22 @@ When using ImageFolder structure:
                 import torch.optim as optim
                 import torch.nn as nn
 
+                # Set seeds for reproducibility
+                if enable_reproducibility:
+                    set_seed(step3_seed)
+
                 subset_dataset = TensorDataset(subset_tensors, subset_labels)
-                subset_loader = DataLoader(subset_dataset, batch_size=step3_batch_size, shuffle=True)
+                # Use seeded generator for reproducible shuffling
+                if enable_reproducibility:
+                    subset_loader = DataLoader(
+                        subset_dataset,
+                        batch_size=step3_batch_size,
+                        shuffle=True,
+                        generator=get_dataloader_generator(step3_seed),
+                        worker_init_fn=worker_init_fn
+                    )
+                else:
+                    subset_loader = DataLoader(subset_dataset, batch_size=step3_batch_size, shuffle=True)
 
                 # Reset model (reload from scratch)
                 # Auto-detect num_classes from manifest if not set
@@ -3795,6 +3994,13 @@ When using ImageFolder structure:
         st.markdown("### 💾 Download Selected Images")
         if st.button("📦 Create ZIP of Selected Images", use_container_width=True):
             with st.spinner("Creating ZIP file..."):
+                # Get dataset name for filename
+                trak_data_for_zip = st.session_state.get("trak_data", {})
+                dataset_root_for_zip = trak_data_for_zip.get("dataset_root", "")
+                dataset_name_for_zip = Path(dataset_root_for_zip).name if dataset_root_for_zip else "dataset"
+                if dataset_name_for_zip.endswith(".zip"):
+                    dataset_name_for_zip = dataset_name_for_zip[:-4]
+
                 # Create a new ZIP file with selected images
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_out:
@@ -3829,7 +4035,7 @@ When using ImageFolder structure:
                 st.download_button(
                     label="⬇️ Download Selected Images (ZIP)",
                     data=zip_buffer.getvalue(),
-                    file_name=f"selected_images_{results['n_selected']}_of_{results['n_total']}.zip",
+                    file_name=f"{dataset_name_for_zip}_selected_{results['n_selected']}.zip",
                     mime="application/zip",
                     use_container_width=True
                 )
