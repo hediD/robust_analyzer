@@ -398,12 +398,17 @@ def train_and_evaluate_subset(
     num_classes: int = None,
     enable_reproducibility: bool = True,
     training_seed: int = 42,
+    return_best: bool = False,
 ) -> Dict:
     """
     Train a model on a subset and evaluate on target data.
 
+    Args:
+        return_best: If True, return metrics from the epoch with best target loss.
+                    If False, return metrics from the final epoch.
+
     Returns:
-        Dict with final_train_loss, final_target_loss, final_target_acc
+        Dict with train_loss, target_loss, target_acc (and best_epoch if return_best=True)
     """
     import torch.nn as nn
     import torch.optim as optim
@@ -463,6 +468,12 @@ def train_and_evaluate_subset(
     final_target_loss = 0
     final_target_acc = 0
 
+    # Track best metrics across epochs (for return_best mode)
+    best_target_loss = float('inf')
+    best_target_acc = 0
+    best_train_loss = 0
+    best_epoch = 0
+
     for epoch in range(epochs):
         # Training phase
         model.train()
@@ -509,6 +520,13 @@ def train_and_evaluate_subset(
             final_target_loss = total_target_loss / len(target_tensors)
             final_target_acc = 100 * correct / total
 
+            # Track best epoch based on target loss
+            if final_target_loss < best_target_loss:
+                best_target_loss = final_target_loss
+                best_target_acc = final_target_acc
+                best_train_loss = final_train_loss
+                best_epoch = epoch + 1
+
         if progress_callback:
             progress_callback(epoch + 1, epochs)
 
@@ -517,11 +535,19 @@ def train_and_evaluate_subset(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return {
-        "train_loss": final_train_loss,
-        "target_loss": final_target_loss,
-        "target_acc": final_target_acc,
-    }
+    if return_best:
+        return {
+            "train_loss": best_train_loss,
+            "target_loss": best_target_loss,
+            "target_acc": best_target_acc,
+            "best_epoch": best_epoch,
+        }
+    else:
+        return {
+            "train_loss": final_train_loss,
+            "target_loss": final_target_loss,
+            "target_acc": final_target_acc,
+        }
 
 
 def handle_image_selection():
@@ -1396,6 +1422,8 @@ When using ImageFolder structure:
                     selection_labels_list = []
                     selection_valid_paths = []
                     importance_scores_list = []
+                    selection_class_names = []
+                    selection_sources = []
 
                     progress_bar = st.progress(0, text="Loading selection pool...")
                     for i, entry in enumerate(scored_entries):
@@ -1406,8 +1434,10 @@ When using ImageFolder structure:
                                 tensor = transform(img)
                                 selection_tensors_list.append(tensor)
                                 selection_labels_list.append(entry.get('class_idx', 0))
-                                selection_valid_paths.append(entry['filename'])
+                                selection_valid_paths.append(img_path)  # Store full path, not relative
                                 importance_scores_list.append(entry['trak_score'])
+                                selection_class_names.append(entry.get('class_name', f"class_{entry.get('class_idx', 0)}"))
+                                selection_sources.append(entry.get('source', 'train'))
                             except Exception:
                                 pass
                         if i % 100 == 0:
@@ -1432,7 +1462,7 @@ When using ImageFolder structure:
                                 tensor = transform(img)
                                 train_tensors_list.append(tensor)
                                 train_labels_list.append(entry.get('class_idx', 0))
-                                train_paths.append(entry['filename'])
+                                train_paths.append(img_path)  # Store full path, not relative
                             except Exception:
                                 pass
                         if i % 100 == 0:
@@ -1473,11 +1503,13 @@ When using ImageFolder structure:
                         total = sum(initial_class_counts.values())
                         initial_class_ratios = {k: v / total for k, v in initial_class_counts.items()}
 
-                    # Build scores dataframe
+                    # Build scores dataframe (matching Step 2 format)
                     scores_data = {
-                        'filename': selection_valid_paths,
+                        'filename': [os.path.basename(p) for p in selection_valid_paths],
                         'trak_score': importance_scores.numpy().tolist(),
-                        'class': selection_labels.numpy().tolist(),
+                        'class': selection_class_names,
+                        'class_idx': selection_labels.numpy().tolist(),
+                        'source': selection_sources,
                     }
                     scores_df = pd.DataFrame(scores_data)
                     scores_df_sorted = scores_df.sort_values('trak_score', ascending=False).reset_index(drop=True)
@@ -3272,10 +3304,10 @@ When using ImageFolder structure:
                 "Epochs",
                 min_value=1,
                 max_value=500,
-                value=train_epochs,  # Default from Step 1
+                value=20,  # Default 20 epochs for comparison
                 step=1,
                 key="step3_train_epochs",
-                help="Number of training epochs (default from Step 1)"
+                help="Number of training epochs (20 recommended for comparison)"
             )
 
         with col_bs:
@@ -3493,15 +3525,18 @@ When using ImageFolder structure:
                         num_classes=num_classes_override,
                         enable_reproducibility=enable_reproducibility,
                         training_seed=step3_seed,
+                        return_best=True,  # Return best epoch metrics based on target loss
                     )
 
                     comparison_results.append({
                         "Pct": f"{pct}%",
+                        "Pct_num": pct,  # Numeric version for plotting
                         "N": n_select_pct,
                         "Method": method_name,
                         "Train Loss": result["train_loss"],
                         "Target Loss": result["target_loss"],
                         "Target Acc (%)": result["target_acc"],
+                        "Best Epoch": result.get("best_epoch", step3_epochs),
                     })
 
                     experiment_idx += 1
@@ -3576,6 +3611,58 @@ When using ImageFolder structure:
                 best_idx = df["Target Acc (%)"].idxmax()
                 best_row = df.loc[best_idx]
                 st.success(f"🏆 **Best Overall**: {best_row['Method']} at {best_row['Pct']} ({best_row['N']} images) with **{best_row['Target Acc (%)']:.2f}%** accuracy (loss: {best_row['Target Loss']:.4f})")
+
+            # Plot comparison results
+            st.markdown("#### 📈 Comparison Plots")
+            try:
+                import matplotlib.pyplot as plt
+
+                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+                # Color scheme for methods
+                method_colors = {"Top": "#2ecc71", "Bottom": "#e74c3c", "Random": "#3498db"}
+                method_markers = {"Top": "o", "Bottom": "s", "Random": "^"}
+
+                # Get data by method
+                for method_name in ["Top", "Bottom", "Random"]:
+                    method_data = df[df["Method"] == method_name].sort_values("Pct_num")
+                    x = method_data["Pct_num"].values
+                    acc = method_data["Target Acc (%)"].values
+                    loss = method_data["Target Loss"].values
+
+                    # Accuracy subplot
+                    axes[0].plot(x, acc,
+                                marker=method_markers[method_name],
+                                color=method_colors[method_name],
+                                label=method_name, linewidth=2, markersize=8)
+
+                    # Loss subplot
+                    axes[1].plot(x, loss,
+                                marker=method_markers[method_name],
+                                color=method_colors[method_name],
+                                label=method_name, linewidth=2, markersize=8)
+
+                # Configure accuracy subplot
+                axes[0].set_xlabel("Data Percentage (%)", fontsize=12)
+                axes[0].set_ylabel("Target Accuracy (%)", fontsize=12)
+                axes[0].set_title("Target Accuracy vs Data Selection %", fontsize=14)
+                axes[0].legend(loc="lower right")
+                axes[0].grid(True, alpha=0.3)
+                axes[0].set_xticks(sorted(df["Pct_num"].unique()))
+
+                # Configure loss subplot
+                axes[1].set_xlabel("Data Percentage (%)", fontsize=12)
+                axes[1].set_ylabel("Target Loss", fontsize=12)
+                axes[1].set_title("Target Loss vs Data Selection % (Best Epoch)", fontsize=14)
+                axes[1].legend(loc="upper right")
+                axes[1].grid(True, alpha=0.3)
+                axes[1].set_xticks(sorted(df["Pct_num"].unique()))
+
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+            except Exception as e:
+                st.warning(f"⚠️ Could not generate plot: {str(e)}")
 
             # Store comparison results in session state
             st.session_state["method_comparison_results"] = {
@@ -3653,6 +3740,59 @@ When using ImageFolder structure:
                     best_idx = df["Target Acc (%)"].idxmax()
                     best_row = df.loc[best_idx]
                     st.success(f"🏆 **Best Overall**: {best_row['Method']} at {best_row['Pct']} ({best_row['N']} images) with **{best_row['Target Acc (%)']:.2f}%** accuracy (loss: {best_row['Target Loss']:.4f})")
+
+                # Plot comparison results (persisted)
+                if "Pct_num" in df.columns:
+                    st.markdown("#### 📈 Comparison Plots")
+                    try:
+                        import matplotlib.pyplot as plt
+
+                        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+                        # Color scheme for methods
+                        method_colors = {"Top": "#2ecc71", "Bottom": "#e74c3c", "Random": "#3498db"}
+                        method_markers = {"Top": "o", "Bottom": "s", "Random": "^"}
+
+                        # Get data by method
+                        for method_name in ["Top", "Bottom", "Random"]:
+                            method_data = df[df["Method"] == method_name].sort_values("Pct_num")
+                            x = method_data["Pct_num"].values
+                            acc = method_data["Target Acc (%)"].values
+                            loss = method_data["Target Loss"].values
+
+                            # Accuracy subplot
+                            axes[0].plot(x, acc,
+                                        marker=method_markers[method_name],
+                                        color=method_colors[method_name],
+                                        label=method_name, linewidth=2, markersize=8)
+
+                            # Loss subplot
+                            axes[1].plot(x, loss,
+                                        marker=method_markers[method_name],
+                                        color=method_colors[method_name],
+                                        label=method_name, linewidth=2, markersize=8)
+
+                        # Configure accuracy subplot
+                        axes[0].set_xlabel("Data Percentage (%)", fontsize=12)
+                        axes[0].set_ylabel("Target Accuracy (%)", fontsize=12)
+                        axes[0].set_title("Target Accuracy vs Data Selection %", fontsize=14)
+                        axes[0].legend(loc="lower right")
+                        axes[0].grid(True, alpha=0.3)
+                        axes[0].set_xticks(sorted(df["Pct_num"].unique()))
+
+                        # Configure loss subplot
+                        axes[1].set_xlabel("Data Percentage (%)", fontsize=12)
+                        axes[1].set_ylabel("Target Loss", fontsize=12)
+                        axes[1].set_title("Target Loss vs Data Selection % (Best Epoch)", fontsize=14)
+                        axes[1].legend(loc="upper right")
+                        axes[1].grid(True, alpha=0.3)
+                        axes[1].set_xticks(sorted(df["Pct_num"].unique()))
+
+                        plt.tight_layout()
+                        st.pyplot(fig, key="comparison_plot_persisted")
+                        plt.close(fig)
+                    except Exception as e:
+                        st.warning(f"⚠️ Could not generate plot: {str(e)}")
 
         with col_retrain:
             retrain_btn = st.button("🚀 Retrain Model on Selected Subset", type="primary", use_container_width=True)
