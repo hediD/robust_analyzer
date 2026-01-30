@@ -3642,10 +3642,33 @@ When using ImageFolder structure:
                                 color=method_colors[method_name],
                                 label=method_name, linewidth=2, markersize=8)
 
+                # Find best overall accuracy and mark with star
+                best_acc_idx = df["Target Acc (%)"].idxmax()
+                best_acc_row = df.loc[best_acc_idx]
+                best_acc = best_acc_row["Target Acc (%)"]
+                best_acc_pct = best_acc_row["Pct_num"]
+                best_acc_method = best_acc_row["Method"]
+                axes[0].plot(best_acc_pct, best_acc, '*',
+                            color=method_colors[best_acc_method],
+                            markersize=20, markeredgecolor='black', markeredgewidth=1)
+
+                # Find best overall loss (minimum) and mark with star
+                best_loss_idx = df["Target Loss"].idxmin()
+                best_loss_row = df.loc[best_loss_idx]
+                best_loss = best_loss_row["Target Loss"]
+                best_loss_pct = best_loss_row["Pct_num"]
+                best_loss_method = best_loss_row["Method"]
+                axes[1].plot(best_loss_pct, best_loss, '*',
+                            color=method_colors[best_loss_method],
+                            markersize=20, markeredgecolor='black', markeredgewidth=1)
+
                 # Configure accuracy subplot
                 axes[0].set_xlabel("Data Percentage (%)", fontsize=12)
                 axes[0].set_ylabel("Target Accuracy (%)", fontsize=12)
                 axes[0].set_title("Target Accuracy vs Data Selection %", fontsize=14)
+                # Add best accuracy to legend
+                axes[0].plot([], [], '*', color='gray', markersize=12, markeredgecolor='black',
+                            markeredgewidth=0.5, label=f'Best: {best_acc:.1f}%')
                 axes[0].legend(loc="lower right")
                 axes[0].grid(True, alpha=0.3)
                 axes[0].set_xticks(sorted(df["Pct_num"].unique()))
@@ -3654,6 +3677,9 @@ When using ImageFolder structure:
                 axes[1].set_xlabel("Data Percentage (%)", fontsize=12)
                 axes[1].set_ylabel("Target Loss", fontsize=12)
                 axes[1].set_title("Target Loss vs Data Selection % (Best Epoch)", fontsize=14)
+                # Add best loss to legend
+                axes[1].plot([], [], '*', color='gray', markersize=12, markeredgecolor='black',
+                            markeredgewidth=0.5, label=f'Best: {best_loss:.4f}')
                 axes[1].legend(loc="upper right")
                 axes[1].grid(True, alpha=0.3)
                 axes[1].set_xticks(sorted(df["Pct_num"].unique()))
@@ -3772,10 +3798,33 @@ When using ImageFolder structure:
                                         color=method_colors[method_name],
                                         label=method_name, linewidth=2, markersize=8)
 
+                        # Find best overall accuracy and mark with star
+                        best_acc_idx = df["Target Acc (%)"].idxmax()
+                        best_acc_row = df.loc[best_acc_idx]
+                        best_acc = best_acc_row["Target Acc (%)"]
+                        best_acc_pct = best_acc_row["Pct_num"]
+                        best_acc_method = best_acc_row["Method"]
+                        axes[0].plot(best_acc_pct, best_acc, '*',
+                                    color=method_colors[best_acc_method],
+                                    markersize=20, markeredgecolor='black', markeredgewidth=1)
+
+                        # Find best overall loss (minimum) and mark with star
+                        best_loss_idx = df["Target Loss"].idxmin()
+                        best_loss_row = df.loc[best_loss_idx]
+                        best_loss = best_loss_row["Target Loss"]
+                        best_loss_pct = best_loss_row["Pct_num"]
+                        best_loss_method = best_loss_row["Method"]
+                        axes[1].plot(best_loss_pct, best_loss, '*',
+                                    color=method_colors[best_loss_method],
+                                    markersize=20, markeredgecolor='black', markeredgewidth=1)
+
                         # Configure accuracy subplot
                         axes[0].set_xlabel("Data Percentage (%)", fontsize=12)
                         axes[0].set_ylabel("Target Accuracy (%)", fontsize=12)
                         axes[0].set_title("Target Accuracy vs Data Selection %", fontsize=14)
+                        # Add best accuracy to legend
+                        axes[0].plot([], [], '*', color='gray', markersize=12, markeredgecolor='black',
+                                    markeredgewidth=0.5, label=f'Best: {best_acc:.1f}%')
                         axes[0].legend(loc="lower right")
                         axes[0].grid(True, alpha=0.3)
                         axes[0].set_xticks(sorted(df["Pct_num"].unique()))
@@ -3784,6 +3833,9 @@ When using ImageFolder structure:
                         axes[1].set_xlabel("Data Percentage (%)", fontsize=12)
                         axes[1].set_ylabel("Target Loss", fontsize=12)
                         axes[1].set_title("Target Loss vs Data Selection % (Best Epoch)", fontsize=14)
+                        # Add best loss to legend
+                        axes[1].plot([], [], '*', color='gray', markersize=12, markeredgecolor='black',
+                                    markeredgewidth=0.5, label=f'Best: {best_loss:.4f}')
                         axes[1].legend(loc="upper right")
                         axes[1].grid(True, alpha=0.3)
                         axes[1].set_xticks(sorted(df["Pct_num"].unique()))
