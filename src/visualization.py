@@ -857,7 +857,23 @@ def create_image_carousel(rendered_images: Sequence[Dict]) -> None:
             st.button("📦 Download All Images (ZIP)", disabled=True, help="Analysis data not available", use_container_width=True)
 
     st.markdown("---")
-    col_img, col_info = st.columns([2, 1])
+
+    # Image display size control
+    col_size, _ = st.columns([1, 2])
+    with col_size:
+        image_display_size = st.select_slider(
+            "🖼️ Display Size",
+            options=["Small", "Medium", "Large", "Full"],
+            value=st.session_state.get("image_display_size", "Large"),
+            key="image_display_size_slider",
+            help="Adjust the display size of rendered images"
+        )
+        st.session_state["image_display_size"] = image_display_size
+
+    # Map size to column proportions
+    size_to_ratio = {"Small": [1, 2], "Medium": [1, 1], "Large": [2, 1], "Full": [3, 1]}
+    col_ratio = size_to_ratio.get(image_display_size, [2, 1])
+    col_img, col_info = st.columns(col_ratio)
 
     with col_img:
         render_img = Image.fromarray(current["image"])

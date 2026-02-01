@@ -685,14 +685,33 @@ When using ImageFolder structure:
 - Projects gradients using Johnson-Lindenstrauss random projection
 - Computes influence scores for each selection image
 - Displays sortable score table with image carousel
+- **Auto-saves** `dataset_trak.json` for quick re-loading later
 
 **Step 3: Select Subset & Retrain**
 - Choose selection method: Top percentage or Top count
 - Choose selection strategy: Top (highest influence), Bottom, or Random
 - Optionally override training hyperparameters
 - **Compare All Methods**: Run Top, Bottom, and Random selections and compare target accuracy
+- Reports **best epoch** results per method (not just final epoch)
 - Select top-k% from `select`, then balance with `train` to match initial class ratios
 - Final training set maintains same class proportions as Step 1
+
+### Quick Start Options
+
+**🚀 Auto-Run All Steps:**
+- One-click button runs Step 1 → Step 2 → Compare All Methods automatically
+- Great for quick experiments with default settings
+
+**⚡ Skip to Step 3 (Pre-computed TRAK):**
+- If your `dataset.json` contains `trak_score` fields, Steps 1 & 2 are skipped
+- If `dataset_trak.json` exists in your dataset folder, it auto-loads on startup
+- Saves time when re-running selection experiments
+
+### Reproducibility
+
+- **Seed control**: Set random seed for reproducible results
+- Seeds apply to: data shuffling, model initialization, random selection baseline
+- Enabled by default with seed=42
 
 ### Understanding Results
 
@@ -700,6 +719,7 @@ When using ImageFolder structure:
 - **Score table**: Sortable by rank, viewable in carousel or grid
 - **Downloads**: CSV (scores only) or JSON (full manifest with scores added)
 - **Comparison mode**: Trains all three methods and shows which performs best
+- **Best epoch tracking**: Reports peak accuracy per method, not just final epoch
 
 ### Example Use Case
 
@@ -717,6 +737,8 @@ When using ImageFolder structure:
 - **Last layer gradients** are usually sufficient and much faster than full model
 - Use **Compare All Methods** to verify TRAK selection outperforms random
 - Higher **JL dimension** improves accuracy but uses more memory
+- **Re-run experiments fast**: After Step 2, `dataset_trak.json` is saved - next time just load and skip to Step 3
+- **Auto-Run** is great for initial experiments; use manual steps for fine-tuning
 
 """)
 

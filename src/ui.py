@@ -755,10 +755,8 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
                 else:
                     st.info("💡 Using generic class names")
 
-    # Robustness Analysis settings - only show when on robustness tab
-    active_tab = st.session_state.get("active_upload_tab", "robustness")
-    if active_tab == "robustness":
-        with st.sidebar.expander("🎯 Robustness Analysis Settings", expanded=True):
+    # Robustness Analysis settings - always visible since it's the main feature
+    with st.sidebar.expander("🎯 Robustness Analysis Settings", expanded=True):
             target_class = create_target_class_selector(num_classes, custom_labels)
 
             batch_size = st.number_input(
@@ -872,23 +870,6 @@ def create_sidebar() -> Dict[str, Union[int, float, bool, str, List[str]]]:
                 key="global_include_heatmap"
             )
             st.session_state["include_heatmap_global"] = include_heatmap
-    else:
-        # Use session state values or defaults when not on robustness tab
-        target_class = st.session_state.get("target_class_imagenet_selector", DEFAULT_TARGET_LABEL)
-        if target_class and ":" in str(target_class):
-            target_class = target_class.split(": ", 1)[-1] if ": " in target_class else target_class
-        batch_size = st.session_state.get("robustness_batch_size", 1)
-        params_to_optimize = st.session_state.get("robustness_params_to_optimize", ["camera"])
-        num_runs = st.session_state.get("robustness_num_runs", 1)
-        num_iterations = st.session_state.get("robustness_num_iterations", 1)
-        learning_rate = st.session_state.get("robustness_learning_rate", 5e-3)
-        targeted = st.session_state.get("robustness_targeted", False)
-        positive_z = st.session_state.get("robustness_positive_z", True)
-        min_max_proportion = st.session_state.get("robustness_min_max_proportion", (0.3, 0.8))
-        image_size = st.session_state.get("robustness_image_size", 448)
-        bin_size = st.session_state.get("robustness_bin_size", 32)
-        max_faces_per_bin = st.session_state.get("robustness_max_faces_per_bin", 100000)
-        include_heatmap = st.session_state.get("global_include_heatmap", True)
 
     # Store model config in session state for image selection panel
     st.session_state["model_config"] = {
@@ -995,12 +976,27 @@ Upload a JSON file to use custom class names instead of generic indices:
 
 ### Configuration Options (Sidebar)
 
-| Parameter | Description | Typical Values |
-|-----------|-------------|----------------|
-| **Target Class** | Class index to test | 0 to num_classes-1 |
-| **Theta/Phi Points** | Angular resolution of sweep | 10-50 |
-| **Min/Max Distance** | Camera distance range (proportional to object size) | 1.5-10x |
-| **Optimization Samples** | Samples for finding worst-case | 50-200 |
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| **Target Class** | Class to test recognition for | ImageNet class |
+| **Batch Size** | Viewpoints to optimize in parallel | 1 |
+| **Number of Runs** | Total optimization runs | 1 |
+| **Optimization Steps** | Steps per adversarial run | 1 |
+| **Learning Rate** | Optimizer learning rate | 5e-3 |
+| **Targeted Attack** | Whether attack is targeted | Off |
+
+**Camera Constraints:**
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| **Positive Z** | Constrain to positive elevation | On |
+| **Object Proportion Range** | How much of image the object fills | 0.3 - 0.8 |
+
+**Rendering Settings:**
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| **Image Size** | Resolution of rendered images | 448 |
+| **Bin Size** | Spatial partitioning for rasterization | 32 |
+| **Max Faces per Bin** | Max faces per spatial bin | 100,000 |
 
 ### Workflow Steps
 
@@ -1008,17 +1004,23 @@ Upload a JSON file to use custom class names instead of generic indices:
 2. **Provide 3D files** - upload or specify paths
 3. **Configure** analysis parameters in sidebar
 4. **Optionally** load custom weights and/or class labels
-5. **Adjust** rendering settings if needed (expand panel)
-6. **Run Analysis** - generates viewpoint confidence map
-7. **Review** polar heatmap showing confidence by angle
-8. **Download** results as JSON
+5. **Run Analysis** - generates viewpoint confidence map
+6. **Explore results**:
+   - Filter by environment map (if multiple)
+   - View interactive polar heatmap
+   - Click points to select positions for rendering
+   - Use position selection panel for batch selection
+7. **Render & download** selected positions
 
 ### Understanding Results
 
-- **Polar Heatmap**: Shows classifier confidence by viewing angle (theta/phi)
+- **Interactive Polar Plot**: Click to select viewpoints for rendering
+- **Environment Selection**: Filter results by specific environment map
 - **Red zones**: Low confidence (adversarial viewpoints)
 - **Green zones**: High confidence (robust viewpoints)
-- **Statistics**: Min/max/mean confidence across all viewpoints
+- **Top-k Accuracy**: Percentage of positions where target is in top-k predictions
+- **Image Carousel**: Browse rendered images with adjustable display size
+- **Batch Downloads**: Download all rendered images as ZIP
 
 ### Tips
 
@@ -1094,42 +1096,51 @@ Upload a JSON file to use custom class names instead of generic indices:
                             env_files.extend(root_path.glob(ext))
                             env_files.extend(root_path.glob(ext.upper()))
 
-                        # Show detected files
-                        st.markdown("**Detected files:**")
-                        col1, col2 = st.columns(2)
+                        # Show summary and collapsible details
+                        non_env_textures = [t for t in texture_files if t.suffix.lower() not in ['.hdr', '.exr']]
+                        obj_name = obj_files[0].name if obj_files else "None"
+                        tex_count = len(non_env_textures)
+                        env_count = len(env_files)
 
-                        with col1:
-                            if obj_files:
-                                st.success(f"✅ OBJ: {obj_files[0].name}")
-                                if len(obj_files) > 1:
-                                    st.warning(f"⚠️ Multiple OBJ files found, using first one")
-                            else:
-                                st.error("❌ No OBJ file found")
+                        if obj_files and env_files:
+                            st.success(f"✅ **Detected:** 1 model ({obj_name}), {tex_count} texture(s), {env_count} environment map(s)")
+                        elif not obj_files:
+                            st.error("❌ No OBJ file found in directory")
+                        elif not env_files:
+                            st.error("❌ No environment maps (.hdr/.exr) found in directory")
 
-                            if mtl_files:
-                                st.success(f"✅ MTL: {mtl_files[0].name}")
-                            else:
-                                st.info("ℹ️ No MTL file found (optional)")
+                        with st.expander("📁 View detected files", expanded=False):
+                            col1, col2 = st.columns(2)
 
-                            if texture_files:
-                                # Filter out envmaps from texture list
-                                non_env_textures = [t for t in texture_files if t.suffix.lower() not in ['.hdr', '.exr']]
+                            with col1:
+                                if obj_files:
+                                    st.write(f"✅ **OBJ:** {obj_files[0].name}")
+                                    if len(obj_files) > 1:
+                                        st.warning(f"⚠️ Multiple OBJ files found, using first one")
+                                else:
+                                    st.error("❌ No OBJ file found")
+
+                                if mtl_files:
+                                    st.write(f"✅ **MTL:** {mtl_files[0].name}")
+                                else:
+                                    st.info("ℹ️ No MTL file found (optional)")
+
                                 if non_env_textures:
-                                    st.success(f"✅ Textures: {len(non_env_textures)} file(s)")
+                                    st.write(f"✅ **Textures:** {len(non_env_textures)} file(s)")
                                     for tex in non_env_textures[:3]:
                                         st.text(f"  • {tex.name}")
                                     if len(non_env_textures) > 3:
                                         st.text(f"  ... and {len(non_env_textures) - 3} more")
 
-                        with col2:
-                            if env_files:
-                                st.success(f"✅ Environment maps: {len(env_files)} file(s)")
-                                for env_f in sorted(env_files)[:5]:
-                                    st.text(f"  • {env_f.name}")
-                                if len(env_files) > 5:
-                                    st.text(f"  ... and {len(env_files) - 5} more")
-                            else:
-                                st.error("❌ No environment maps (.hdr/.exr) found")
+                            with col2:
+                                if env_files:
+                                    st.write(f"✅ **Environment maps:** {len(env_files)} file(s)")
+                                    for env_f in sorted(env_files)[:5]:
+                                        st.text(f"  • {env_f.name}")
+                                    if len(env_files) > 5:
+                                        st.text(f"  ... and {len(env_files) - 5} more")
+                                else:
+                                    st.error("❌ No environment maps (.hdr/.exr) found")
 
                         # Return if valid
                         if obj_files and env_files:
@@ -2287,6 +2298,10 @@ def validate_weights_compatibility(weights_path: str, model_name: str) -> Tuple[
 def main() -> None:
     setup_page()
 
+    # Initialize active_upload_tab early so sidebar config renders correctly
+    if "active_upload_tab" not in st.session_state:
+        st.session_state["active_upload_tab"] = "robustness"
+
     has_cached = check_cached_files()
     if st.session_state.get("using_cached_files", False):
         st.success("🔄 **Using cached files from previous session**")
@@ -2329,21 +2344,27 @@ def main() -> None:
                         obj_path, texture_path, envmap_paths, temp_dir = save_files_to_cache(upload_type, zip_file)
                     st.success("✅ ZIP package processed successfully!")
 
-                    st.subheader("📋 Processed Files")
-                    c1, c2, c3 = st.columns(3)
-                    with c1:
-                        st.write("**3D Object:**")
-                        st.write(f"✅ {os.path.basename(obj_path) if obj_path else '❌ No OBJ file found'}")
-                    with c2:
-                        st.write("**Texture:**")
-                        st.write(f"✅ {os.path.basename(texture_path) if texture_path else '💡 Will use MTL materials'}")
-                    with c3:
-                        st.write("**Environment Maps:**")
-                        if envmap_paths:
-                            for env_path in envmap_paths:
-                                st.write(f"✅ {os.path.basename(env_path)}")
-                        else:
-                            st.write("❌ No environment maps found")
+                    # Show summary and collapsible details
+                    obj_name = os.path.basename(obj_path) if obj_path else "None"
+                    tex_name = os.path.basename(texture_path) if texture_path else "MTL materials"
+                    env_count = len(envmap_paths) if envmap_paths else 0
+                    st.info(f"📋 **Package contents:** 1 model ({obj_name}), 1 texture ({tex_name}), {env_count} environment map(s)")
+
+                    with st.expander("📁 View all extracted files", expanded=False):
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
+                            st.write("**3D Object:**")
+                            st.write(f"✅ {os.path.basename(obj_path) if obj_path else '❌ No OBJ file found'}")
+                        with c2:
+                            st.write("**Texture:**")
+                            st.write(f"✅ {os.path.basename(texture_path) if texture_path else '💡 Will use MTL materials'}")
+                        with c3:
+                            st.write("**Environment Maps:**")
+                            if envmap_paths:
+                                for env_path in envmap_paths:
+                                    st.write(f"✅ {os.path.basename(env_path)}")
+                            else:
+                                st.write("❌ No environment maps found")
 
                     mtl_path = obj_path.replace(".obj", ".mtl") if obj_path else None
                     if mtl_path and os.path.exists(mtl_path):
@@ -2374,25 +2395,31 @@ def main() -> None:
                         )
                     st.success("✅ Files processed successfully!")
 
-                    st.subheader("📋 Processed Files")
-                    c1, c2, c3 = st.columns(3)
-                    with c1:
-                        st.write("**3D Object:**")
-                        st.write(f"✅ {obj_file.name}")
-                    with c2:
-                        st.write("**Texture:**")
-                        if texture_files:
-                            if hasattr(texture_files, "read"):
-                                st.write(f"✅ {texture_files.name}")
+                    # Show summary and collapsible details
+                    tex_count = 1 if hasattr(texture_files, "read") else len(texture_files) if texture_files else 0
+                    tex_name = texture_files.name if (texture_files and hasattr(texture_files, "read")) else f"{tex_count} file(s)" if tex_count else "MTL materials"
+                    env_count = len(env_files)
+                    st.info(f"📋 **Uploaded files:** 1 model ({obj_file.name}), texture ({tex_name}), {env_count} environment map(s)")
+
+                    with st.expander("📁 View all uploaded files", expanded=False):
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
+                            st.write("**3D Object:**")
+                            st.write(f"✅ {obj_file.name}")
+                        with c2:
+                            st.write("**Texture:**")
+                            if texture_files:
+                                if hasattr(texture_files, "read"):
+                                    st.write(f"✅ {texture_files.name}")
+                                else:
+                                    for tf in texture_files:
+                                        st.write(f"✅ {tf.name}")
                             else:
-                                for tf in texture_files:
-                                    st.write(f"✅ {tf.name}")
-                        else:
-                            st.write("💡 Will use MTL materials")
-                    with c3:
-                        st.write("**Environment Maps:**")
-                        for ef in env_files:
-                            st.write(f"✅ {ef.name}")
+                                st.write("💡 Will use MTL materials")
+                        with c3:
+                            st.write("**Environment Maps:**")
+                            for ef in env_files:
+                                st.write(f"✅ {ef.name}")
 
                     if mtl_file:
                         mtl_path = os.path.join(temp_dir, mtl_file.name)
@@ -2422,30 +2449,35 @@ def main() -> None:
                     texture_paths = local_paths.get("texture_paths", [])
                     env_paths = local_paths.get("env_paths", [])
 
-                    st.success("✅ Local paths validated successfully!")
+                    # Show summary and collapsible details
+                    obj_name = Path(obj_path).name
+                    tex_count = len(texture_paths)
+                    tex_name = Path(texture_paths[0]).name if tex_count == 1 else f"{tex_count} file(s)" if tex_count else "MTL materials"
+                    env_count = len(env_paths)
+                    st.info(f"📋 **Local files:** 1 model ({obj_name}), texture ({tex_name}), {env_count} environment map(s)")
 
-                    st.subheader("📋 Local Files")
-                    c1, c2, c3 = st.columns(3)
-                    with c1:
-                        st.write("**3D Object:**")
-                        st.write(f"✅ {Path(obj_path).name}")
-                        if mtl_path:
-                            st.write(f"✅ {Path(mtl_path).name}")
-                    with c2:
-                        st.write("**Textures:**")
-                        if texture_paths:
-                            for tp in texture_paths[:3]:
-                                st.write(f"✅ {Path(tp).name}")
-                            if len(texture_paths) > 3:
-                                st.write(f"... +{len(texture_paths) - 3} more")
-                        else:
-                            st.write("💡 No textures specified")
-                    with c3:
-                        st.write("**Environment Maps:**")
-                        for ep in env_paths[:3]:
-                            st.write(f"✅ {Path(ep).name}")
-                        if len(env_paths) > 3:
-                            st.write(f"... +{len(env_paths) - 3} more")
+                    with st.expander("📁 View all local files", expanded=False):
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
+                            st.write("**3D Object:**")
+                            st.write(f"✅ {Path(obj_path).name}")
+                            if mtl_path:
+                                st.write(f"✅ {Path(mtl_path).name}")
+                        with c2:
+                            st.write("**Textures:**")
+                            if texture_paths:
+                                for tp in texture_paths[:3]:
+                                    st.write(f"✅ {Path(tp).name}")
+                                if len(texture_paths) > 3:
+                                    st.write(f"... +{len(texture_paths) - 3} more")
+                            else:
+                                st.write("💡 No textures specified")
+                        with c3:
+                            st.write("**Environment Maps:**")
+                            for ep in env_paths[:3]:
+                                st.write(f"✅ {Path(ep).name}")
+                            if len(env_paths) > 3:
+                                st.write(f"... +{len(env_paths) - 3} more")
 
                     # For local paths, we use files directly without copying to cache
                     # Determine texture path (first texture or None)
